@@ -1,0 +1,259 @@
+# os9-protect
+
+Test machine and tooling for adding crash containment to Mac OS 9.2.2: a
+crashed or hung application should not take the rest of the system down.
+
+## Test machine
+
+QEMU's `mac99` machine (PowerPC G4, 512 MB) running Mac OS 9.2.2. It boots the
+real Mac OS ROM file and NanoKernel from the guest's System Folder, so a
+modified NanoKernel can be tested by replacing that file.
+
+Requirements: `brew install qemu hfsutils`, and the universal 9.2.2 install
+image linked at `media/macos-922-uni.iso`.
+
+To install Mac OS 9.2.2 on a fresh disk, run `./run.sh install`. In the guest,
+open Utilities > Drive Setup, initialize the 8 GB disk as Mac OS Extended, then
+run Install Mac OS 9.2.2 onto it. Shut the guest down when the installer
+finishes.
+
+To boot the installed system, run `./run.sh`. The CD drive starts empty; to
+start with a disc in it, set `CD=path/to/image`.
+
+To use the mouse in the guest, click inside the window; QEMU captures the
+pointer. To release it, press Ctrl+Option+G. To change the zoom, drag the
+window edge: with the local QEMU build the window snaps to whole-number zoom
+levels and starts at the largest that fits the screen. View > Integer Scaling
+turns this off. To change the guest's own resolution, use the Monitors control
+panel.
+
+To restart the guest, use Special > Restart as usual. QEMU's mac99 firmware
+hangs on a black screen after a guest restart, so `run.sh` makes QEMU exit on
+a restart and starts it again from the hard disk. The window closes and
+reopens.
+
+To debug the guest with gdb, run `./run.sh debug`. QEMU starts paused with a
+gdb stub on `localhost:1234`.
+
+To run without a window, set `HEADLESS=1`. To throw away every disk write when
+the machine stops, set `SCRATCH=1`.
+
+## Networking
+
+The guest has a Sun GEM network card (the G4's built-in Ethernet, which Mac OS
+9.2.2 drives without extra software) on QEMU's user-mode network. TCP/IP is set
+to Ethernet, Using DHCP Server, and gets 10.0.2.15. The guest reaches the
+internet through the host, and reaches the host itself at 10.0.2.2.
+
+## Moving files into the guest
+
+To copy files from the host into the running guest, run
+`tools/push.sh [-n "Volume Name"] file...`. It builds an HFS disc image with
+the files and inserts it into the guest's CD drive, where it mounts on the
+desktop. `.bin` files are decoded as MacBinary (resource forks, type and
+creator kept), `.hqx` as BinHex, `.txt` as text with Mac line endings, and
+anything else is copied as raw data.
+
+Mac OS locks the CD tray while a disc is mounted and does not notice a disc
+changed underneath it, so `push.sh` first ejects a disc it pushed earlier from
+inside the guest: it clicks the desktop near the bottom left corner, selects the
+disc by typing its name, and presses Cmd-E. If a file on that disc is open, the
+eject fails and `push.sh` says so.
+
+## Controlling the guest
+
+`tools/qmp.py` talks to the running machine over QMP:
+
+```
+tools/qmp.py screenshot shot.png
+tools/qmp.py pos                 # cursor position, guest pixels
+tools/qmp.py click 22 9          # Apple menu
+tools/qmp.py dclick X Y
+tools/qmp.py drag X1 Y1 X2 Y2
+tools/qmp.py key cmd-q
+tools/qmp.py type 'Hello'
+tools/qmp.py hmp 'info registers'
+tools/qmp.py quit
+```
+
+The guest mouse is a relative USB mouse and Mac OS accelerates it. To place the
+cursor exactly, `move` (and the commands built on it) reads the cursor position
+from the guest's low memory (`RawMouse`, 0x82C), moves by the remaining
+distance, and repeats until it matches. A move takes about two seconds.
+
+## Snapshots
+
+`clean-install` is Mac OS 9.2.2 straight after the installer, before its
+first boot and the Setup Assistant.
+
+To save the disk state while the machine is off, run
+`qemu-img snapshot -c <name> disks/os9.qcow2`.
+
+To return to a saved state, run `qemu-img snapshot -a <name> disks/os9.qcow2`.
+
+To list saved states, run `qemu-img snapshot -l disks/os9.qcow2`.
+
+## Local QEMU build
+
+`run.sh` uses `qemu/build/qemu-system-ppc` when it exists, otherwise Homebrew's
+`qemu-system-ppc`. The local build is QEMU 11.1.3 with
+`qemu/patches/0001-cocoa-zoom-integer.patch`, which adds the Cocoa
+`zoom-integer=on|off` option.
+
+The repository holds only the patch, not QEMU's source. To build it:
+
+```bash
+qemu/build.sh
+```
+
+The script downloads the QEMU 11.1.3 release tarball (141 MB, kept as
+`qemu/qemu-11.1.3.tar.xz`) and checks its SHA-256. It unpacks it into
+`qemu/src` as a git repository whose one commit is the unmodified release, and
+applies each `qemu/patches/*.patch` in name order. It then configures
+`qemu/build` (`--target-list=ppc-softmmu --enable-cocoa --disable-docs
+--disable-werror`) and builds it at `nice -n 19`. Running it again skips
+patches that are already applied and only rebuilds what changed.
+
+To change the patch, run `qemu/build.sh src` (fetch and patch only), edit the
+files in `qemu/src`, then regenerate the patch:
+
+```bash
+git -C qemu/src diff > qemu/patches/0001-cocoa-zoom-integer.patch
+```
+
+## Toolchain
+
+Retro68 (GCC 16 for classic 68k and PowerPC Mac OS) is built in
+`toolchain/build/toolchain`, using the open-source Multiversal Interfaces
+(Apple's Universal Interfaces are not installed, so Open Transport,
+Navigation Services and other post-System 7 APIs have no headers).
+
+To build a CMake project for 68k, configure it with
+`-DCMAKE_TOOLCHAIN_FILE=toolchain/build/toolchain/m68k-apple-macos/cmake/retro68.toolchain.cmake`.
+For PowerPC, use
+`toolchain/build/toolchain/powerpc-apple-macos/cmake/retroppc.toolchain.cmake`.
+Each application builds as a `.bin` (MacBinary) that `tools/push.sh` can copy
+into the guest. Retro68's samples are already built in
+`toolchain/build/build-target/Samples` (68k) and
+`toolchain/build/build-target-ppc/Samples` (PowerPC).
+
+To rebuild the toolchain, run:
+
+```
+mkdir -p toolchain/build && cd toolchain/build
+nice -n 19 ../Retro68/build-toolchain.bash --no-carbon --ninja
+```
+
+Dependencies: `brew install boost cmake gmp mpfr libmpc bison texinfo`.
+
+A Retro68 CMake project must declare both C and CXX (`project(Name C CXX)`),
+because `add_application` links with the C++ driver.
+
+## Reference sources
+
+These clones are not in this repository (`.gitignore` excludes `refs/` and
+`toolchain/`). To recreate them:
+
+```bash
+git clone https://github.com/elliotnunn/NanoKernel.git refs/NanoKernel
+```
+
+```bash
+git clone https://git.applefritter.com/Macintosh-SW/powermac-rom.git refs/powermac-rom
+```
+
+```bash
+git clone --recursive https://github.com/autc04/Retro68.git toolchain/Retro68
+```
+
+- `refs/NanoKernel` (commit b2b5613): Elliot Nunn's reconstruction of the
+  v1 NanoKernel.
+- `refs/powermac-rom` (commit 4de6504): the v2 NanoKernel sources, in
+  `NanoKernel/NK*.s`.
+- `toolchain/Retro68` (commit a4a389c41): to build it, run
+  `../Retro68/build-toolchain.bash --no-carbon --ninja` from
+  `toolchain/build`.
+
+## Page protection probe
+
+`probe/` is a PowerPC console application that write-protects one page of its
+own heap with the NanoKernel's area calls, then stores to it and reports what
+the Exception Manager handler saw. To build it and run it in a throwaway
+guest:
+
+```
+cmake -S probe -B probe/build -DCMAKE_TOOLCHAIN_FILE=$PWD/toolchain/build/toolchain/powerpc-apple-macos/cmake/retroppc.toolchain.cmake
+cmake --build probe/build
+SCRATCH=1 ./run.sh &
+tools/push.sh -n Probe probe/build/Probe.bin
+```
+
+Then open the Probe disc in the guest and run Probe. It pauses after printing
+the area information; press Return to run the tests.
+
+## Write logger
+
+`common/nk.h` holds the NanoKernel area calls (`nk_protect`, `nk_unprotect`,
+`nk_area_from_address`) and the Exception Manager declarations, including
+`nk_find_system_installer()`, which finds the installer for the Exception
+Manager's system-wide handler slot.
+
+`wlog/` (WLog) write-protects its own application heap and logs stores into
+it made while another application is current. It logs native PowerPC
+stores by writer (PC, LR, application). For 68k stores it lists the last 16
+that the 68k write hook caught (see below), without the application name.
+
+WLog installs the 68k write hook and points it at its heap. Without the
+hook, a 68k store into the protected heap at interrupt time or during a
+process switch hangs the whole machine. A Time Manager task re-protects
+pages every 16 ms. Run WLog only in a `SCRATCH=1` guest.
+
+`run/wlog-scenario.sh [WLog.bin]` boots a scratch guest if none is running,
+runs WLog, has the Finder draw over it, then stops it and saves screenshots
+as `run/ws-*.png`.
+
+## 68k write hook
+
+A store from 68k code to a protected page never reaches the Exception
+Manager. The emulator handles the fault itself: in an ordinary context the
+application gets a bus error (error type 1), and at interrupt time or during
+a process switch the emulator double-faults and the machine hangs.
+
+`common/h68k.s` is a small PowerPC handler that goes in front of the
+emulator's own exception entry. The NanoKernel delivers every exception
+taken in emulator context to the address in the emulator context block
+(logical 0x68FFF14C, normally 0x6806D440). The hook checks for a write
+violation (exception code 21) at an address in its range, makes that page
+writable with `MPSetAreaAccess`, and returns to the faulting instruction,
+which then succeeds. Anything else goes to the emulator unchanged.
+
+The hook lives in unused space in the emulator data page (logical
+0x68FFFB80-0x68FFFEFF: data, then code). That space stayed zero across 40
+dumps taken while the Finder and QuickTime ran. The hook stays installed
+after the installing application quits.
+
+`common/h68k.h` installs and removes it: `h68k_install(area)`,
+`h68k_set_range(lo, hi)` and `h68k_uninstall()`. `h68k_install` refuses
+unless the context block's handler is in the emulator's code and the space
+is all zeros. `common/h68k.cmake` assembles `h68k.s` at build time; call
+`h68k_embed(target)` from an application's CMakeLists.
+
+`h68k/` (H68KTest) tests the hook. The first run installs it and runs three
+68k stores: to an unprotected page, to a protected page in the range (the
+hook opens the page and the store lands), and to a protected page outside the
+range (the application is killed with error type 1 and the system stays up).
+The second run prints the hook's counters and removes it.
+
+To read the hook's counters and its last 16 events from the host while the
+guest runs:
+
+```bash
+tools/h68k-read.py
+```
+
+To check that the hook's space in the emulator data page stays zero, take 40
+dumps half a second apart (do this before installing the hook):
+
+```bash
+tools/edp-scan.py 40 0.5
+```

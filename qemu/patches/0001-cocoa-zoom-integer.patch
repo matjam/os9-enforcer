@@ -1,0 +1,389 @@
+diff --git a/qapi/ui.json b/qapi/ui.json
+index b2c42a7f5..0c20101b9 100644
+--- a/qapi/ui.json
++++ b/qapi/ui.json
+@@ -1448,6 +1448,10 @@
+ # @zoom-interpolation: Apply interpolation to smooth output when
+ #     zoom-to-fit is enabled.  Defaults to "off".  (Since 9.0)
+ #
++# @zoom-integer: Zoom the guest display by whole-number factors
++#     only, centred in the window, and snap window resizing to those
++#     factors.  Implies zoom-to-fit.  Defaults to "off".  (Since 11.2)
++#
+ # Since: 7.0
+ ##
+ { 'struct': 'DisplayCocoa',
+@@ -1456,7 +1460,8 @@
+       '*full-grab': 'bool',
+       '*swap-opt-cmd': 'bool',
+       '*zoom-to-fit': 'bool',
+-      '*zoom-interpolation': 'bool'
++      '*zoom-interpolation': 'bool',
++      '*zoom-integer': 'bool'
+   } }
+ 
+ ##
+diff --git a/qemu-options.hx b/qemu-options.hx
+index 34970fffc..2e2582e91 100644
+--- a/qemu-options.hx
++++ b/qemu-options.hx
+@@ -2261,6 +2261,7 @@ DEF("display", HAS_ARG, QEMU_OPTION_display,
+     "-display cocoa[,full-grab=on|off][,swap-opt-cmd=on|off]\n"
+     "              [,show-cursor=on|off][,left-command-key=on|off]\n"
+     "              [,full-screen=on|off][,zoom-to-fit=on|off]\n"
++    "              [,zoom-integer=on|off]\n"
+ #endif
+ #if defined(CONFIG_OPENGL)
+     "-display egl-headless[,rendernode=<file>]\n"
+@@ -2391,6 +2392,11 @@ SRST
+         ``zoom-to-fit=on|off`` : Expand video output to the window size,
+                                  defaults to "off"
+ 
++        ``zoom-integer=on|off`` : Zoom video output by whole-number factors
++                                  only, centred in the window, and snap
++                                  window resizing to those factors. Implies
++                                  zoom-to-fit. Defaults to "off"
++
+     ``egl-headless[,rendernode=<file>]``
+         Offload all OpenGL operations to a local DRI device. For any
+         graphical display, this display needs to be paired with either
+diff --git a/ui/cocoa.m b/ui/cocoa.m
+index 3751be379..884e2da68 100644
+--- a/ui/cocoa.m
++++ b/ui/cocoa.m
+@@ -101,6 +101,9 @@ static void cocoa_switch(DisplayChangeListener *dcl,
+ static bool swap_opt_cmd;
+ 
+ static CGInterpolationQuality zoom_interpolation = kCGInterpolationNone;
++static bool zoom_integer;
++/* Whole-number zoom chosen by resizing the window; 0 picks the largest fit. */
++static int zoom_integer_scale;
+ static NSTextField *pauseLabel;
+ 
+ static bool allow_events;
+@@ -207,6 +210,9 @@ - (void) notifyMouseModeChange;
+ - (BOOL) isMouseGrabbed;
+ - (QEMUScreen) gscreen;
+ - (void) raiseAllKeys;
++- (void) resizeWindow;
++- (void) layoutInSuperview;
++- (NSSize) snapFrameSize:(NSSize)frameSize;
+ @end
+ 
+ QemuCocoaView *cocoaView;
+@@ -495,22 +501,150 @@ - (NSSize) screenSafeAreaSize
+     return size;
+ }
+ 
++- (CGFloat) backingScale
++{
++    CGFloat scale = [[self window] backingScaleFactor];
++    return scale > 0 ? scale : 1.0;
++}
++
++/* Largest whole-number zoom at which the guest screen fits in size (points). */
++- (int) integerScaleForSize:(NSSize)size
++{
++    CGFloat b = [self backingScale];
++    int kx = (int)floor(size.width * b / screen.width);
++    int ky = (int)floor(size.height * b / screen.height);
++
++    return MAX(1, MIN(kx, ky));
++}
++
++/* Largest whole-number zoom whose window still fits on the current screen. */
++- (int) maxIntegerScale
++{
++    NSWindow *win = [self window];
++    NSScreen *scr = [win screen] ? [win screen] : [NSScreen mainScreen];
++    NSRect content = [win contentRectForFrameRect:[scr visibleFrame]];
++
++    return [self integerScaleForSize:content.size];
++}
++
++/*
++ * Size the window for zoom-integer: the zoom the user picked by resizing,
++ * or the largest that fits on screen, keeping the window's top left corner.
++ */
++- (void) resizeWindowInteger
++{
++    NSWindow *win = [self window];
++    CGFloat b = [self backingScale];
++    int k = [self maxIntegerScale];
++    NSRect content;
++    NSRect frame;
++
++    if (zoom_integer_scale) {
++        k = MIN(zoom_integer_scale, k);
++    }
++
++    /* Resizing is snapped in snapFrameSize:, not by a fixed aspect ratio. */
++    [win setContentResizeIncrements:NSMakeSize(1.0, 1.0)];
++    [win setContentMinSize:NSMakeSize(screen.width / b, screen.height / b)];
++
++    content = [win contentRectForFrameRect:[win frame]];
++    content.origin.y = NSMaxY(content) - screen.height * k / b;
++    content.size = NSMakeSize(screen.width * k / b, screen.height * k / b);
++    frame = [win constrainFrameRect:[win frameRectForContentRect:content]
++                           toScreen:[win screen]];
++    [win setFrame:frame display:YES];
++}
++
+ - (void) resizeWindow
+ {
+-    [[self window] setContentAspectRatio:NSMakeSize(screen.width, screen.height)];
++    NSWindow *win = [self window];
++    NSWindowStyleMask style = [win styleMask];
+ 
+-    if (!([[self window] styleMask] & NSWindowStyleMaskResizable)) {
+-        CGFloat width = screen.width / [[self window] backingScaleFactor];
+-        CGFloat height = screen.height / [[self window] backingScaleFactor];
++    if (zoom_integer && (style & NSWindowStyleMaskResizable)) {
++        if (!(style & NSWindowStyleMaskFullScreen)) {
++            [self resizeWindowInteger];
++        }
++        [self layoutInSuperview];
++        return;
++    }
++
++    [win setContentAspectRatio:NSMakeSize(screen.width, screen.height)];
++
++    if (!(style & NSWindowStyleMaskResizable)) {
++        CGFloat width = screen.width / [win backingScaleFactor];
++        CGFloat height = screen.height / [win backingScaleFactor];
+ 
+-        [[self window] setContentSize:NSMakeSize(width, height)];
+-        [[self window] center];
+-    } else if ([[self window] styleMask] & NSWindowStyleMaskFullScreen) {
+-        [[self window] setContentSize:[self fixAspectRatio:[self screenSafeAreaSize]]];
+-        [[self window] center];
++        [win setContentSize:NSMakeSize(width, height)];
++        [win center];
++    } else if (style & NSWindowStyleMaskFullScreen) {
++        [win setContentSize:[self fixAspectRatio:[self screenSafeAreaSize]]];
++        [win center];
+     } else {
+-        [[self window] setContentSize:[self fixAspectRatio:[self frame].size]];
++        NSView *container = [self superview];
++        NSSize size = container ? [container frame].size : [self frame].size;
++
++        [win setContentSize:[self fixAspectRatio:size]];
++    }
++    [self layoutInSuperview];
++}
++
++/*
++ * Place this view inside its container, the window's content view.  Without
++ * zoom-integer it fills the container.  With it, the guest screen is drawn at
++ * the largest whole-number zoom that fits, centred on device pixels, and the
++ * container paints the border black.
++ */
++- (void) layoutInSuperview
++{
++    NSView *container = [self superview];
++    NSRect area;
++    NSRect frame;
++    CGFloat b;
++    int k;
++
++    if (!container) {
++        return;
++    }
++
++    area = [container bounds];
++    if (!zoom_integer) {
++        [self setFrame:area];
++        [self updateBounds];
++        return;
++    }
++
++    if (@available(macOS 11.0, *)) {
++        area = [container safeAreaRect];
+     }
++    b = [self backingScale];
++    k = [self integerScaleForSize:area.size];
++    frame.size = NSMakeSize(screen.width * k / b, screen.height * k / b);
++    frame.origin.x = area.origin.x +
++        floor((area.size.width - frame.size.width) * b / 2) / b;
++    frame.origin.y = area.origin.y +
++        floor((area.size.height - frame.size.height) * b / 2) / b;
++    [self setFrame:frame];
++    [self updateBounds];
++    [container setNeedsDisplay:YES];
++}
++
++/*
++ * Called while the user drags the window edge with zoom-integer on: snap the
++ * proposed frame to the nearest whole-number zoom of the guest screen.
++ */
++- (NSSize) snapFrameSize:(NSSize)frameSize
++{
++    NSWindow *win = [self window];
++    CGFloat b = [self backingScale];
++    NSRect content = [win contentRectForFrameRect:
++                          NSMakeRect(0, 0, frameSize.width, frameSize.height)];
++    CGFloat k = MIN(content.size.width * b / screen.width,
++                    content.size.height * b / screen.height);
++
++    zoom_integer_scale = MIN(MAX(1, (int)lround(k)), [self maxIntegerScale]);
++    content.size = NSMakeSize(screen.width * zoom_integer_scale / b,
++                              screen.height * zoom_integer_scale / b);
++    return [win frameRectForContentRect:content].size;
+ }
+ 
+ - (void) updateBounds
+@@ -970,12 +1104,18 @@ - (void) handleMouseEvent:(NSEvent *)event
+ 
+     with_bql(^{
+         if (isAbsoluteEnabled) {
+-            CGFloat d = (CGFloat)screen.height / [self frame].size.height;
+-            NSPoint p = [event locationInWindow];
++            /*
++             * The view's bounds are the guest screen (see updateBounds), so
++             * converting into view coordinates gives guest pixels, whatever
++             * the zoom or the view's offset inside the window.
++             */
++            NSPoint p = [self convertPoint:[event locationInWindow] fromView:nil];
++            CGFloat x = MIN(MAX(p.x, 0), screen.width);
++            CGFloat y = MIN(MAX(p.y, 0), screen.height);
+ 
+             /* Note that the origin for Cocoa mouse coords is bottom left, not top left. */
+-            qemu_input_queue_abs(dcl.con, INPUT_AXIS_X, p.x * d, 0, screen.width);
+-            qemu_input_queue_abs(dcl.con, INPUT_AXIS_Y, screen.height - p.y * d, 0, screen.height);
++            qemu_input_queue_abs(dcl.con, INPUT_AXIS_X, x, 0, screen.width);
++            qemu_input_queue_abs(dcl.con, INPUT_AXIS_Y, screen.height - y, 0, screen.height);
+         } else {
+             qemu_input_queue_rel(dcl.con, INPUT_AXIS_X, [event deltaX]);
+             qemu_input_queue_rel(dcl.con, INPUT_AXIS_Y, [event deltaY]);
+@@ -1126,6 +1266,34 @@ - (void) raiseAllButtons
+ 
+ 
+ 
++/*
++ ------------------------------------------------------
++    QemuCocoaContainerView
++ ------------------------------------------------------
++ The window's content view.  It holds the QemuCocoaView and paints black
++ around it when zoom-integer leaves a border.
++*/
++@interface QemuCocoaContainerView : NSView
++@end
++
++@implementation QemuCocoaContainerView
++- (BOOL) isOpaque
++{
++    return YES;
++}
++
++- (void) drawRect:(NSRect) rect
++{
++    [[NSColor blackColor] setFill];
++    NSRectFill(rect);
++}
++
++- (void) resizeSubviewsWithOldSize:(NSSize) oldSize
++{
++    [cocoaView layoutInSuperview];
++}
++@end
++
+ /*
+  ------------------------------------------------------
+     QemuCocoaAppController
+@@ -1138,6 +1306,7 @@ @interface QemuCocoaAppController : NSObject
+ - (void)doToggleFullScreen:(id)sender;
+ - (void)showQEMUDoc:(id)sender;
+ - (void)zoomToFit:(id) sender;
++- (void)toggleZoomInteger:(id) sender;
+ - (void)displayConsole:(id)sender;
+ - (void)pauseQEMU:(id)sender;
+ - (void)resumeQEMU:(id)sender;
+@@ -1157,18 +1326,22 @@ @implementation QemuCocoaAppController
+ - (id) init
+ {
+     NSWindow *window;
++    QemuCocoaContainerView *container;
+ 
+     COCOA_DEBUG("QemuCocoaAppController: init\n");
+ 
+     self = [super init];
+     if (self) {
+ 
+-        // create a view and add it to the window
++        // create a view and add it to the window, inside a container that
++        // paints the border when zoom-integer centres the guest screen
+         cocoaView = [[QemuCocoaView alloc] initWithFrame:NSMakeRect(0.0, 0.0, 640.0, 480.0)];
+         if(!cocoaView) {
+             error_report("(cocoa) can't create a view");
+             exit(1);
+         }
++        container = [[QemuCocoaContainerView alloc] initWithFrame:[cocoaView frame]];
++        [container addSubview:cocoaView];
+ 
+         // create a window
+         window = [[NSWindow alloc] initWithContentRect:[cocoaView frame]
+@@ -1181,7 +1354,8 @@ - (id) init
+         [window setAcceptsMouseMovedEvents:YES];
+         [window setCollectionBehavior:NSWindowCollectionBehaviorFullScreenPrimary];
+         [window setTitle:qemu_name ? [NSString stringWithFormat:@"QEMU %s", qemu_name] : @"QEMU"];
+-        [window setContentView:cocoaView];
++        [window setContentView:container];
++        [container release];
+         [window makeKeyAndOrderFront:self];
+         [window center];
+         [window setDelegate: self];
+@@ -1267,6 +1441,15 @@ - (void)windowDidResize:(NSNotification *)notification
+     [cocoaView updateUIInfo];
+ }
+ 
++- (NSSize)windowWillResize:(NSWindow *)sender toSize:(NSSize)frameSize
++{
++    if (zoom_integer && [sender inLiveResize] &&
++        !([sender styleMask] & NSWindowStyleMaskFullScreen)) {
++        return [cocoaView snapFrameSize:frameSize];
++    }
++    return frameSize;
++}
++
+ /* Called when the user clicks on a window's close button */
+ - (BOOL)windowShouldClose:(id)sender
+ {
+@@ -1361,6 +1544,15 @@ - (void)zoomToFit:(id) sender
+     [cocoaView resizeWindow];
+ }
+ 
++/* Zooms by whole-number factors only, when zoom-to-fit is on */
++- (void)toggleZoomInteger:(id) sender
++{
++    zoom_integer = !zoom_integer;
++    zoom_integer_scale = 0;
++    [sender setState:zoom_integer ? NSControlStateValueOn : NSControlStateValueOff];
++    [cocoaView resizeWindow];
++}
++
+ - (void)toggleZoomInterpolation:(id) sender
+ {
+     if (zoom_interpolation == kCGInterpolationNone) {
+@@ -1636,6 +1828,9 @@ static void create_initial_menus(void)
+     menuItem = [[[NSMenuItem alloc] initWithTitle:@"Zoom To Fit" action:@selector(zoomToFit:) keyEquivalent:@""] autorelease];
+     [menuItem setState: [[cocoaView window] styleMask] & NSWindowStyleMaskResizable ? NSControlStateValueOn : NSControlStateValueOff];
+     [menu addItem: menuItem];
++    menuItem = [[[NSMenuItem alloc] initWithTitle:@"Integer Scaling" action:@selector(toggleZoomInteger:) keyEquivalent:@""] autorelease];
++    [menuItem setState: zoom_integer ? NSControlStateValueOn : NSControlStateValueOff];
++    [menu addItem: menuItem];
+     menuItem = [[[NSMenuItem alloc] initWithTitle:@"Zoom Interpolation" action:@selector(toggleZoomInterpolation:) keyEquivalent:@""] autorelease];
+     [menuItem setState: zoom_interpolation == kCGInterpolationLow ? NSControlStateValueOn : NSControlStateValueOff];
+     [menu addItem: menuItem];
+@@ -2005,6 +2200,12 @@ static void cocoa_display_init(DisplayState *ds, DisplayOptions *opts)
+         zoom_interpolation = kCGInterpolationLow;
+     }
+ 
++    if (opts->u.cocoa.has_zoom_integer && opts->u.cocoa.zoom_integer) {
++        zoom_integer = true;
++        [cocoaView window].styleMask |= NSWindowStyleMaskResizable;
++        [cocoaView resizeWindow];
++    }
++
+     create_initial_menus();
+     /*
+      * Create the menu entries which depend on QEMU state (for consoles

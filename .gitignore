@@ -1,0 +1,37 @@
+# Only our own sources, scripts and patches are tracked. Third-party trees
+# are fetched and built by scripts (qemu/build.sh) or cloned (see "Reference
+# sources" in the README).
+
+/disks/
+/media/
+# run/ holds guest logs, screenshots, sockets and memory dumps; keep only
+# the scripts in it.
+/run/*
+!/run/*.sh
+!/run/*.py
+# qemu/build.sh downloads the release tarball, unpacks and patches it in
+# qemu/src, and builds in qemu/build.
+/qemu/src/
+/qemu/src.part/
+/qemu/build/
+/qemu/*.tar.*
+/toolchain/
+/refs/
+/probe/build/
+/wlog/build*/
+/h68k/build/
+
+# Binary files, wherever they are.
+*.bin
+*.img
+*.iso
+*.dmg
+*.qcow2
+*.o
+*.a
+*.xcoff
+*.pef
+*.png
+*.tar.*
+*.part
+.DS_Store
