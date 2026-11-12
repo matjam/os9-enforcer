@@ -327,6 +327,52 @@ tools/hooks-read.py
 
 It reads everything in one pause of the guest through `tools/vdump.py`.
 
+## Cross-application write logger
+
+`xlog/` (XLog) logs stores from one application into another's memory,
+across every running application. It only logs: every store is allowed.
+
+Each running application's partition, from the Process Manager, is a
+domain. While an application is not current, XLog write-protects the whole
+pages of its partition and sets their bits in a page bitmap over the blue
+area. Both write hooks manage exactly those pages. A store into a protected
+page is opened and recorded by the hook, unless it lands in the current
+application's own domain, which the hooks only count.
+
+A Time Manager task runs every 16 ms:
+- When ApplZone changes (a process switch), it points the hooks' current
+  range at the new application's domain and protects the previous
+  application's domain again.
+- It takes the hooks' rings. A store is the target's own when ApplZone at
+  the store is inside the target's partition. Otherwise it is logged by
+  store site (PC and LR for native code, the next 68k instruction for 68k
+  code), writing application and target. The page is protected again unless
+  it belongs to the current application.
+
+A store that reaches the Exception Manager from another context goes to a
+fallback handler in its system-wide slot, which opens the page and records
+the store in a third ring. The process list is read again every half
+second, adding and removing domains.
+
+To run it, boot a scratch guest from the VM-off overlay, push XLog, and
+open it. It prints a status line every 10 seconds. To stop it, bring it to
+the front and press a key; it prints the domains and the 24 most frequent
+cross-domain writers.
+
+```bash
+SCRATCH=1 DISK=disks/os9-novm.qcow2 ./run.sh &
+tools/push.sh -n XLog xlog/build/XLog.bin
+```
+
+To read its counters, domains and writers from the host while it runs:
+
+```bash
+tools/xlog-read.py
+```
+
+XLog's state begins with a header giving the offsets and sizes of its parts,
+which `xlog-read.py` checks against its own copy of the layout.
+
 To check that the hook's space in the emulator data page stays zero, take 40
 dumps half a second apart (do this before installing the hook):
 

@@ -2,35 +2,46 @@
  * XLog: log writes from one application into another's memory, across all
  * running applications. Log only: every write is allowed.
  *
- * Each running application's partition (from the Process Manager, rounded
- * inward to whole pages) is a domain. The pages of every domain start
- * write-protected. A write to a protected page faults:
- *   - native code: the Exception Manager's system-wide handler slot;
- *   - 68k code: the 68k write hook (common/h68k.s), which opens the page
- *     and records the store in its ring for the next tick.
- * If the domain written belongs to the current application (the one whose
- * heap zone is ApplZone), it is the owner's own write: the page stays open
- * until that application is switched out. Otherwise it is a cross-domain
- * write: it is logged by writer (PC, LR, current application) and target,
- * and the page is protected again on the next tick.
+ * Each running application's partition (from the Process Manager) is a
+ * domain. Its whole pages ([lo, hi), the partition rounded inward to pages)
+ * are write-protected while the application is not current, and their bits
+ * are set in a page bitmap over the blue area. Both write hooks manage
+ * exactly the pages whose bit is set:
+ *   - 68k code: common/h68k.s, in front of the emulator;
+ *   - native code: common/hnat.s, in front of the Exception Manager.
+ * A hook opens the faulting page, retries the store and records it in its
+ * ring, unless the address is in the hooks' current range (the current
+ * application's domain), where it only counts it.
  *
- * XLog's own partition is not a domain, and nothing outside partitions is
- * protected. A 16 ms Time Manager task notices process switches (ApplZone
- * changes), protects pages that should no longer be open, and takes the
- * hook's ring.
+ * A 16 ms Time Manager task:
+ *   - notices a process switch (ApplZone changes), points both hooks'
+ *     current range at the new application's domain, and protects all of
+ *     the previous application's domain again;
+ *   - takes the rings. A store is the target's own when ApplZone at the
+ *     store is inside the target's partition, and cross-domain otherwise:
+ *     logged by writer (PC and LR, or the 68k PC; application) and target.
+ *     The page is protected again unless it is the current application's.
+ * If a ring overflowed between ticks, every domain but the current one is
+ * protected again.
+ *
+ * A write that reaches the Exception Manager without going through the
+ * native hook (from another context) goes to a fallback handler in the
+ * Exception Manager's system-wide slot. It opens the page and records the
+ * store in a third ring.
  *
  * Safety rule: a protected page always has its bit set in the bitmap and a
- * live domain behind it. Otherwise a fault on it would go on to the
- * emulator or kill the application. Domains are added as live, then bits,
- * then protect; removed as dying, unprotect, then bits, then dead.
+ * live domain behind it; otherwise a fault on it kills the application or
+ * hangs the machine. Domains are added as live, then bits, then protect;
+ * removed as dying, unprotect, then bits, then dead.
  *
- * Run it only in a SCRATCH=1 guest. To stop, bring XLog to the front and
- * press a key.
+ * XLog's own partition is not a domain. Run it only in a SCRATCH=1 guest
+ * with virtual memory off. To stop, bring XLog to the front and press a key.
  */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stddef.h>
 #include <MacTypes.h>
 #include <MacMemory.h>
 #include <Events.h>
@@ -39,38 +50,39 @@
 #include <MixedMode.h>
 
 #include "nk.h"
+#include "hook.h"
 #include "h68k.h"
+#include "hnat.h"
 
 enum {
     kMaxDomains = 32,
-    kMaxOpen = 256,
     kMaxWriters = 512,
+    kFallbackRing = 16,
     kTimerMs = 16,
     kRefreshTicks = 30, /* re-read the process list every half second */
     kStatusTicks = 600, /* print a status line every 10 seconds */
-    kMagic = 'XLG!'
+    kMagic = 'XLG2'
 };
 
 /* The bitmap covers the whole blue area, one bit per page. */
 #define kSpanLo 0UL
 #define kSpanHi 0x40000000UL
 #define kBitmapBytes ((kSpanHi - kSpanLo) / kPage / 8)
+#define kPageMask (~(unsigned long)(kPage - 1))
+
+/* Where a store was caught. */
+enum { kSrcNative, kSrc68k, kSrcFallback, kSources };
 
 typedef struct {
-    volatile int live;   /* in use and protected */
-    volatile int dying;  /* being removed: never protect its pages again */
-    int seen;            /* found by the last refresh */
-    unsigned long lo, hi;
-    unsigned long location, size; /* partition, from the Process Manager */
+    volatile unsigned long live;  /* in use: its pages may be protected */
+    volatile unsigned long dying; /* being removed: never protect again */
+    unsigned long seen;           /* found by the last refresh */
+    unsigned long lo, hi;         /* whole pages inside the partition */
+    unsigned long location, size; /* the partition */
     ProcessSerialNumber psn;
     char name[16];
     unsigned long self_writes, foreign_writes_in;
 } Domain;
-
-typedef struct {
-    unsigned long page;
-    int domain;
-} OpenPage;
 
 /* A cross-domain writer: a store site, the application current at the
    store, and the domain written. For 68k stores, pc is the 68k instruction
@@ -78,32 +90,46 @@ typedef struct {
 typedef struct {
     unsigned long pc, lr, writer_zone, target_lo;
     unsigned long first_addr, last_addr, count;
-    int is68k;
+    unsigned long source;
     char writer[16];
     char target[16];
 } Writer;
 
+/* tools/xlog-read.py names these in this order. */
 typedef struct {
-    unsigned long magic;
-    unsigned long self;
-    volatile int active;
-    volatile int busy; /* the handler is running: the timer waits */
+    unsigned long self[kSources], foreign[kSources], lost[kSources];
+    unsigned long outside; /* ring entries outside every live domain */
+    unsigned long switches, timer_runs, kernel_errors;
+    unsigned long refreshes, added, removed;
+    unsigned long dropped, nwriters;
+    unsigned long info_errors; /* GetProcessInformation failures */
+} Counters;
+
+typedef struct {
+    /* For tools/xlog-read.py: where everything is. */
+    unsigned long magic, self;
+    unsigned long off_counters, n_counters;
+    unsigned long off_domains, n_domains, domain_size;
+    unsigned long off_writers, max_writers, writer_size;
+    unsigned long off_cur;
+
+    Counters c;
+    long cur; /* domain of the current application, or -1 */
+    unsigned long cur_zone;
+    volatile unsigned long active;
     unsigned long area;
     unsigned long my_lo, my_hi; /* XLog's own partition */
-    unsigned long my_zone;
-    Domain domains[kMaxDomains];
-    int cur; /* domain of the current application, or -1 */
-    unsigned long cur_zone;
-    int nopen;
-    OpenPage open[kMaxOpen];
+    unsigned long seen[kSources];
+    volatile HookData *h68k, *hnat;
+    /* The hooks' own and passed-on counts, kept for the report because
+       removing a hook frees its data. */
+    unsigned long hook_self[2], hook_passed[2];
     unsigned char *bitmap;
-    unsigned long h68k_seen, h68k_lost;
-    unsigned long native_self, native_foreign, m68k_self, m68k_foreign;
-    unsigned long switches, timer_runs, kernel_errors, open_overflows;
-    unsigned long refreshes, added, removed, chained;
-    unsigned long dropped;
-    int nwriters;
+    Domain domains[kMaxDomains];
     Writer writers[kMaxWriters];
+    /* Written by the fallback handler; fb_count is the last seq. */
+    volatile unsigned long fb_count, fb_idx;
+    HookEvent fb_ring[kFallbackRing];
     TMTask timer;
     RoutineDescriptor timer_rd;
 } State;
@@ -117,19 +143,16 @@ static inline volatile void *lowmem(unsigned long addr)
     return (volatile void *)addr;
 }
 
-static unsigned long current_zone(void)
+/* A long at an address that is only 2-byte aligned. */
+static unsigned long lowmem_long(unsigned long addr)
 {
-    volatile unsigned short *p = lowmem(0x2AA); /* ApplZone */
+    volatile unsigned short *p = lowmem(addr);
     return ((unsigned long)p[0] << 16) | p[1];
 }
 
-static void current_app(char out[16])
+static unsigned long current_zone(void)
 {
-    volatile unsigned char *name = lowmem(0x910); /* CurApName */
-    int n = name[0] < 15 ? name[0] : 15;
-    for (int i = 0; i < n; i++)
-        out[i] = name[1 + i];
-    out[n] = 0;
+    return lowmem_long(0x2AA); /* ApplZone */
 }
 
 static void copy_name(char out[16], const char *in)
@@ -150,11 +173,23 @@ static void zone_name(char out[16], unsigned long zone)
     out[13] = 0;
 }
 
-static int domain_of(State *s, unsigned long addr)
+/* The live domain whose protected pages hold addr. */
+static int domain_at(State *s, unsigned long addr)
 {
     for (int i = 0; i < kMaxDomains; i++) {
         Domain *d = &s->domains[i];
         if (d->live && addr >= d->lo && addr < d->hi)
+            return i;
+    }
+    return -1;
+}
+
+/* The live domain whose partition holds addr (an ApplZone). */
+static int domain_of_zone(State *s, unsigned long addr)
+{
+    for (int i = 0; i < kMaxDomains; i++) {
+        Domain *d = &s->domains[i];
+        if (d->live && addr >= d->location && addr - d->location < d->size)
             return i;
     }
     return -1;
@@ -171,188 +206,206 @@ static void set_bits(State *s, unsigned long lo, unsigned long hi, int on)
     }
 }
 
-static void protect(State *s, unsigned long lo, unsigned long len)
+/* Protect pages of domain i, unless it is going away. */
+static void protect(State *s, int i, unsigned long lo, unsigned long len)
 {
+    Domain *d = &s->domains[i];
+    if (!d->live || d->dying)
+        return;
     if (nk_protect(s->area, lo, len))
-        s->kernel_errors++;
+        s->c.kernel_errors++;
 }
 
-/* Protect again every open page outside domain keep (keep = -1: all).
-   Pages of dying domains are dropped without protecting them. */
-static void close_others(State *s, int keep)
+static void protect_domain(State *s, int i)
 {
-    int n = 0;
-    for (int i = 0; i < s->nopen; i++) {
-        OpenPage *o = &s->open[i];
-        if (o->domain == keep && keep >= 0) {
-            s->open[n++] = *o;
-            continue;
-        }
-        Domain *d = &s->domains[o->domain];
-        if (d->live && !d->dying)
-            protect(s, o->page, kPage);
-    }
-    s->nopen = n;
+    protect(s, i, s->domains[i].lo, s->domains[i].hi - s->domains[i].lo);
 }
 
-/* Note a page that is now writable. */
-static void note_open(State *s, unsigned long page, int d)
+static void protect_others(State *s)
 {
-    if (s->nopen == kMaxOpen) {
-        s->open_overflows++;
-        close_others(s, -1);
-    }
-    s->open[s->nopen].page = page;
-    s->open[s->nopen].domain = d;
-    s->nopen++;
+    for (int i = 0; i < kMaxDomains; i++)
+        if (i != s->cur)
+            protect_domain(s, i);
 }
 
-/* On a process switch, protect the pages the previous application had
-   open. */
+/* Point both hooks' current range at domain i (-1: none). */
+static void set_current(State *s, int i)
+{
+    unsigned long lo = 0, hi = 0;
+    if (i >= 0) {
+        lo = s->domains[i].lo;
+        hi = s->domains[i].hi;
+    }
+    hook_set_current(s->h68k, lo, hi);
+    hook_set_current(s->hnat, lo, hi);
+    s->cur = i;
+}
+
+/* On a process switch, protect the previous application's domain. */
 static void check_switch(State *s)
 {
     unsigned long zone = current_zone();
     if (zone == s->cur_zone)
         return;
     s->cur_zone = zone;
-    int d = domain_of(s, zone);
-    if (d != s->cur) {
-        s->switches++;
-        s->cur = d;
-        close_others(s, d);
-    }
+    int d = domain_of_zone(s, zone);
+    if (d >= 0 && s->domains[d].dying)
+        d = -1;
+    if (d == s->cur)
+        return;
+    int old = s->cur;
+    set_current(s, d);
+    s->c.switches++;
+    if (old >= 0)
+        protect_domain(s, old);
 }
 
-static void writer_name(State *s, unsigned long zone, int is68k, char out[16])
+static void writer_name(State *s, unsigned long zone, char out[16])
 {
-    int w = domain_of(s, zone);
+    int w = domain_of_zone(s, zone);
     if (w >= 0)
         copy_name(out, s->domains[w].name);
-    else if (zone == s->my_zone)
+    else if (zone >= s->my_lo && zone < s->my_hi)
         copy_name(out, "XLog");
-    else if (!is68k)
-        current_app(out);
+    else if (zone == lowmem_long(0x2A6)) /* SysZone */
+        copy_name(out, "System");
     else
         zone_name(out, zone);
 }
 
-static void record(State *s, unsigned long pc, unsigned long lr,
-                   unsigned long zone, int t, unsigned long addr, int is68k)
+static void record(State *s, int src, unsigned long pc, unsigned long lr,
+                   unsigned long zone, int t, unsigned long addr)
 {
     Domain *d = &s->domains[t];
     d->foreign_writes_in++;
-    for (int i = 0; i < s->nwriters; i++) {
+    for (unsigned long i = 0; i < s->c.nwriters; i++) {
         Writer *w = &s->writers[i];
         if (w->pc == pc && w->lr == lr && w->writer_zone == zone &&
-            w->target_lo == d->lo && w->is68k == is68k) {
+            w->target_lo == d->lo && w->source == (unsigned long)src) {
             w->count++;
             w->last_addr = addr;
             return;
         }
     }
-    if (s->nwriters == kMaxWriters) {
-        s->dropped++;
+    if (s->c.nwriters == kMaxWriters) {
+        s->c.dropped++;
         return;
     }
-    Writer *w = &s->writers[s->nwriters];
+    Writer *w = &s->writers[s->c.nwriters];
     w->pc = pc;
     w->lr = lr;
     w->writer_zone = zone;
     w->target_lo = d->lo;
     w->first_addr = w->last_addr = addr;
     w->count = 1;
-    w->is68k = is68k;
-    writer_name(s, zone, is68k, w->writer);
+    w->source = src;
+    writer_name(s, zone, w->writer);
     copy_name(w->target, d->name);
-    s->nwriters++;
+    s->c.nwriters++;
 }
 
-/* Take the 68k stores the hook caught since the last call. */
-static void drain_h68k(State *s)
+/* Take the stores a ring holds with seq in (seen, handled]. */
+static void drain(State *s, int src, volatile HookEvent *ring, unsigned long n,
+                  unsigned long handled)
 {
-    volatile H68kData *hd = h68k_data();
-    unsigned long handled = hd->count_handled;
-    unsigned long seen = s->h68k_seen;
-    if (handled == seen)
+    unsigned long seen = s->seen[src];
+    if (handled == seen || !ring)
         return;
-    if (handled - seen > kH68kRing) {
-        /* Pages the hook opened that are no longer in its ring: protect
-           every domain but the current one again. */
-        s->h68k_lost += handled - seen - kH68kRing;
-        for (int i = 0; i < kMaxDomains; i++) {
-            Domain *d = &s->domains[i];
-            if (d->live && !d->dying && i != s->cur)
-                protect(s, d->lo, d->hi - d->lo);
-        }
+    if (handled - seen > n) {
+        /* Pages opened by stores no longer in the ring. */
+        s->c.lost[src] += handled - seen - n;
+        protect_others(s);
     }
-    for (int i = 0; i < kH68kRing; i++) {
-        volatile H68kEvent *e = &hd->ring[i];
-        if (e->seq <= seen || e->seq > handled)
+    for (unsigned long i = 0; i < n; i++) {
+        volatile HookEvent *e = &ring[i];
+        if (e->seq - seen - 1 >= handled - seen)
             continue;
-        int t = domain_of(s, e->addr);
-        if (t < 0)
+        unsigned long addr = e->addr, zone = e->zone;
+        int t = domain_at(s, addr);
+        if (t < 0) {
+            s->c.outside++;
             continue;
-        if (!s->domains[t].dying)
-            note_open(s, e->addr & ~(unsigned long)(kPage - 1), t);
-        if (domain_of(s, e->zone) == t) {
-            s->m68k_self++;
+        }
+        if (domain_of_zone(s, zone) == t) {
+            s->c.self[src]++;
             s->domains[t].self_writes++;
         } else {
-            s->m68k_foreign++;
-            record(s, h68k_next_pc(e->r24), 0, e->zone, t, e->addr, 1);
+            s->c.foreign[src]++;
+            if (src == kSrc68k)
+                record(s, src, hook_next_pc(e->r24), 0, zone, t, addr);
+            else
+                record(s, src, e->pc, e->lr, zone, t, addr);
         }
+        if (t != s->cur)
+            protect(s, t, addr & kPageMask, kPage);
     }
-    s->h68k_seen = handled;
+    s->seen[src] = handled;
 }
 
+static void drain_all(State *s)
+{
+    drain(s, kSrc68k, s->h68k->ring, kHookRing, s->h68k->count_handled);
+    drain(s, kSrcNative, s->hnat->ring, kHookRing, s->hnat->count_handled);
+    drain(s, kSrcFallback, s->fb_ring, kFallbackRing, s->fb_count);
+}
+
+/* The Exception Manager's system-wide handler: writes to managed pages
+   that did not come through the native hook. */
 static long handler(ExceptionInfo *e)
 {
     State *s = g_state;
     MemoryExceptionInfo *mi = e->memoryInfo;
     if (!s || !s->active || e->theKind != kReadOnlyMemoryException || !mi ||
         mi->theAddress >= kSpanHi ||
-        !h68k_bit(s->bitmap, kSpanLo, mi->theAddress))
+        !hook_bit(s->bitmap, kSpanLo, mi->theAddress))
         return g_prev ? g_prev(e) : -1;
     unsigned long addr = mi->theAddress;
-    int t = domain_of(s, addr);
-    if (t < 0) {
-        /* Bit set without a live domain: should not happen. */
-        s->chained++;
-        return g_prev ? g_prev(e) : -1;
-    }
-
-    s->busy = 1;
-    check_switch(s);
-    unsigned long page = addr & ~(unsigned long)(kPage - 1);
-    if (nk_unprotect(s->area, page, kPage))
-        s->kernel_errors++;
-    if (!s->domains[t].dying)
-        note_open(s, page, t);
-    if (t == s->cur) {
-        s->native_self++;
-        s->domains[t].self_writes++;
-    } else {
-        s->native_foreign++;
-        record(s, e->machineState->PC.lo, e->machineState->LR.lo,
-               current_zone(), t, addr, 0);
-    }
-    s->busy = 0;
+    if (nk_unprotect(s->area, addr & kPageMask, kPage))
+        s->c.kernel_errors++;
+    unsigned long seq = s->fb_count + 1;
+    volatile HookEvent *ev = &s->fb_ring[s->fb_idx];
+    s->fb_idx = (s->fb_idx + 1) % kFallbackRing;
+    ev->seq = seq;
+    ev->pc = e->machineState->PC.lo;
+    ev->addr = addr;
+    ev->r24 = 0;
+    ev->lr = e->machineState->LR.lo;
+    ev->zone = current_zone();
+    ev->r4 = 0;
+    ev->sp = 0;
+    s->fb_count = seq;
     return 0;
 }
 
 static void timer_proc(TMTask *tm)
 {
     State *s = g_state;
-    if (s && s->active && !s->busy) {
-        s->timer_runs++;
+    if (s && s->active) {
+        s->c.timer_runs++;
         check_switch(s);
-        drain_h68k(s);
-        close_others(s, s->cur);
+        drain_all(s);
     }
     PrimeTime((QElemPtr)tm, kTimerMs);
 }
 
 enum { uppTimerProcInfo = 0x0000B802 }; /* register-based, A1 = task */
+
+static int same_psn(const ProcessSerialNumber *a, const ProcessSerialNumber *b)
+{
+    return a->lowLongOfPSN == b->lowLongOfPSN &&
+           a->highLongOfPSN == b->highLongOfPSN;
+}
+
+/* Copy a Pascal-string process name, leaving out control characters:
+   Calculator's process name is "\0Calculator". */
+static void set_name(Domain *d, const unsigned char *name)
+{
+    int n = 0;
+    for (int i = 1; i <= name[0] && n < 15; i++)
+        if (name[i] >= 0x20)
+            d->name[n++] = name[i];
+    d->name[n] = 0;
+}
 
 /* Runs in XLog's own context (never at interrupt time). */
 static void refresh_domains(State *s)
@@ -371,23 +424,43 @@ static void refresh_domains(State *s)
         memset(&info, 0, sizeof info);
         info.processInfoLength = sizeof info;
         info.processName = name;
-        if (GetProcessInformation(&psn, &info) != noErr)
-            continue;
+        name[0] = 0;
+        int ok = GetProcessInformation(&psn, &info) == noErr;
         unsigned long loc = (unsigned long)info.processLocation;
-        unsigned long lo = (loc + kPage - 1) & ~(unsigned long)(kPage - 1);
-        unsigned long hi = (loc + info.processSize) & ~(unsigned long)(kPage - 1);
+        unsigned long lo = (loc + kPage - 1) & kPageMask;
+        unsigned long hi = (loc + info.processSize) & kPageMask;
 
         int found = -1, free_slot = -1;
         for (int i = 0; i < kMaxDomains; i++) {
             Domain *d = &s->domains[i];
-            if (d->live && d->location == loc && d->psn.lowLongOfPSN ==
-                psn.lowLongOfPSN && d->psn.highLongOfPSN == psn.highLongOfPSN)
+            if (d->live && same_psn(&d->psn, &psn) &&
+                (!ok || d->location == loc))
                 found = i;
             else if (!d->live && free_slot < 0)
                 free_slot = i;
         }
+        if (ok && !name[0]) {
+            /* A process with no name: use the creator code, as 'calc'. */
+            unsigned long sig = info.processSignature;
+            name[0] = 6;
+            name[1] = name[6] = '\'';
+            for (int i = 0; i < 4; i++)
+                name[2 + i] = (sig >> (24 - 8 * i)) & 0xFF;
+        }
+        if (!ok) {
+            /* Keep a domain the Process Manager could not describe this
+               time; add nothing. */
+            s->c.info_errors++;
+            if (found >= 0)
+                s->domains[found].seen = 1;
+            continue;
+        }
         if (found >= 0) {
-            s->domains[found].seen = 1;
+            Domain *d = &s->domains[found];
+            d->seen = 1;
+            /* A process being launched has no name yet. */
+            if (!d->name[0] && name[0])
+                set_name(d, name);
             continue;
         }
         if (free_slot < 0 || hi <= lo || lo < kSpanLo || hi > kSpanHi ||
@@ -401,14 +474,12 @@ static void refresh_domains(State *s)
         d->location = loc;
         d->size = info.processSize;
         d->psn = psn;
-        int n = name[0] < 15 ? name[0] : 15;
-        memcpy(d->name, name + 1, n);
-        d->name[n] = 0;
+        set_name(d, name);
         d->seen = 1;
         d->live = 1;
         set_bits(s, lo, hi, 1);
-        protect(s, lo, hi - lo);
-        s->added++;
+        protect_domain(s, free_slot);
+        s->c.added++;
     }
 
     for (int i = 0; i < kMaxDomains; i++) {
@@ -416,21 +487,28 @@ static void refresh_domains(State *s)
         if (!d->live || d->seen)
             continue;
         d->dying = 1;
+        if (s->cur == i) {
+            set_current(s, -1);
+            s->cur_zone = 0; /* the next tick looks again */
+        }
         if (nk_unprotect(s->area, d->lo, d->hi - d->lo))
-            s->kernel_errors++;
+            s->c.kernel_errors++;
         set_bits(s, d->lo, d->hi, 0);
         d->live = 0;
-        s->removed++;
+        s->c.removed++;
     }
-    s->refreshes++;
+    s->c.refreshes++;
 }
 
 static void status(State *s)
 {
-    printf("domains %lu-%lu, switches %lu; native self %lu foreign %lu; "
-           "68k self %lu foreign %lu lost %lu; writers %d\n", s->added,
-           s->removed, s->switches, s->native_self, s->native_foreign,
-           s->m68k_self, s->m68k_foreign, s->h68k_lost, s->nwriters);
+    Counters *c = &s->c;
+    printf("domains +%lu -%lu, switches %lu; own/cross: native %lu/%lu, 68k "
+           "%lu/%lu, fallback %lu/%lu; lost %lu/%lu; writers %lu\n",
+           c->added, c->removed, c->switches, c->self[kSrcNative],
+           c->foreign[kSrcNative], c->self[kSrc68k], c->foreign[kSrc68k],
+           c->self[kSrcFallback], c->foreign[kSrcFallback],
+           c->lost[kSrcNative], c->lost[kSrc68k], c->nwriters);
 }
 
 static int by_count(const void *a, const void *b)
@@ -441,32 +519,63 @@ static int by_count(const void *a, const void *b)
 
 static void report(State *s)
 {
-    printf("\nrefreshes %lu, timer runs %lu, kernel errors %lu, open "
-           "overflows %lu, chained %lu, writers not kept %lu\n",
-           s->refreshes, s->timer_runs, s->kernel_errors, s->open_overflows,
-           s->chained, s->dropped);
+    printf("\nrefreshes %lu (process info errors %lu), timer runs %lu, "
+           "kernel errors %lu, outside domains %lu, writers not kept %lu\n",
+           s->c.refreshes, s->c.info_errors, s->c.timer_runs,
+           s->c.kernel_errors, s->c.outside, s->c.dropped);
+    printf("68k hook: own %lu, passed on %lu; native hook: own %lu, passed "
+           "on %lu\n", s->hook_self[0], s->hook_passed[0], s->hook_self[1],
+           s->hook_passed[1]);
     status(s);
     printf("domains:\n");
     for (int i = 0; i < kMaxDomains; i++) {
         Domain *d = &s->domains[i];
         if (d->live)
-            printf("  %-15s %08lX-%08lX self %lu, written by others %lu\n",
+            printf("  %-15s %08lX-%08lX own %lu, written by others %lu\n",
                    d->name, d->lo, d->hi, d->self_writes, d->foreign_writes_in);
     }
-    qsort(s->writers, s->nwriters, sizeof(Writer), by_count);
+    /* Names of processes that were still being launched when recorded. */
+    for (unsigned long i = 0; i < s->c.nwriters; i++) {
+        Writer *w = &s->writers[i];
+        int t = domain_at(s, w->target_lo);
+        if (!w->target[0] && t >= 0)
+            copy_name(w->target, s->domains[t].name);
+        if (!w->writer[0])
+            writer_name(s, w->writer_zone, w->writer);
+    }
+    qsort(s->writers, s->c.nwriters, sizeof(Writer), by_count);
     printf("cross-domain writers (68k: PC is the instruction after the "
            "store):\n count PC       LR       writer          target          "
            "addr\n");
-    for (int i = 0; i < s->nwriters && i < 24; i++) {
+    for (unsigned long i = 0; i < s->c.nwriters && i < 24; i++) {
         Writer *w = &s->writers[i];
         char lr[9];
-        if (w->is68k)
+        if (w->source == kSrc68k)
             snprintf(lr, sizeof lr, " (68k)  ");
         else
             snprintf(lr, sizeof lr, "%08lX", w->lr);
-        printf("%6lu %08lX %s %-15s %-15s %08lX\n", w->count, w->pc, lr,
-               w->writer, w->target, w->first_addr);
+        printf("%6lu %08lX %s %-15s %-15s %08lX%s\n", w->count, w->pc, lr,
+               w->writer, w->target, w->first_addr,
+               w->source == kSrcFallback ? " (fallback)" : "");
     }
+}
+
+static void unhook(State *s, int had68, int hadnat)
+{
+    s->hook_self[0] = s->h68k->count_self;
+    s->hook_passed[0] = s->h68k->count_passed;
+    s->hook_self[1] = s->hnat->count_self;
+    s->hook_passed[1] = s->hnat->count_passed;
+    hook_set_bitmap(s->h68k, 0, 0, 0);
+    hook_set_bitmap(s->hnat, 0, 0, 0);
+    hook_set_current(s->h68k, 0, 0);
+    hook_set_current(s->hnat, 0, 0);
+    s->h68k->owner = 0;
+    s->hnat->owner = 0;
+    if (!had68)
+        h68k_uninstall();
+    if (!hadnat)
+        hnat_uninstall();
 }
 
 int main(void)
@@ -490,9 +599,17 @@ int main(void)
     }
     s->magic = kMagic;
     s->self = (unsigned long)s;
+    s->off_counters = offsetof(State, c);
+    s->n_counters = sizeof(Counters) / 4;
+    s->off_domains = offsetof(State, domains);
+    s->n_domains = kMaxDomains;
+    s->domain_size = sizeof(Domain);
+    s->off_writers = offsetof(State, writers);
+    s->max_writers = kMaxWriters;
+    s->writer_size = sizeof(Writer);
+    s->off_cur = offsetof(State, cur);
     s->bitmap = bitmap;
     s->cur = -1;
-    s->my_zone = (unsigned long)ApplicationZone();
 
     ProcessSerialNumber me;
     ProcessInfoRec info;
@@ -502,25 +619,37 @@ int main(void)
     GetProcessInformation(&me, &info);
     s->my_lo = (unsigned long)info.processLocation;
     s->my_hi = s->my_lo + info.processSize;
+    s->cur_zone = current_zone();
 
     long err = nk_area_from_address(s->my_lo, &s->area);
-    int had_h68k = h68k_installed();
-    long herr = err ? 0 : h68k_install(s->area);
-    if (err || herr) {
-        printf("area err %ld, 68k hook err %ld\n", err, herr);
+    int had68 = h68k_installed(), hadnat = hnat_installed();
+    long e68 = err ? 0 : h68k_install(s->area);
+    long enat = err || e68 ? 0 : hnat_install(s->area);
+    if (err || e68 || enat) {
+        printf("area err %ld, 68k hook err %ld, native hook err %ld\n", err,
+               e68, enat);
+        if (!e68 && !had68)
+            h68k_uninstall();
         getchar();
         return 1;
     }
-    s->h68k_seen = h68k_data()->count_handled;
-    h68k_data()->owner = (unsigned long)s; /* for tools/xlog-read.py */
+    s->h68k = h68k_data();
+    s->hnat = hnat_data();
+    s->seen[kSrc68k] = s->h68k->count_handled;
+    s->seen[kSrcNative] = s->hnat->count_handled;
+    /* For tools/xlog-read.py. */
+    s->h68k->owner = (unsigned long)s;
+    s->hnat->owner = (unsigned long)s;
 
     printf("state %08lX, my partition %08lX-%08lX; to stop, bring XLog to "
            "the front and press a key\n", (unsigned long)s, s->my_lo,
            s->my_hi);
 
     g_state = s;
+    set_current(s, -1);
+    hook_set_bitmap(s->h68k, kSpanLo, kSpanHi, bitmap);
+    hook_set_bitmap(s->hnat, kSpanLo, kSpanHi, bitmap);
     g_prev = sys_install(handler);
-    h68k_set_bitmap(kSpanLo, kSpanHi, bitmap);
     s->active = 1;
     BlockMoveData(timer_upp, &s->timer_rd, sizeof s->timer_rd);
     s->timer.tmAddr = (ProcPtr)&s->timer_rd;
@@ -555,23 +684,22 @@ int main(void)
         }
     }
 
+    /* Stop the tick, take what the rings hold, then open everything before
+       the hooks stop managing it. */
     s->active = 0;
     RmvTime((QElemPtr)&s->timer);
-    drain_h68k(s);
+    drain_all(s);
     for (int i = 0; i < kMaxDomains; i++) {
         Domain *d = &s->domains[i];
         if (!d->live)
             continue;
         d->dying = 1;
         if (nk_unprotect(s->area, d->lo, d->hi - d->lo))
-            s->kernel_errors++;
+            s->c.kernel_errors++;
     }
-    h68k_set_range(0, 0);
     sys_install(g_prev);
+    unhook(s, had68, hadnat);
     g_state = 0;
-    if (!had_h68k)
-        h68k_uninstall();
-    memset(bitmap, 0, kBitmapBytes);
 
     WindowPtr w = FrontWindow();
     if (w) {
