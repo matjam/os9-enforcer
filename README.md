@@ -38,6 +38,20 @@ gdb stub on `localhost:1234`.
 To run without a window, set `HEADLESS=1`. To throw away every disk write when
 the machine stops, set `SCRATCH=1`.
 
+To boot another disk image, set `DISK=path/to/image` (default
+`disks/os9.qcow2`). `disks/os9-novm.qcow2` is an overlay on `os9.qcow2` with
+virtual memory turned off in the Memory control panel; the hook tests use it,
+so that no page is ever paged out under a hook. An overlay records only its
+own changes, so changing `os9.qcow2` after the overlay was made corrupts the
+overlay. To make it again:
+
+```bash
+qemu-img create -f qcow2 -b os9.qcow2 -F qcow2 disks/os9-novm.qcow2
+```
+
+Then boot it with `DISK=disks/os9-novm.qcow2 ./run.sh`, turn Virtual Memory
+off in the Memory control panel and restart.
+
 ## Networking
 
 The guest has a Sun GEM network card (the G4's built-in Ethernet, which Mac OS
@@ -215,57 +229,103 @@ Manager when it prints the report. Run WLog only in a `SCRATCH=1` guest.
 runs WLog, has the Finder draw over it, then stops it and saves screenshots
 as `run/ws-*.png`.
 
-## 68k write hook
+## Write hooks
+
+Two small PowerPC handlers catch stores to protected pages before the system
+sees them, make the page writable and let the store run again. One covers
+68k code, the other native code. Both keep the same data block
+(`common/hook.h`):
+- the pages they manage: a range `[lo, hi)` and, optionally, a page bitmap
+  over it, one bit per 4 KB page;
+- a "current" range `[cur_lo, cur_hi)`, the current application's own
+  memory: a store there is only counted (`count_self`);
+- a 64-entry ring, in the system heap, recording every other store they
+  handle;
+- `passed`, the last write fault they did not handle, which goes on to the
+  original handler.
+
+Each hook makes the page writable with `MPSetAreaAccess` and returns to the
+kernel with r3 = 0, which runs the faulting instruction again. Anything else
+goes to the original handler with every register as it arrived. Both stay
+installed after the installing application quits.
+
+### 68k hook
 
 A store from 68k code to a protected page never reaches the Exception
 Manager. The emulator handles the fault itself: in an ordinary context the
 application gets a bus error (error type 1), and at interrupt time or during
 a process switch the emulator double-faults and the machine hangs.
 
-`common/h68k.s` is a small PowerPC handler that goes in front of the
-emulator's own exception entry. The NanoKernel delivers every exception
-taken in emulator context to the address in the emulator context block
-(logical 0x68FFF14C, normally 0x6806D440). The hook checks for a write
-violation (exception code 21) at an address in its range, makes that page
-writable with `MPSetAreaAccess`, and returns to the faulting instruction,
-which then succeeds. Anything else goes to the emulator unchanged.
+`common/h68k.s` goes in front of the emulator's own exception entry. The
+NanoKernel delivers every exception taken in emulator context to the address
+in the emulator context block (logical 0x68FFF14C, normally 0x6806D440).
 
-For each store it handles, the hook writes an entry to an 8-entry ring:
+Each ring entry holds:
 - a sequence number;
 - the emulator instruction that faulted, and the fault address;
 - r24, the emulator's 68k instruction pointer;
+- the emulator's return address (LR);
 - the current zone (ApplZone), the value stored (usually r4) and the 68k
   stack pointer (A7, which is r1).
 
 The emulator is a threaded interpreter: each opcode handler fetches the next
 opcode with `lhau rX,2(r24)` before its own store, so at the fault r24 is
-the next 68k instruction + 2 (`h68k_next_pc()` subtracts the 2). For the
-last write fault outside the range, the hook keeps the same details in a
-separate record, `passed`. That fault kills the application.
+the next 68k instruction + 2 (`hook_next_pc()` subtracts the 2).
 
-The hook lives in unused space in the emulator data page (logical
-0x68FFFB80-0x68FFFEFF: data, then code). That space stayed zero across 40
-dumps taken while the Finder and QuickTime ran. The hook stays installed
-after the installing application quits.
+The hook's code and data live in unused space in the emulator data page
+(logical 0x68FFFB80-0x68FFFEFF: data, then code), because it must be within
+a relative branch (32 MB) of the emulator's entry. That space stayed zero
+across 40 dumps taken while the Finder and QuickTime ran.
 
-`common/h68k.h` installs and removes it: `h68k_install(area)`,
-`h68k_set_range(lo, hi)` and `h68k_uninstall()`. `h68k_install` refuses
-unless the context block's handler is in the emulator's code and the space
-is all zeros. `common/h68k.cmake` assembles `h68k.s` at build time; call
-`h68k_embed(target)` from an application's CMakeLists.
+`common/h68k.h` installs and removes it: `h68k_install(area)` and
+`h68k_uninstall()`. `h68k_install` refuses unless the context block's
+handler is in the emulator's code and the space is all zeros.
 
-`h68k/` (H68KTest) tests the hook. The first run installs it and runs three
-68k stores: to an unprotected page, to a protected page in the range (the
-hook opens the page and the store lands), and to a protected page outside the
-range (the application is killed with error type 1 and the system stays up).
-The second run prints the hook's counters and removes it.
+### Native hook
 
-To read the hook's counters, its ring and the passed-on record from the host
+The NanoKernel delivers exceptions in native code to the handler in the
+native context block (logical 0x68FFF44C), normally the ROM Exception
+Manager entry 0xFFCF0F28. That entry saves every register in a frame on the
+interrupted stack, so a store to a protected stack page faults again inside
+it, which is fatal. `common/hnat.s` goes in front of it and never touches
+the stack.
+
+Its ring entries hold the faulting PC, the fault address, the interrupted
+r3, LR and r4, the current zone and the stack pointer (r1).
+
+The hook's code, data block and ring live in one system heap block, placed
+by `hnat_install(area)` in `common/hnat.h`. The install patches the data
+block's address into the code and the original handler into its final
+absolute branch. `hnat_uninstall()` puts the original handler back and frees
+the block.
+
+### Building and testing
+
+`common/hooks.cmake` assembles both hooks at build time; call
+`hooks_embed(target)` from an application's CMakeLists.
+
+`h68k/` (H68KTest) tests both hooks. Run it in a `SCRATCH=1` guest booted
+from `disks/os9-novm.qcow2`. The first run installs them and runs:
+- A: a 68k store to an unprotected page;
+- B: a 68k store to a protected page in the 68k hook's range: the hook opens
+  the page, the store lands and the ring records it;
+- C: the same for a native store, through the native hook;
+- D: as C, with the page in the current range: counted, not recorded;
+- E: native stores to the application's own stack while those pages are
+  protected: the native hook opens them;
+- F: after a pause, a 68k store to a protected page outside the range: the
+  application is killed with error type 1 and the system stays up.
+
+The second run prints both hooks' counters and removes them.
+
+To read both hooks' counters, rings and passed-on records from the host
 while the guest runs:
 
 ```bash
-tools/h68k-read.py
+tools/hooks-read.py
 ```
+
+It reads everything in one pause of the guest through `tools/vdump.py`.
 
 To check that the hook's space in the emulator data page stays zero, take 40
 dumps half a second apart (do this before installing the hook):

@@ -3,11 +3,15 @@
 # The NanoKernel hands exceptions in the 68k emulator's context to the
 # handler address in the emulator context block (ECB, 0x68FFF100) at +0x4C,
 # normally the emulator's own entry 0x6806D440, which turns a write fault
-# into a 68k bus error. This code replaces that entry. For a write
-# violation (exception code 21) inside the range set in the data block, it
-# makes the page writable with MPSetAreaAccess, records the fault, and
-# returns to the kernel with r3 = 0, so the store runs again. Anything else
-# goes on to the original entry with every register as it arrived.
+# into a 68k bus error (or hangs, when it cannot take one). This code
+# replaces that entry. For a write violation (exception code 21) on a page
+# it manages (inside [lo, hi) and, with a bitmap, with the page's bit set),
+# it makes the page writable with MPSetAreaAccess and returns to the kernel
+# with r3 = 0, so the store runs again. A write inside [cur_lo, cur_hi), the
+# current application's own memory, is only counted; any other is recorded
+# in a ring for the program that installed the hook. Anything else goes on
+# to the original entry with every register as it arrived. The hook never
+# touches the stack.
 #
 # Entry state, from the kernel (NKInterrupts.s LetBlueHandleOwnException):
 #   r3  = ECB (logical)          free: the original overwrites it first
@@ -26,15 +30,16 @@
 # r24 is the address of the next 68k instruction + 2. r1 is the 68k A7, and
 # r4 usually holds the value being stored.
 #
-# The code is copied to 0x68FFFD00 and the data block lives at 0x68FFFB80
-# (unused space in the emulator data page, within branch range of
-# 0x6806D440). Data offsets are below; keep common/h68k.h in step.
+# The data block is at 0x68FFFB80 and the code is copied to 0x68FFFC40, in
+# unused space in the emulator data page, within branch range of 0x6806D440.
+# The ring is in the system heap. Data offsets are below; keep common/h68k.h
+# in step.
 
         .set    BASE_FROM_ECB, 0xA80    # data block = ECB + 0xA80
         .set    E, -BASE_FROM_ECB       # ECB field X is at X+E(base)
 
         .set    D_COUNT_ALL, 0x04
-        .set    D_COUNT_HANDLED, 0x08
+        .set    D_COUNT_HANDLED, 0x08   # recorded in the ring (= last seq)
         .set    D_LO, 0x0C
         .set    D_HI, 0x10              # 0 = handle nothing
         .set    D_AREA, 0x14
@@ -46,11 +51,14 @@
         .set    D_R6, 0x30
         .set    D_R7, 0x34
         .set    D_ECB40, 0x38           # six saved ECB words, 0x38-0x4C
-        .set    D_COUNT_PASSED, 0x50    # write faults outside the range
+        .set    D_COUNT_PASSED, 0x50    # write faults not handled
         .set    D_PASSED, 0x54          # the last one: pc, addr, r24, zone, a7
         .set    D_BITMAP, 0x68          # page bitmap, or 0 for the whole range
-        .set    D_RING, 0x80            # RING_N entries of 32 bytes
-        .set    RING_N, 8
+        .set    D_CUR_LO, 0x70          # the current application's pages:
+        .set    D_CUR_HI, 0x74          # handled but not recorded
+        .set    D_RING, 0x78            # RING_N entries of 32 bytes, or 0
+        .set    D_COUNT_SELF, 0x7C      # handled inside [cur_lo, cur_hi)
+        .set    RING_N, 64
 
         # Ring entry and passed-fault record fields.
         .set    R_SEQ, 0x00             # count_handled after this event
@@ -115,8 +123,47 @@ h68k_start:
         b       chain_write
 
 handle:
-        # A write to a page we protected.
+        # The current application's own pages: count only.
+        lwz     5,D_CUR_LO(3)
+        cmplw   4,5
+        blt     record
+        lwz     5,D_CUR_HI(3)
+        cmplw   4,5
+        bge     record
+        lwz     5,D_COUNT_SELF(3)
+        addi    5,5,1
+        stw     5,D_COUNT_SELF(3)
+        b       open
 
+record:
+        lwz     5,D_COUNT_HANDLED(3)
+        addi    5,5,1
+        stw     5,D_COUNT_HANDLED(3)
+        lwz     7,D_RING(3)
+        cmpwi   7,0
+        beq     open
+        lwz     6,D_RING_IDX(3)
+        slwi    0,6,5
+        add     7,7,0                   # r7 = ring entry
+        addi    6,6,1
+        andi.   6,6,RING_N-1
+        stw     6,D_RING_IDX(3)
+        stw     5,R_SEQ(7)
+        lwz     6,0x84+E(3)
+        stw     6,R_PC(7)
+        stw     4,R_ADDR(7)
+        stw     24,R_R24(7)
+        lwz     6,0x8C+E(3)
+        stw     6,R_LR(7)
+        lhz     6,0x2AA(0)              # ApplZone is 2-byte aligned
+        lhz     5,0x2AC(0)
+        rlwimi  5,6,16,0,15
+        stw     5,R_ZONE(7)
+        lwz     6,0x9C+E(3)
+        stw     6,R_R4(7)
+        stw     1,R_A7(7)
+
+open:
         # The kernel call below goes through the same context block; keep
         # the exception words it might touch.
         lwz     5,0x40+E(3)
@@ -131,31 +178,6 @@ handle:
         stw     5,D_ECB40+0x10(3)
         lwz     5,0x9C+E(3)
         stw     5,D_ECB40+0x14(3)
-
-        # Ring entry (see R_ fields).
-        lwz     5,D_COUNT_HANDLED(3)
-        addi    5,5,1
-        stw     5,D_COUNT_HANDLED(3)
-        lwz     6,D_RING_IDX(3)
-        addi    7,6,1
-        andi.   7,7,RING_N-1
-        stw     7,D_RING_IDX(3)
-        slwi    6,6,5
-        add     6,6,3                   # r6 = data block + 32 * index
-        stw     5,D_RING+R_SEQ(6)
-        lwz     7,0x84+E(3)
-        stw     7,D_RING+R_PC(6)
-        stw     4,D_RING+R_ADDR(6)
-        stw     24,D_RING+R_R24(6)
-        lwz     7,0x8C+E(3)
-        stw     7,D_RING+R_LR(6)
-        lhz     7,0x2AA(0)              # ApplZone is 2-byte aligned
-        lhz     5,0x2AC(0)
-        rlwimi  5,7,16,0,15
-        stw     5,D_RING+R_ZONE(6)
-        lwz     7,0x9C+E(3)
-        stw     7,D_RING+R_R4(6)
-        stw     1,D_RING+R_A7(6)
 
         # MPSetAreaAccess(area, write, write, page, 4096)
         rlwinm  6,4,0,0,19

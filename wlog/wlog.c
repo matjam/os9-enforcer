@@ -154,20 +154,20 @@ static void record_foreign(State *s, unsigned long pc, unsigned long lr,
    protect their pages again (the hook leaves them writable). */
 static void drain_h68k(State *s)
 {
-    volatile H68kData *hd = h68k_data();
+    volatile HookData *hd = h68k_data();
     unsigned long handled = hd->count_handled;
     unsigned long seen = s->h68k_seen;
     if (handled == seen)
         return;
-    if (handled - seen > kH68kRing) {
+    if (handled - seen > kHookRing) {
         /* Some opened pages are no longer in the ring: protect the whole
            range again. */
-        s->h68k_lost += handled - seen - kH68kRing;
+        s->h68k_lost += handled - seen - kHookRing;
         if (nk_protect(s->area, s->lo, s->hi - s->lo))
             s->kernel_errors++;
     }
-    for (int i = 0; i < kH68kRing; i++) {
-        volatile H68kEvent *e = &hd->ring[i];
+    for (int i = 0; i < kHookRing; i++) {
+        volatile HookEvent *e = &hd->ring[i];
         if (e->seq <= seen || e->seq > handled)
             continue;
         if (nk_protect(s->area, e->addr & ~(unsigned long)(kPage - 1), kPage))
@@ -176,7 +176,7 @@ static void drain_h68k(State *s)
             s->own_68k++;
         } else {
             s->foreign_68k++;
-            record_foreign(s, h68k_next_pc(e->r24), 0, e->zone, e->addr, 1);
+            record_foreign(s, hook_next_pc(e->r24), 0, e->zone, e->addr, 1);
         }
     }
     s->h68k_seen = handled;
@@ -480,9 +480,9 @@ int main(void)
     g_state = 0;
 
     /* Copy the hook's results out before removing it. */
-    volatile H68kData *hd = h68k_data();
+    volatile HookData *hd = h68k_data();
     unsigned long h68k_passed = hd->count_passed;
-    H68kPassed passed = *(H68kPassed *)&hd->passed;
+    HookPassed passed = *(HookPassed *)&hd->passed;
     if (!had_h68k)
         h68k_uninstall();
 
@@ -530,7 +530,7 @@ int main(void)
         app_for_zone(passed.zone, app);
         printf("68k write faults outside the range: %lu; last: addr %08lX, "
                "next 68k %08lX, %s\n", h68k_passed, passed.addr,
-               h68k_next_pc(passed.r24), app);
+               hook_next_pc(passed.r24), app);
     }
 
     DisposePtr((Ptr)s);

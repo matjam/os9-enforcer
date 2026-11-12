@@ -7,7 +7,9 @@
 #   ./run.sh debug     boot from the hard disk, paused, gdb stub on localhost:1234
 #
 # Set HEADLESS=1 to run without a window, SCRATCH=1 to discard disk writes,
-# CD=image to start with a disc in the CD drive (it is empty otherwise).
+# CD=image to start with a disc in the CD drive (it is empty otherwise),
+# DISK=image to boot another hard disk image (default disks/os9.qcow2; for
+# example disks/os9-novm.qcow2, an overlay with virtual memory off).
 # The guest has a network card (sungem) on QEMU's user-mode network: DHCP,
 # outbound internet, and the host reachable at 10.0.2.2.
 # A QMP control socket is always opened at run/qmp.sock, for screenshots
@@ -20,7 +22,7 @@
 set -eu
 cd "$(dirname "$0")"
 
-DISK=disks/os9.qcow2
+DISK=${DISK:-disks/os9.qcow2}
 CDROM=media/macos-922-uni.iso
 QMP=run/qmp.sock
 EVENTS=run/events.sock
