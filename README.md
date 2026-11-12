@@ -585,3 +585,64 @@ dumps half a second apart (do this before installing the hook):
 ```bash
 tools/edp-scan.py 40 0.5
 ```
+
+## Store measurement
+
+`tools/storewatch/` is a QEMU TCG plugin that counts every store the guest
+makes into low memory (below 0x2800) and the system heap (0x2800 to
+SysZone's end). For each store it records the code that made it: the native
+PC, or for 68k code the 68k instruction after the store (as the 68k hook
+does). It marks a store "app" when that code lies in the current
+application's partition, which it reads from the running engine's 68k hook
+data, the same test as Enforcer's. It needs the local QEMU build.
+
+To build it and measure an idle and a busy phase:
+
+```bash
+tools/storewatch/build.sh
+SCRATCH=1 DISK=disks/os9-enforcer.qcow2 PLUGIN=tools/storewatch/build/libstorewatch.dylib,out=run/sw ./run.sh &
+tools/storewatch/scenario.sh run/sw
+tools/storewatch/report.py run/sw-use
+```
+
+The plugin runs on every store, so the guest slows down in proportion to
+how many stores it makes: about 16 million instructions a second at the
+desktop, against hundreds of millions in loops with few stores. To measure
+something else, create `run/sw.reset` to clear the counts and `run/sw.dump`
+to write them (see `storewatch.c`).
+
+Results on 9.2.2 (2026-11-12, Enforcer running; the busy phase opens a
+window, uses the Calculator and Stickies, and switches applications):
+
+| | Idle | Busy |
+|---|---|---|
+| Instructions | 334 million | 1,610 million |
+| Low memory stores per million instructions | 682 | 752 |
+| System heap stores per million instructions | 5,614 | 3,758 |
+| Low memory stores by app code | 0 | 16 |
+| System heap stores by app code | 0 (see below) | 0 (see below) |
+| Stores into the 68k vectors (0000-00FF) | 0 | 0 |
+
+- System code writes low memory all the time: `MemErr` and `TheZone` on
+  every Memory Manager call, the current port, `ResErr`, `CrsrVis`, the
+  File Manager and VBL queues.
+- The only low memory global written by app code was `ResReadOnly`
+  (0A5C), by a 68k application.
+- Every system heap store marked "app" (5,466 idle, 12,369 busy) came from
+  one emulator instruction, 6806E34C. The emulator saves state into a
+  544-byte frame, from a table near 0x46000, when 68k code calls native
+  code (most traps). r24 still points at the application's trap instruction
+  then, so the 68k-PC test counts the emulator's store as the application's.
+  Enforcer's 68k hook uses the same test; it does not matter there, because
+  these frames are in the system heap, not in an application's partition.
+- Nothing wrote the 68k exception vectors, where a write through a NULL
+  pointer with a small offset lands.
+
+What this means for protecting low memory and the system heap:
+- Trapping every store, as the hooks do for other applications' pages, is
+  too slow: one trap per store would mean hundreds to thousands of traps per
+  million instructions. Low memory's first page holds both the vectors and
+  the most written globals, so it cannot be protected alone.
+- Applications' own code almost never writes either area, so a rule like
+  Enforcer's (deny app code) would rarely stop a working application. The
+  cost is in telling app code from system code at each store.

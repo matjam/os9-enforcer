@@ -6,6 +6,8 @@
 #   ./run.sh           boot from the hard disk
 #   ./run.sh debug     boot from the hard disk, paused, gdb stub on localhost:1234
 #
+# Set PLUGIN=library[,args] to load a QEMU TCG plugin (needs the local
+# build, qemu/build), for example tools/storewatch.
 # Set HEADLESS=1 to run without a window, SCRATCH=1 to discard disk writes,
 # CD=image to start with a disc in the CD drive (it is empty otherwise),
 # DISK=image to boot another hard disk image (default disks/os9.qcow2; for
@@ -60,6 +62,11 @@ if [ "${SCRATCH:-}" = 1 ]; then
   scratch="-snapshot"
 fi
 
+plugin=""
+if [ -n "${PLUGIN:-}" ]; then
+  plugin="-plugin $PLUGIN"
+fi
+
 qemu_pid=""
 trap '[ -n "$qemu_pid" ] && kill "$qemu_pid" 2>/dev/null; exit 130' INT TERM
 
@@ -99,7 +106,7 @@ while :; do
     -action reboot=shutdown \
     -qmp unix:"$QMP",server=on,wait=off \
     -qmp unix:"$EVENTS",server=on,wait=on \
-    $display $debug $scratch &
+    $display $debug $scratch $plugin &
   qemu_pid=$!
 
   reason=$(QMP_SOCK="$EVENTS" tools/qmp.py wait-shutdown) || reason=""

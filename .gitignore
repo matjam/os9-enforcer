@@ -23,6 +23,7 @@
 /xlog/build/
 /scribble/build/
 /enforcer/build/
+/tools/storewatch/build/
 
 __pycache__/
 
