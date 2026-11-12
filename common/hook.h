@@ -15,7 +15,8 @@
  * the page protected and passes the fault on, which stops the application;
  * such faults are counted in count_denied, with the last one in denied.
  * The code's address is the faulting PC for native code and the next 68k
- * instruction (r24 - 2) for 68k code.
+ * instruction (r24 - 2) for 68k code. When stop is set, a denial also
+ * stores ApplZone (the application to stop) in *stop.
  */
 
 #ifndef HOOK_H
@@ -74,7 +75,8 @@ typedef struct {
     unsigned long enforce;       /* deny stores by the current app's code */
     unsigned long count_denied;
     HookPassed denied;           /* the last store denied */
-    unsigned long reserved[7];
+    volatile unsigned long *stop; /* gets ApplZone on a denial, or 0 */
+    unsigned long reserved[6];
 } HookData;
 
 _Static_assert(sizeof(HookEvent) == 32, "ring entry size");
@@ -88,6 +90,7 @@ _Static_assert(offsetof(HookData, saved_ctx) == 0x80, "hnat D_CTX");
 _Static_assert(offsetof(HookData, enforce) == 0x88, "D_ENFORCE");
 _Static_assert(offsetof(HookData, count_denied) == 0x8C, "D_COUNT_DENIED");
 _Static_assert(offsetof(HookData, denied) == 0x90, "D_DENIED");
+_Static_assert(offsetof(HookData, stop) == 0xA4, "D_STOP");
 _Static_assert(sizeof(HookData) == 0xC0, "data block size");
 
 /* A pointer to a fixed address. The empty asm hides the constant from GCC,

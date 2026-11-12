@@ -412,11 +412,9 @@ else.
 The rule: a store into another application's protected pages is denied when
 the code doing it lies inside the current application's partition (its
 code fragment and 68k code resources are in its heap). The hook leaves the
-page protected and passes the fault on: the 68k emulator gives the
-application a bus error, and a native fault goes to the Exception Manager.
-Either way, Mac OS stops the application with "unexpectedly quit, error of
-type 1", and the target's memory is unchanged. Guard prints each denial in
-its window:
+page protected, so the target's memory is unchanged, and the engine stops
+the application with `ExitToShell` (see [Clean stop](#clean-stop)). Guard
+prints each denial in its window:
 
 ```
 DENIED: Scribble's own code (native, 1E1B5C98) wrote into Finder at 1EA34100
@@ -440,6 +438,9 @@ Limits:
 - A 68k denial at interrupt time hangs the machine (the emulator cannot take
   a bus error there). This needs the current application's own interrupt
   task to write into another application.
+- A native denial at interrupt time would call `ExitToShell` at interrupt
+  time: the native side cannot tell interrupt time from task level (not
+  tested).
 
 `scribble/` (Scribble) tests it. It stores into a word in the middle of the
 Finder's partition the value already there, so an allowed store changes
@@ -471,6 +472,32 @@ has three modes: off (nothing protected), log only (as XLog) and enforce (as
 Guard). Only one engine can run at a time: a second one refuses to start
 while the hooks have an owner.
 
+### Clean stop
+
+Mac OS stops a faulting application with "unexpectedly quit, because an
+error of type 1 occurred" and advises a restart, because it cannot know
+what the application changed. After a denial, the engine knows that the
+store did not happen, so it stops the application itself, with no alert:
+
+- A hook that denies a store writes ApplZone (the application to stop) into
+  a word in a system heap block, the `Stopper`.
+- A denied native store reaches the engine's handler in the Exception
+  Manager's system-wide slot before any other handler. The handler sets the
+  faulting context's PC, r2 and r12 to `ExitToShell`'s and resumes it, so
+  the application quits through the normal exit path.
+- A denied 68k store becomes a 68k bus error. A 28-word 68k stub in the
+  `Stopper`, in front of the bus error vector (low memory 0x08), calls
+  `_ExitToShell`.
+
+Both check that ApplZone still matches the word, and the stub also checks
+that the frame's interrupt mask is 0. Any other fault goes on to the
+previous handler, as before. The engine restores the vector when it stops;
+if another program has patched the vector since, the stub stays in place
+and passes every fault on.
+
+`tools/xlog-read.py` prints the `Stopper`'s address and its count of clean
+stops by kind (native, 68k).
+
 ## Enforcer
 
 Enforcer is Guard's protection for everyday use: it starts with the
@@ -491,9 +518,19 @@ machine, has no window, and has a control panel.
 
   A change takes effect within half a second and is saved.
 
-When Enforcer stops an application, Mac OS shows its usual "unexpectedly
-quit" alert, and Enforcer posts a notification naming the application, the
-application whose memory it wrote into, and the address.
+When Enforcer stops an application, Mac OS shows no alert (see
+[Clean stop](#clean-stop)). Enforcer posts a notification instead:
+
+> Enforcer stopped “Scribble” because it tried to write into the memory of
+> “Finder” at address 1E9DC100. The write was blocked, so “Finder” was not
+> changed and you do not need to restart.
+
+If Mac OS stopped the application instead (a denial at interrupt time), its
+own alert appears and the notification leaves out the last part.
+
+The claim covers the denied store only. The system heap and low memory are
+not protected, so an application that crashes for another reason can still
+have damaged them, and Mac OS's own alert then still applies.
 
 The extension's timer task and fallback handler run code in its own
 partition. Do not force-quit it: quit it with the quit Apple event (as at
@@ -529,6 +566,12 @@ tools/push.sh -n Install "enforcer/build/Enforcer Extension.bin" enforcer/build/
 In the guest, drag each file onto the System Folder icon and click OK when
 the Finder offers to put it into the Extensions or Control Panels folder.
 Then restart. To remove Enforcer, drag both out of those folders and
+restart.
+
+To update an installed Enforcer, first drag the running Enforcer Extension
+out of the Extensions folder (to the desktop or the Trash): its file is in
+use, so the Finder cannot replace it. Then install as above; the Finder
+offers to replace the control panel. The old extension stops at the
 restart.
 
 A slow drag over a folder springs it open, so a scripted drag
