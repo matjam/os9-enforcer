@@ -15,7 +15,8 @@
  * the state's want_mode; this program applies it and saves it.
  *
  * When it stops an application, it posts a notification naming the
- * application, the one whose memory it wrote into, and the address.
+ * application, the one whose memory it tried to write into, and the
+ * address, and saying that no restart is needed.
  */
 
 #include <string.h>
@@ -123,10 +124,12 @@ static void add_hex(unsigned char *p, unsigned long v)
     add(p, s);
 }
 
-/* "Enforcer stopped “Scribble”: its own code wrote into the memory of
-   “Finder” at address 1EA34100. The write was blocked, so “Finder” was
-   not changed." (Mac Roman curly quotes.) */
-static void notify(const Offense *o)
+/* "Enforcer stopped “Scribble” because it tried to write into the memory
+   of “Finder” at address 1EA34100. The write was blocked, so “Finder” was
+   not changed and you do not need to restart." (Mac Roman curly quotes.)
+   When Mac OS stopped the application instead (clean is 0), its own alert
+   has already asked for a restart, so the last part is left out. */
+static void notify(const Offense *o, int clean)
 {
     NMRec *n = &g_nm[g_nm_next];
     unsigned char *str = g_nm_str[g_nm_next];
@@ -136,13 +139,14 @@ static void notify(const Offense *o)
     str[0] = 0;
     add(str, "Enforcer stopped \xD2");
     add(str, o->writer);
-    add(str, "\xD3: its own code wrote into the memory of \xD2");
+    add(str, "\xD3 because it tried to write into the memory of \xD2");
     add(str, o->target);
     add(str, "\xD3 at address ");
     add_hex(str, o->addr);
     add(str, ". The write was blocked, so \xD2");
     add(str, o->target);
-    add(str, "\xD3 was not changed.");
+    add(str, clean ? "\xD3 was not changed and you do not need to restart."
+                   : "\xD3 was not changed.");
 
     memset(n, 0, sizeof *n);
     n->qType = kNMType;
@@ -200,7 +204,7 @@ int main(void)
     }
     publish((long)s);
 
-    unsigned long last_poll = TickCount(), shown = 0;
+    unsigned long last_poll = TickCount(), shown = 0, stops_shown = 0;
     EventRecord ev;
     while (!g_quit) {
         if (WaitNextEvent(everyEvent, &ev, kPollTicks, NULL) &&
@@ -214,14 +218,20 @@ int main(void)
                 save_mode(s->mode);
             last_poll = now;
         }
-        /* Tell the user about each application stopped since last time. */
-        unsigned long n = s->n_offenses;
+        /* Tell the user about each application stopped since last time.
+           A clean stop happens at the fault, before this loop can run, so
+           each one counted pairs with the next denied offense. */
+        unsigned long n = s->n_offenses, stops = engine_clean_stops(s);
         if (n - shown > kOffenseLog)
             shown = n - kOffenseLog;
         for (; shown < n; shown++) {
             Offense *o = &s->offenses[shown % kOffenseLog];
-            if (o->denied)
-                notify(o);
+            if (!o->denied)
+                continue;
+            int clean = stops_shown < stops;
+            if (clean)
+                stops_shown++;
+            notify(o, clean);
         }
     }
 

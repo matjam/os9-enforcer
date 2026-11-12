@@ -124,9 +124,13 @@ typedef struct {
 } MemoryExceptionInfo;
 
 typedef struct {
+    NKWide R[32];
+} RegisterInfo;
+
+typedef struct {
     unsigned long theKind;
     MachineInfo *machineState;
-    void *registerImage;
+    RegisterInfo *registerImage;
     void *FPUImage;
     MemoryExceptionInfo *memoryInfo;
     void *vectorImage;

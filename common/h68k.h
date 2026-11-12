@@ -26,7 +26,7 @@ enum {
     kH68kData = 0x68FFFB80,   /* = ECB + 0xA80, see h68k.s */
     kH68kCode = 0x68FFFC40,
     kH68kEnd = 0x68FFFF00,
-    kH68kMagic = 'H685'       /* changes with the data layout */
+    kH68kMagic = 'H686'       /* changes with the data layout */
 };
 
 _Static_assert(kH68kData + sizeof(HookData) <= kH68kCode, "data overlaps code");

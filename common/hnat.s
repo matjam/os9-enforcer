@@ -18,7 +18,8 @@
 # Deny rule: when the faulting PC of a recorded store is inside [cur_lo,
 # cur_hi), the current application's own code is writing outside its
 # memory. The ring entry's pc gets bit 0 set. With D_ENFORCE set, the hook
-# then leaves the page protected and passes the fault on to the Exception
+# then leaves the page protected, stores ApplZone at D_STOP (when set) to
+# name the application to stop, and passes the fault on to the Exception
 # Manager.
 #
 # Entry state: as for h68k.s, with the NCB in r3 and NCB+0x54 (the
@@ -56,6 +57,7 @@
         .set    D_ENFORCE, 0x88         # nonzero: deny the current app's code
         .set    D_COUNT_DENIED, 0x8C
         .set    D_DENIED, 0x90          # the last one: pc, addr, r3, zone, sp
+        .set    D_STOP, 0xA4            # gets the zone on a denial, or 0
         .set    RING_N, 64
         .set    APPCODE, 6              # CR bit (cr1.eq): the current app's code
 
@@ -149,7 +151,8 @@ app_known:
         slwi    0,0,5
         add     6,6,0                   # r6 = ring entry
         srwi    0,0,5
-        addi    0,0,1
+        nor     0,0,0                   # r0 + 1 as -(~r0): `addi 0,0,1`
+        neg     0,0                     # would read r0 as 0
         andi.   0,0,RING_N-1
         stw     0,D_RING_IDX(4)
         stw     5,R_SEQ(6)
@@ -243,6 +246,11 @@ deny:
         lwz     5,D_COUNT_DENIED(4)
         addi    5,5,1
         stw     5,D_COUNT_DENIED(4)
+        lwz     5,D_STOP(4)             # name the application to stop
+        cmpwi   5,0
+        beq     deny_out
+        stw     0,0(5)
+deny_out:
         lwz     0,D_R0(4)
         lwz     6,D_R6(4)
         lwz     7,D_R7(4)

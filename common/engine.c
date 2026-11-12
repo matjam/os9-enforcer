@@ -19,7 +19,7 @@
 #include "h68k.h"
 #include "hnat.h"
 
-enum { kTimerMs = 16 };
+enum { kTimerMs = 16, kBusErrorVector = 0x08 };
 
 /* The bitmap covers the whole blue area, one bit per page. */
 #define kSpanLo 0UL
@@ -273,6 +273,99 @@ static void drain_all(State *s)
     drain(s, kSrcFallback, s->fb_ring, kFallbackRing, s->fb_count);
 }
 
+/* Clean stop ---------------------------------------------------------- */
+
+#define HI16(x) ((unsigned short)((x) >> 16))
+#define LO16(x) ((unsigned short)((x) & 0xFFFF))
+
+/* Put the 68k stub in front of the bus error vector. The stub runs on the
+   application's stack with the exception frame on top (SR first):
+
+     move.l  d0,-(sp)
+     move.l  zone,d0          ; a hook denied a store...
+     beq.s   pass
+     cmp.l   ApplZone.w,d0    ; ...of this application
+     bne.s   pass
+     clr.l   zone
+     move.w  4(sp),d0         ; the frame's SR
+     andi.w  #$0700,d0        ; interrupt mask: not at task level
+     bne.s   pass
+     addq.l  #1,stops68k
+     move.w  #$2000,sr
+     _ExitToShell             ; never returns
+     bra.s   *
+   pass:
+     move.l  (sp)+,d0
+     move.l  old_vector,-(sp) ; every register as it arrived
+     rts
+*/
+static Stopper *stopper_install(void)
+{
+    Stopper *st = (Stopper *)NewPtrSysClear(sizeof(Stopper));
+    if (!st)
+        return 0;
+    unsigned long z = (unsigned long)&st->zone;
+    unsigned long n = (unsigned long)&st->stops[kSrc68k];
+    unsigned long o = (unsigned long)&st->old_vector;
+    const unsigned short code[kStopperCode] = {
+        0x2F00,                       /* 00 */
+        0x2039, HI16(z), LO16(z),     /* 02 */
+        0x6724,                       /* 08 beq.s 2E */
+        0xB0B8, 0x02AA,               /* 0A */
+        0x661E,                       /* 0E bne.s 2E */
+        0x42B9, HI16(z), LO16(z),     /* 10 */
+        0x302F, 0x0004,               /* 16 */
+        0x0240, 0x0700,               /* 1A */
+        0x660E,                       /* 1E bne.s 2E */
+        0x52B9, HI16(n), LO16(n),     /* 20 */
+        0x46FC, 0x2000,               /* 26 */
+        0xA9F4,                       /* 2A */
+        0x60FE,                       /* 2C */
+        0x201F,                       /* 2E */
+        0x2F39, HI16(o), LO16(o),     /* 30 */
+        0x4E75                        /* 36 */
+    };
+    st->magic = kStopperMagic;
+    BlockMove(code, st->code, sizeof code); /* flushes the code caches */
+    volatile unsigned long *vec = lowmem(kBusErrorVector);
+    st->old_vector = *vec;
+    *vec = (unsigned long)st->code;
+    return st;
+}
+
+/* Restore the vector. If another program has patched it since, it chains
+   to the stub, so the stub stays: with zone 0 it passes everything on. */
+static void stopper_remove(State *s)
+{
+    Stopper *st = s->stopper;
+    if (!st)
+        return;
+    st->zone = 0;
+    volatile unsigned long *vec = lowmem(kBusErrorVector);
+    if (*vec == (unsigned long)st->code) {
+        *vec = st->old_vector;
+        s->stopper = 0;
+        DisposePtr((Ptr)st);
+    }
+}
+
+/* If a hook has just denied a store by the current application, make the
+   fault resume at ExitToShell, in the application's own context. */
+static int stop_native(State *s, ExceptionInfo *e)
+{
+    Stopper *st = s->stopper;
+    if (!st || !st->zone || st->zone != current_zone() || !e->registerImage)
+        return 0;
+    st->zone = 0;
+    st->stops[kSrcNative]++;
+    const unsigned long *tv = (const unsigned long *)(void *)ExitToShell;
+    e->machineState->PC.lo = tv[0];
+    e->machineState->LR.lo = 0; /* never returns */
+    e->registerImage->R[2].lo = tv[1];
+    e->registerImage->R[12].lo = (unsigned long)tv;
+    return 1;
+}
+
 /* The Exception Manager's system-wide handler: writes to managed pages
    that did not come through the native hook. */
 static long handler(ExceptionInfo *e)
@@ -285,10 +378,13 @@ static long handler(ExceptionInfo *e)
         return g_prev ? g_prev(e) : -1;
     unsigned long addr = mi->theAddress, pc = e->machineState->PC.lo;
     int app = pc >= s->hnat->cur_lo && pc < s->hnat->cur_hi;
-    /* A store the native hook denied (it is in its ring already): let the
-       system stop the application. */
-    if (app && s->hnat->enforce)
+    /* A store the native hook denied (it is in its ring already): stop
+       the application, or let the system do it. */
+    if (app && s->hnat->enforce) {
+        if (stop_native(s, e))
+            return 0;
         return g_prev ? g_prev(e) : -1;
+    }
     if (nk_unprotect(s->area, addr & kPageMask, kPage))
         s->c.kernel_errors++;
     unsigned long seq = s->fb_count + 1;
@@ -492,6 +588,7 @@ long engine_start(State **out, unsigned long mode, const char *name)
     s->max_offenses = kOffenseLog;
     s->offense_size = sizeof(Offense);
     s->off_mode = offsetof(State, mode);
+    s->off_stopper = offsetof(State, stopper);
     s->mode = s->want_mode = kModeOff;
     copy_name(s->name, name);
     s->bitmap = bitmap;
@@ -531,6 +628,13 @@ long engine_start(State **out, unsigned long mode, const char *name)
     /* For tools/xlog-read.py. */
     s->h68k->owner = (unsigned long)s;
     s->hnat->owner = (unsigned long)s;
+
+    /* Without memory for it, denied applications are stopped by Mac OS. */
+    s->stopper = stopper_install();
+    if (s->stopper) {
+        s->h68k->stop = &s->stopper->zone;
+        s->hnat->stop = &s->stopper->zone;
+    }
 
     g_state = s;
     g_sys_install = sys_install;
@@ -572,6 +676,9 @@ void engine_stop(State *s)
     s->active = 0;
     RmvTime((QElemPtr)&s->timer);
     drain_all(s);
+    s->h68k->stop = 0;
+    s->hnat->stop = 0;
+    stopper_remove(s);
     for (int i = 0; i < kMaxDomains; i++) {
         Domain *d = &s->domains[i];
         if (!d->live)

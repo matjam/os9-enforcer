@@ -23,7 +23,9 @@ OWNER = 0x68FFFBEC
 HEADER = ["magic", "self", "off_counters", "n_counters", "off_domains",
           "n_domains", "domain_size", "off_writers", "max_writers",
           "writer_size", "off_cur", "off_offenses", "max_offenses",
-          "offense_size", "off_mode"]
+          "offense_size", "off_mode", "off_stopper"]
+STOPPER = ["magic", "old_vector", "zone"] + ["stops_" + s for s in
+                                             ["native", "68k", "fallback"]]
 MODES = ["off", "log only", "enforce"]
 SOURCES = ["native", "68k", "fallback"]
 COUNTERS = (["own_" + s for s in SOURCES] + ["cross_" + s for s in SOURCES] +
@@ -41,15 +43,24 @@ def collect(addr):
         if a is None:
             a = struct.unpack(">I", read(OWNER, 4))[0]
         if not a:
-            return a, None, None
+            return a, None, None, None
         n = len(HEADER)
         h = dict(zip(HEADER, struct.unpack(">%dI" % n, read(a, 4 * n))))
-        if h["magic"] != struct.unpack(">I", b"ENF1")[0] or h["self"] != a:
-            return a, h, None
+        if h["magic"] != struct.unpack(">I", b"ENF2")[0] or h["self"] != a:
+            return a, h, None, None
         size = max(h["off_writers"] + h["max_writers"] * h["writer_size"],
                    h["off_offenses"] + 4 +
-                   h["max_offenses"] * h["offense_size"])
-        return a, h, read(a, size)
+                   h["max_offenses"] * h["offense_size"],
+                   h["off_stopper"] + 4)
+        d = read(a, size)
+        o = h["off_stopper"]
+        st = struct.unpack(">I", d[o:o + 4])[0]
+        stopper = None
+        if st:
+            stopper = dict(zip(STOPPER, struct.unpack(
+                ">%dI" % len(STOPPER), read(st, 4 * len(STOPPER)))))
+            stopper["addr"] = st
+        return a, h, d, stopper
     return fn
 
 
@@ -59,11 +70,11 @@ def cstr(b):
 
 def main():
     addr = int(sys.argv[1], 0) if len(sys.argv) > 1 else None
-    addr, h, d = vdump.paused(collect(addr))
+    addr, h, d, stopper = vdump.paused(collect(addr))
     if not addr:
         sys.exit("no engine is running (no owner in the 68k hook)")
     if d is None:
-        sys.exit("no engine state (ENF1) at %08X" % addr)
+        sys.exit("no engine state (ENF2) at %08X" % addr)
     if (h["n_counters"] != len(COUNTERS) or h["domain_size"] != DOMAIN_SIZE
             or h["writer_size"] != WRITER_SIZE
             or h["offense_size"] != OFFENSE_SIZE):
@@ -86,6 +97,14 @@ def main():
                               w(o + 16), w(o + 20)))
     c = {n: w(h["off_counters"] + 4 * i) for i, n in enumerate(COUNTERS)}
     print(", ".join("%s %d" % (n, c[n]) for n in COUNTERS))
+    if stopper:
+        print("clean stop at %08X (stub %08X, bus error vector was %08X): "
+              "zone %08X, stops native %d, 68k %d" % (
+                  stopper["addr"], stopper["addr"] + 4 * len(STOPPER),
+                  stopper["old_vector"], stopper["zone"],
+                  stopper["stops_native"], stopper["stops_68k"]))
+    else:
+        print("clean stop not installed")
     print("domains:")
     for i in range(h["n_domains"]):
         o = h["off_domains"] + i * DOMAIN_SIZE

@@ -15,9 +15,20 @@
  *
  * A store into another domain by the current application's own code (the
  * code lies in its partition) is an offense. In kModeEnforce the hooks deny
- * it: the page stays protected, the fault goes on, and Mac OS stops the
- * application. In kModeLog it is allowed and logged. Stores by system code
- * are always allowed. In kModeOff nothing is protected.
+ * it: the page stays protected and the fault goes on. In kModeLog it is
+ * allowed and logged. Stores by system code are always allowed. In
+ * kModeOff nothing is protected.
+ *
+ * Clean stop: a hook that denies a store writes ApplZone into the
+ * Stopper's zone, and the engine stops that application with ExitToShell
+ * instead of letting Mac OS show its "unexpectedly quit" alert:
+ *   - a denied native store reaches the fallback handler (below) first,
+ *     which resumes the application at ExitToShell;
+ *   - a denied 68k store becomes a 68k bus error, and a 68k stub in front
+ *     of the bus error vector (lowmem 0x08) calls _ExitToShell.
+ * Both check that ApplZone still matches, and the stub also that the
+ * fault was at task level (interrupt mask 0 in the frame's SR); otherwise
+ * the fault goes on to Mac OS as before.
  *
  * A 16 ms Time Manager task:
  *   - notices a process switch (ApplZone changes), points both hooks'
@@ -59,7 +70,7 @@ enum {
     kMaxWriters = 512,
     kFallbackRing = 16,
     kOffenseLog = 16,
-    kEngineMagic = 'ENF1',
+    kEngineMagic = 'ENF2',
     /* Gestalt selector whose value is the engine's State, while it runs. */
     kEngineGestalt = 'Enfr'
 };
@@ -114,6 +125,19 @@ typedef struct {
     char target[16];
 } Offense;
 
+/* The clean stop's shared words and its 68k bus error stub, in a system
+   heap block of its own: it stays allocated if another program patches
+   the vector after the engine, so the stub keeps passing faults on. */
+enum { kStopperMagic = 'Stop', kStopperCode = 28 };
+
+typedef struct {
+    unsigned long magic;
+    unsigned long old_vector;        /* the bus error vector it replaced */
+    volatile unsigned long zone;     /* the application to stop, or 0 */
+    volatile unsigned long stops[kSources]; /* clean stops, by source */
+    unsigned short code[kStopperCode];
+} Stopper;
+
 /* tools/xlog-read.py names these in this order. */
 typedef struct {
     unsigned long self[kSources], foreign[kSources], lost[kSources];
@@ -136,6 +160,7 @@ typedef struct {
     unsigned long off_cur;
     unsigned long off_offenses, max_offenses, offense_size;
     unsigned long off_mode;
+    unsigned long off_stopper;
 
     /* Control. A control panel sets want_mode; engine_poll applies it. */
     volatile unsigned long mode, want_mode;
@@ -165,6 +190,7 @@ typedef struct {
     HookEvent fb_ring[kFallbackRing];
     TMTask timer;
     RoutineDescriptor timer_rd;
+    Stopper *stopper; /* 0 if the clean stop is not installed */
 } State;
 
 /* Install the hooks, the fallback handler and the timer, read the process
@@ -186,6 +212,18 @@ void engine_stop(State *s);
 /* For reports. */
 int engine_domain_at(State *s, unsigned long addr);
 void engine_writer_name(State *s, unsigned long zone, char out[16]);
+
+/* Applications stopped cleanly so far. Inline, as below. */
+static inline unsigned long engine_clean_stops(const State *s)
+{
+    const Stopper *st = s->stopper;
+    if (!st)
+        return 0;
+    unsigned long n = 0;
+    for (int i = 0; i < kSources; i++)
+        n += st->stops[i];
+    return n;
+}
 
 /* The applications being tracked. Inline, so that readers of the state
    (the control panel) need not link the engine. */
