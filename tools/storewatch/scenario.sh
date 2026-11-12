@@ -5,8 +5,8 @@
 #   use   open and close the System Folder window, type a sum into the
 #         Calculator, open Stickies and type, switch applications three
 #         times and drag a note.
-# Each phase is saved as OUT-idle.* and OUT-use.* (sites and words) for
-# tools/storewatch/report.py.
+# Each phase is saved as OUT-idle.* and OUT-use.* (sites, words, and pages
+# with the plugin's epoch= option) for tools/storewatch/report.py.
 #
 # Usage: tools/storewatch/scenario.sh [OUT]   (default run/sw)
 #
@@ -38,6 +38,7 @@ phase() {
   sleep 1
   cp "$out.sites" "$out-$1.sites"
   cp "$out.words" "$out-$1.words"
+  if [ -f "$out.pages" ]; then cp "$out.pages" "$out-$1.pages"; fi
   touch "$out.reset"
   while [ -f "$out.reset" ]; do sleep 1; done
 }

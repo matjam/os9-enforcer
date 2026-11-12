@@ -1,13 +1,22 @@
 #!/usr/bin/env python3
 """Summarize a storewatch dump: stores into low memory and the system heap,
-which globals they hit, and which code made them.
+which globals they hit, which code made them, and (with the plugin's epoch=
+option) what protecting the system heap page by page would cost.
 
 Usage: tools/storewatch/report.py PREFIX [TOP]
 
-Reads PREFIX.sites and PREFIX.words (see storewatch.c). Low memory globals
-are named from the LMGet accessors in the 68k Multiversal Interfaces
+Reads PREFIX.sites, PREFIX.words and, if there, PREFIX.pages (see
+storewatch.c). Low memory globals are named from the LMGet accessors in the
+68k Multiversal Interfaces
 (toolchain/build/toolchain/m68k-apple-macos/include/Multiverse.h), which
 give each global's address.
+
+The page model section gives, for each protection interval:
+  traps/interval  traps per interval: at one interval per 16 ms tick, times
+                  62.5 is traps a second;
+  open pages      how many system heap pages are open on average, and the
+                  share protected (coverage) at a random moment;
+then the same if the K pages with the most traps were left open for good.
 """
 
 import os
@@ -146,6 +155,51 @@ def main():
             print("  68k stores by emulator instruction: " + ", ".join(
                 "%s x%d" % kv for kv in sorted(by_epc.items(),
                                                key=lambda kv: -kv[1])[:8]))
+
+    if os.path.exists(prefix + ".pages"):
+        pages_report(prefix + ".pages", top)
+
+
+def pages_report(path, top):
+    models, pages = [], []
+    head = {}
+    for line in open(path):
+        if line.startswith("# insns"):
+            f = line[2:].split()
+            head = {f[i]: int(f[i + 1]) for i in range(0, len(f) - 1, 2)}
+        elif line.startswith("# model"):
+            f = line[2:].split()
+            models.append({f[i]: int(f[i + 1]) for i in range(0, len(f) - 1, 2)})
+        elif not line.startswith("#"):
+            f = line.split()
+            pages.append((int(f[0], 16), [int(x) for x in f[1:]]))
+    insns = head["insns"]
+    total = head["last_page"] - head["first_page"] + 1
+    print("\npage model: %d system heap pages (from %08X), %d instructions"
+          % (total, head["first_page"] << 12, insns))
+    for m, md in enumerate(models):
+        traps = [(p[1][2 * m], p[1][2 * m + 1], p[0]) for p in pages]
+        traps.sort(reverse=True)
+        n_traps = sum(t for t, _, _ in traps)
+        epochs = max(md["epochs"], 1)
+        label = ("one guest tick (1/60 s)" if md["interval"] == 0 else
+                 "%d instructions" % md["interval"])
+        print("\n  interval %s: %d intervals, %d traps, %.1f per interval, "
+              "%.0f per million instructions; app stores caught %d, "
+              "missed %d" % (label, epochs, n_traps, n_traps / epochs,
+                             n_traps * 1e6 / insns, md["caught"],
+                             md["missed"]))
+        print("    open for good  traps/interval  open pages  coverage")
+        for k in (0, 4, 8, 16, 32, 64, 128, 256):
+            if k > len(traps):
+                break
+            rest = traps[k:]
+            t = sum(x for x, _, _ in rest)
+            open_avg = k + sum(o for _, o, _ in rest) / insns
+            print("    %13d  %14.1f  %10.1f  %7.2f%%" % (
+                k, t / epochs, open_avg, 100 * (1 - open_avg / total)))
+        hot = ", ".join("%08X x%d" % (a, t) for t, _, a in traps[:min(top, 12)])
+        print("    most traps: " + hot)
 
 
 if __name__ == "__main__":

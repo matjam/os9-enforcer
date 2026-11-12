@@ -6,3 +6,5 @@ project(Scribble C CXX)
 #   cmake -S scribble -B scribble/build -DCMAKE_TOOLCHAIN_FILE=$PWD/toolchain/build/toolchain/powerpc-apple-macos/cmake/retroppc.toolchain.cmake
 add_application(Scribble scribble.c CONSOLE)
 target_compile_options(Scribble PRIVATE -O2 -Wall)
+# engine.h and hook.h, for the trap timing test (it reads Enforcer's state).
+target_include_directories(Scribble PRIVATE ../common)

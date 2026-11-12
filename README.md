@@ -448,7 +448,9 @@ nothing:
 - `n`: a store from its native code: denied;
 - `6`: a store from 68k code in its heap: denied;
 - `b`: `BlockMoveData`, system code: allowed;
-- `o`: a store into its own heap: allowed.
+- `o`: a store into its own heap: allowed;
+- `t`: times traps, with the Enforcer Extension running (see
+  [Protecting the system heap page by page](#protecting-the-system-heap-page-by-page)).
 
 A denied store stops Scribble; open it again for the next test. To build and
 run both:
@@ -635,14 +637,73 @@ window, uses the Calculator and Stickies, and switches applications):
   then, so the 68k-PC test counts the emulator's store as the application's.
   Enforcer's 68k hook uses the same test; it does not matter there, because
   these frames are in the system heap, not in an application's partition.
+  The plugin now counts stores by that emulator code (6806E300-6806E370) as
+  system stores.
 - Nothing wrote the 68k exception vectors, where a write through a NULL
   pointer with a small offset lands.
 
 What this means for protecting low memory and the system heap:
-- Trapping every store, as the hooks do for other applications' pages, is
-  too slow: one trap per store would mean hundreds to thousands of traps per
-  million instructions. Low memory's first page holds both the vectors and
-  the most written globals, so it cannot be protected alone.
+- Trapping every store is too slow: that would be hundreds to thousands of
+  traps per million instructions. Low memory's first page holds both the
+  vectors and the most written globals, so it cannot be protected alone.
 - Applications' own code almost never writes either area, so a rule like
-  Enforcer's (deny app code) would rarely stop a working application. The
-  cost is in telling app code from system code at each store.
+  Enforcer's (deny app code) would rarely stop a working application.
+
+### Protecting the system heap page by page
+
+Enforcer does not trap every store into another application's memory: it
+protects each page, lets the first store by system code open it (one
+trap), and protects it again at its next 16 ms tick. The plugin's `epoch=`
+option replays that on every system heap page from 0x2000 up, and counts
+the traps it would take and how many pages would be open at a time:
+
+```bash
+SCRATCH=1 DISK=disks/os9-enforcer.qcow2 PLUGIN=tools/storewatch/build/libstorewatch.dylib,out=run/pm,epoch=ticks:250000:1000000:4000000:16000000 ./run.sh &
+tools/storewatch/scenario.sh run/pm
+tools/storewatch/report.py run/pm-use
+```
+
+`ticks` re-protects at each tick of the guest's clock (1/60 s), the closest
+to Enforcer's timer. The plugin slows the guest, so for work that keeps the
+CPU busy each tick holds less work than it would; an interval of a fixed
+number of instructions covers that case. Without the plugin, this guest
+runs 13 to 25 million instructions a second at the desktop and up to about
+900 million when busy (`mode=insns`), so 16 ms is 0.2 to 14 million
+instructions.
+
+To measure what a trap costs, Scribble's `t` test rewrites a word on 32
+of the Finder's pages with `BlockMoveData` for two seconds, with Enforcer's
+protection off and then on, and divides the extra time by the traps. On
+this QEMU (Apple Silicon host) one trap costs 60 to 76 µs, about 70 µs,
+including Enforcer putting the protection back; most of it is likely QEMU
+flushing its TLB when the page table changes.
+
+Results (2026-11-12, same idle and busy phases as above, 5,300 system heap
+pages; "open for good" leaves the pages with the most traps unprotected):
+
+| Open for good | Traps per tick, idle / busy | CPU at 70 µs a trap | Pages protected |
+|---|---|---|---|
+| none | 51 / 45 | about 20% | 99.4% |
+| 64 pages | 1.6 / 6.3 | 0.7% / 2.6% | 98.7% |
+| 128 pages | 0.1 / 2.3 | 0.1% / 1.0% | 97.5% |
+| 256 pages | 0 / 0.8 | 0.3% | 95.2% |
+
+For a busy CPU with 16 million instructions per interval (16 ms at about
+1,000 million a second), the busy phase takes 124 traps per interval with
+no pages open for good (about 54% CPU), 69 with 64 (30%), 44 with 128
+(19%) and 22 with 256 (10%).
+
+- The pages with the most traps are the same in both phases and are
+  written in nearly every tick: the emulator's call frames (0x44000 to
+  0x46000) and a few dozen others.
+- No application's code stored into the system heap in these phases, so a
+  deny rule stopped nothing here; that is a small sample of applications.
+- A protected share of 98.7% means a store to a random system heap
+  address would be caught that often. A stale pointer into a structure the
+  system uses all the time is more likely to hit one of the open pages.
+
+So protecting the system heap the way Enforcer protects applications costs
+about 20% of the CPU on this QEMU if every page is protected again at every
+tick, and 1 to 3% in interactive use if the few dozen pages the system
+writes all the time are left open, at the price of those pages. Busy work
+costs more, because more pages get written in each tick.
