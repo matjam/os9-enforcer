@@ -8,6 +8,14 @@
  * counted (count_self); any other is recorded in the ring (count_handled is
  * its sequence number). Faults it does not handle go on to the original
  * handler and are counted in count_passed, with the last one in passed.
+ *
+ * Deny rule: a recorded store whose code lies inside [cur_lo, cur_hi) is
+ * the current application's own code writing outside its memory. The hook
+ * sets kHookAppCode in the event's pc. When enforce is set, it also leaves
+ * the page protected and passes the fault on, which stops the application;
+ * such faults are counted in count_denied, with the last one in denied.
+ * The code's address is the faulting PC for native code and the next 68k
+ * instruction (r24 - 2) for 68k code.
  */
 
 #ifndef HOOK_H
@@ -17,12 +25,16 @@
 
 enum { kHookRing = 64 }; /* ring entries; RING_N in the .s files */
 
+/* Set in HookEvent.pc (PowerPC instructions are 4-byte aligned, so the
+   low bits are free): the store's code is the current application's. */
+enum { kHookAppCode = 1 };
+
 /* A store a hook handled. Must match the R_ offsets in h68k.s and hnat.s.
    For h68k, r24 is the next 68k instruction + 2 and sp is the 68k A7; for
    hnat, r24 holds the interrupted r3 and sp is r1. */
 typedef struct {
     unsigned long seq;  /* count_handled after this event; 0 = empty */
-    unsigned long pc;   /* the instruction that faulted */
+    unsigned long pc;   /* the instruction that faulted, | kHookAppCode */
     unsigned long addr; /* fault address */
     unsigned long r24;
     unsigned long lr;
@@ -59,7 +71,10 @@ typedef struct {
     unsigned long count_self;    /* handled inside [cur_lo, cur_hi) */
     unsigned long saved_ctx;     /* hnat: the context block, during the call */
     unsigned long block;         /* hnat: the system-heap block it lives in */
-    unsigned long reserved[14];
+    unsigned long enforce;       /* deny stores by the current app's code */
+    unsigned long count_denied;
+    HookPassed denied;           /* the last store denied */
+    unsigned long reserved[7];
 } HookData;
 
 _Static_assert(sizeof(HookEvent) == 32, "ring entry size");
@@ -70,6 +85,9 @@ _Static_assert(offsetof(HookData, cur_lo) == 0x70, "D_CUR_LO");
 _Static_assert(offsetof(HookData, ring) == 0x78, "D_RING");
 _Static_assert(offsetof(HookData, count_self) == 0x7C, "D_COUNT_SELF");
 _Static_assert(offsetof(HookData, saved_ctx) == 0x80, "hnat D_CTX");
+_Static_assert(offsetof(HookData, enforce) == 0x88, "D_ENFORCE");
+_Static_assert(offsetof(HookData, count_denied) == 0x8C, "D_COUNT_DENIED");
+_Static_assert(offsetof(HookData, denied) == 0x90, "D_DENIED");
 _Static_assert(sizeof(HookData) == 0xC0, "data block size");
 
 /* A pointer to a fixed address. The empty asm hides the constant from GCC,
