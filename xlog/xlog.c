@@ -2,6 +2,14 @@
  * XLog: log writes from one application into another's memory, across all
  * running applications. Log only: every write is allowed.
  *
+ * Guard: the same program built with XLOG_ENFORCE=1. It denies a store into
+ * another application's memory when the code doing it is the current
+ * application's own (it lies in the current application's domain). The
+ * hooks leave the page protected and pass the fault on, and the system
+ * stops the application. Stores made by system code (the Process Manager,
+ * the Window Manager and others, which live outside every domain) are
+ * still allowed and logged. XLog marks the stores Guard would deny.
+ *
  * Each running application's partition (from the Process Manager) is a
  * domain. Its whole pages ([lo, hi), the partition rounded inward to pages)
  * are write-protected while the application is not current, and their bits
@@ -38,6 +46,15 @@
  * with virtual memory off. To stop, bring XLog to the front and press a key.
  */
 
+#ifndef XLOG_ENFORCE
+#define XLOG_ENFORCE 0
+#endif
+#if XLOG_ENFORCE
+#define kName "Guard"
+#else
+#define kName "XLog"
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -61,7 +78,8 @@ enum {
     kTimerMs = 16,
     kRefreshTicks = 30, /* re-read the process list every half second */
     kStatusTicks = 600, /* print a status line every 10 seconds */
-    kMagic = 'XLG2'
+    kOffenseLog = 16,
+    kMagic = 'XLG3'
 };
 
 /* The bitmap covers the whole blue area, one bit per page. */
@@ -70,8 +88,11 @@ enum {
 #define kBitmapBytes ((kSpanHi - kSpanLo) / kPage / 8)
 #define kPageMask (~(unsigned long)(kPage - 1))
 
-/* Where a store was caught. */
+/* Where a store was caught. In Writer.source and Offense.source, combined
+   with kWriterAppCode: the store's code is the writing application's own
+   (Guard denies these stores). */
 enum { kSrcNative, kSrc68k, kSrcFallback, kSources };
+enum { kSrcMask = 0xFF, kWriterAppCode = 0x100 };
 
 typedef struct {
     volatile unsigned long live;  /* in use: its pages may be protected */
@@ -95,6 +116,16 @@ typedef struct {
     char target[16];
 } Writer;
 
+/* A store by an application's own code into another domain: denied by
+   Guard, only logged by XLog. */
+typedef struct {
+    unsigned long seq; /* 1 for the first */
+    unsigned long pc;  /* native PC, or the 68k instruction after the store */
+    unsigned long addr, source, denied;
+    char writer[16];
+    char target[16];
+} Offense;
+
 /* tools/xlog-read.py names these in this order. */
 typedef struct {
     unsigned long self[kSources], foreign[kSources], lost[kSources];
@@ -103,6 +134,7 @@ typedef struct {
     unsigned long refreshes, added, removed;
     unsigned long dropped, nwriters;
     unsigned long info_errors; /* GetProcessInformation failures */
+    unsigned long app_code[kSources]; /* offenses, by where caught */
 } Counters;
 
 typedef struct {
@@ -112,6 +144,7 @@ typedef struct {
     unsigned long off_domains, n_domains, domain_size;
     unsigned long off_writers, max_writers, writer_size;
     unsigned long off_cur;
+    unsigned long off_offenses, max_offenses, offense_size, enforce;
 
     Counters c;
     long cur; /* domain of the current application, or -1 */
@@ -127,6 +160,9 @@ typedef struct {
     unsigned char *bitmap;
     Domain domains[kMaxDomains];
     Writer writers[kMaxWriters];
+    /* The last kOffenseLog offenses: number n is at (n - 1) % kOffenseLog. */
+    volatile unsigned long n_offenses;
+    Offense offenses[kOffenseLog];
     /* Written by the fallback handler; fb_count is the last seq. */
     volatile unsigned long fb_count, fb_idx;
     HookEvent fb_ring[kFallbackRing];
@@ -228,13 +264,17 @@ static void protect_others(State *s)
             protect_domain(s, i);
 }
 
-/* Point both hooks' current range at domain i (-1: none). */
+/* Point both hooks' current range at domain i (-1: none): its whole
+   partition, not only its whole pages, because the hooks also test the
+   store's code against it, and an application's code can start on the
+   partly used first page. The partly used pages are never protected, so
+   for fault addresses the two ranges are the same. */
 static void set_current(State *s, int i)
 {
     unsigned long lo = 0, hi = 0;
     if (i >= 0) {
-        lo = s->domains[i].lo;
-        hi = s->domains[i].hi;
+        lo = s->domains[i].location;
+        hi = s->domains[i].location + s->domains[i].size;
     }
     hook_set_current(s->h68k, lo, hi);
     hook_set_current(s->hnat, lo, hi);
@@ -266,7 +306,7 @@ static void writer_name(State *s, unsigned long zone, char out[16])
     if (w >= 0)
         copy_name(out, s->domains[w].name);
     else if (zone >= s->my_lo && zone < s->my_hi)
-        copy_name(out, "XLog");
+        copy_name(out, kName);
     else if (zone == lowmem_long(0x2A6)) /* SysZone */
         copy_name(out, "System");
     else
@@ -304,6 +344,22 @@ static void record(State *s, int src, unsigned long pc, unsigned long lr,
     s->c.nwriters++;
 }
 
+static void record_offense(State *s, int src, unsigned long pc,
+                           unsigned long zone, int t, unsigned long addr)
+{
+    unsigned long n = s->n_offenses + 1;
+    Offense *o = &s->offenses[(n - 1) % kOffenseLog];
+    o->seq = n;
+    o->pc = pc;
+    o->addr = addr;
+    o->source = src;
+    o->denied = XLOG_ENFORCE && src != kSrcFallback;
+    writer_name(s, zone, o->writer);
+    copy_name(o->target, s->domains[t].name);
+    s->c.app_code[src]++;
+    s->n_offenses = n;
+}
+
 /* Take the stores a ring holds with seq in (seen, handled]. */
 static void drain(State *s, int src, volatile HookEvent *ring, unsigned long n,
                   unsigned long handled)
@@ -321,6 +377,7 @@ static void drain(State *s, int src, volatile HookEvent *ring, unsigned long n,
         if (e->seq - seen - 1 >= handled - seen)
             continue;
         unsigned long addr = e->addr, zone = e->zone;
+        int app = (e->pc & kHookAppCode) != 0;
         int t = domain_at(s, addr);
         if (t < 0) {
             s->c.outside++;
@@ -330,11 +387,13 @@ static void drain(State *s, int src, volatile HookEvent *ring, unsigned long n,
             s->c.self[src]++;
             s->domains[t].self_writes++;
         } else {
+            unsigned long pc = src == kSrc68k ? hook_next_pc(e->r24)
+                                              : e->pc & ~3UL;
+            unsigned long lr = src == kSrc68k ? 0 : e->lr;
             s->c.foreign[src]++;
-            if (src == kSrc68k)
-                record(s, src, hook_next_pc(e->r24), 0, zone, t, addr);
-            else
-                record(s, src, e->pc, e->lr, zone, t, addr);
+            record(s, src | (app ? kWriterAppCode : 0), pc, lr, zone, t, addr);
+            if (app)
+                record_offense(s, src, pc, zone, t, addr);
         }
         if (t != s->cur)
             protect(s, t, addr & kPageMask, kPage);
@@ -359,14 +418,19 @@ static long handler(ExceptionInfo *e)
         mi->theAddress >= kSpanHi ||
         !hook_bit(s->bitmap, kSpanLo, mi->theAddress))
         return g_prev ? g_prev(e) : -1;
-    unsigned long addr = mi->theAddress;
+    unsigned long addr = mi->theAddress, pc = e->machineState->PC.lo;
+    int app = pc >= s->hnat->cur_lo && pc < s->hnat->cur_hi;
+    /* A store the native hook denied (it is in its ring already): let the
+       system stop the application. */
+    if (app && XLOG_ENFORCE)
+        return g_prev ? g_prev(e) : -1;
     if (nk_unprotect(s->area, addr & kPageMask, kPage))
         s->c.kernel_errors++;
     unsigned long seq = s->fb_count + 1;
     volatile HookEvent *ev = &s->fb_ring[s->fb_idx];
     s->fb_idx = (s->fb_idx + 1) % kFallbackRing;
     ev->seq = seq;
-    ev->pc = e->machineState->PC.lo;
+    ev->pc = pc | (app ? kHookAppCode : 0);
     ev->addr = addr;
     ev->r24 = 0;
     ev->lr = e->machineState->LR.lo;
@@ -504,11 +568,39 @@ static void status(State *s)
 {
     Counters *c = &s->c;
     printf("domains +%lu -%lu, switches %lu; own/cross: native %lu/%lu, 68k "
-           "%lu/%lu, fallback %lu/%lu; lost %lu/%lu; writers %lu\n",
+           "%lu/%lu, fallback %lu/%lu; lost %lu/%lu; writers %lu; by app "
+           "code %lu\n",
            c->added, c->removed, c->switches, c->self[kSrcNative],
            c->foreign[kSrcNative], c->self[kSrc68k], c->foreign[kSrc68k],
            c->self[kSrcFallback], c->foreign[kSrcFallback],
-           c->lost[kSrcNative], c->lost[kSrc68k], c->nwriters);
+           c->lost[kSrcNative], c->lost[kSrc68k], c->nwriters,
+           s->n_offenses);
+}
+
+static const char *source_name(unsigned long src)
+{
+    switch (src & kSrcMask) {
+    case kSrc68k:
+        return "68k";
+    case kSrcFallback:
+        return "native, fallback";
+    default:
+        return "native";
+    }
+}
+
+/* Print the offenses recorded since *shown (main loop only). */
+static void show_offenses(State *s, unsigned long *shown)
+{
+    unsigned long n = s->n_offenses;
+    if (n - *shown > kOffenseLog)
+        *shown = n - kOffenseLog;
+    for (; *shown < n; (*shown)++) {
+        Offense *o = &s->offenses[*shown % kOffenseLog];
+        printf("%s: %s's own code (%s, %08lX) wrote into %s at %08lX\n",
+               o->denied ? "DENIED" : "would deny", o->writer,
+               source_name(o->source), o->pc, o->target, o->addr);
+    }
 }
 
 static int by_count(const void *a, const void *b)
@@ -549,14 +641,22 @@ static void report(State *s)
            "addr\n");
     for (unsigned long i = 0; i < s->c.nwriters && i < 24; i++) {
         Writer *w = &s->writers[i];
+        unsigned long src = w->source & kSrcMask;
         char lr[9];
-        if (w->source == kSrc68k)
+        if (src == kSrc68k)
             snprintf(lr, sizeof lr, " (68k)  ");
         else
             snprintf(lr, sizeof lr, "%08lX", w->lr);
-        printf("%6lu %08lX %s %-15s %-15s %08lX%s\n", w->count, w->pc, lr,
+        printf("%6lu %08lX %s %-15s %-15s %08lX%s%s\n", w->count, w->pc, lr,
                w->writer, w->target, w->first_addr,
-               w->source == kSrcFallback ? " (fallback)" : "");
+               src == kSrcFallback ? " (fallback)" : "",
+               w->source & kWriterAppCode ? " (app code)" : "");
+    }
+    if (s->n_offenses) {
+        unsigned long shown = 0;
+        printf("stores by an application's own code (the last %d):\n",
+               kOffenseLog);
+        show_offenses(s, &shown);
     }
 }
 
@@ -566,6 +666,8 @@ static void unhook(State *s, int had68, int hadnat)
     s->hook_passed[0] = s->h68k->count_passed;
     s->hook_self[1] = s->hnat->count_self;
     s->hook_passed[1] = s->hnat->count_passed;
+    s->h68k->enforce = 0;
+    s->hnat->enforce = 0;
     hook_set_bitmap(s->h68k, 0, 0, 0);
     hook_set_bitmap(s->hnat, 0, 0, 0);
     hook_set_current(s->h68k, 0, 0);
@@ -580,7 +682,12 @@ static void unhook(State *s, int had68, int hadnat)
 
 int main(void)
 {
+#if XLOG_ENFORCE
+    printf("Guard: stop applications whose own code writes into another "
+           "application's memory\n");
+#else
     printf("XLog: log writes from one application into another's memory\n");
+#endif
 
     InstallFn sys_install = nk_find_system_installer();
     if (!sys_install) {
@@ -608,6 +715,10 @@ int main(void)
     s->max_writers = kMaxWriters;
     s->writer_size = sizeof(Writer);
     s->off_cur = offsetof(State, cur);
+    s->off_offenses = offsetof(State, n_offenses);
+    s->max_offenses = kOffenseLog;
+    s->offense_size = sizeof(Offense);
+    s->enforce = XLOG_ENFORCE;
     s->bitmap = bitmap;
     s->cur = -1;
 
@@ -641,14 +752,16 @@ int main(void)
     s->h68k->owner = (unsigned long)s;
     s->hnat->owner = (unsigned long)s;
 
-    printf("state %08lX, my partition %08lX-%08lX; to stop, bring XLog to "
+    printf("state %08lX, my partition %08lX-%08lX; to stop, bring %s to "
            "the front and press a key\n", (unsigned long)s, s->my_lo,
-           s->my_hi);
+           s->my_hi, kName);
 
     g_state = s;
     set_current(s, -1);
     hook_set_bitmap(s->h68k, kSpanLo, kSpanHi, bitmap);
     hook_set_bitmap(s->hnat, kSpanLo, kSpanHi, bitmap);
+    s->h68k->enforce = XLOG_ENFORCE;
+    s->hnat->enforce = XLOG_ENFORCE;
     g_prev = sys_install(handler);
     s->active = 1;
     BlockMoveData(timer_upp, &s->timer_rd, sizeof s->timer_rd);
@@ -663,6 +776,7 @@ int main(void)
                    s->domains[i].lo, s->domains[i].hi);
 
     unsigned long last_refresh = TickCount(), last_status = TickCount();
+    unsigned long shown = 0;
     EventRecord ev;
     for (;;) {
         if (WaitNextEvent(everyEvent, &ev, 6, NULL)) {
@@ -682,10 +796,13 @@ int main(void)
             status(s);
             last_status = now;
         }
+        show_offenses(s, &shown);
     }
 
-    /* Stop the tick, take what the rings hold, then open everything before
-       the hooks stop managing it. */
+    /* Stop denying and stop the tick, take what the rings hold, then open
+       everything before the hooks stop managing it. */
+    s->h68k->enforce = 0;
+    s->hnat->enforce = 0;
     s->active = 0;
     RmvTime((QElemPtr)&s->timer);
     drain_all(s);

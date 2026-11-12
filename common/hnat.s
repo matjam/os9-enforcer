@@ -15,6 +15,12 @@
 # Anything else goes on to the original entry with every register as it
 # arrived.
 #
+# Deny rule: when the faulting PC of a recorded store is inside [cur_lo,
+# cur_hi), the current application's own code is writing outside its
+# memory. The ring entry's pc gets bit 0 set. With D_ENFORCE set, the hook
+# then leaves the page protected and passes the fault on to the Exception
+# Manager.
+#
 # Entry state: as for h68k.s, with the NCB in r3 and NCB+0x54 (the
 # Exception Manager's TVector) in r4. Fault details in the NCB: +0x40 flags
 # (code in the top byte), +0x74 fault address, +0x84 PC, +0x8C LR,
@@ -47,7 +53,11 @@
         .set    D_RING, 0x78
         .set    D_COUNT_SELF, 0x7C
         .set    D_CTX, 0x80             # the NCB, kept across the kernel call
+        .set    D_ENFORCE, 0x88         # nonzero: deny the current app's code
+        .set    D_COUNT_DENIED, 0x8C
+        .set    D_DENIED, 0x90          # the last one: pc, addr, r3, zone, sp
         .set    RING_N, 64
+        .set    APPCODE, 6              # CR bit (cr1.eq): the current app's code
 
         .set    R_SEQ, 0x00
         .set    R_PC, 0x04
@@ -116,12 +126,25 @@ handle:
         b       open
 
 record:
+        # Deny rule: is the faulting PC inside the current range? The answer
+        # is kept in CR bit APPCODE, which the exit paths restore from D_CR
+        # with the rest of CR.
+        crxor   APPCODE,APPCODE,APPCODE
+        lwz     6,0x84(3)               # PC
+        lwz     5,D_CUR_LO(4)
+        cmplw   6,5
+        blt     app_known
+        lwz     5,D_CUR_HI(4)
+        cmplw   6,5
+        bge     app_known
+        creqv   APPCODE,APPCODE,APPCODE
+app_known:
         lwz     5,D_COUNT_HANDLED(4)
         addi    5,5,1
         stw     5,D_COUNT_HANDLED(4)
         lwz     6,D_RING(4)
         cmpwi   6,0
-        beq     open
+        beq     decide
         lwz     0,D_RING_IDX(4)
         slwi    0,0,5
         add     6,6,0                   # r6 = ring entry
@@ -131,6 +154,9 @@ record:
         stw     0,D_RING_IDX(4)
         stw     5,R_SEQ(6)
         lwz     5,0x84(3)
+        bne     1,pc_known              # cr1.eq clear: not the app's code
+        ori     5,5,1
+pc_known:
         stw     5,R_PC(6)
         stw     7,R_ADDR(6)
         lwz     5,0x94(3)
@@ -144,6 +170,12 @@ record:
         lwz     5,0x9C(3)
         stw     5,R_R4(6)
         stw     1,R_SP(6)
+
+decide:
+        bne     1,open
+        lwz     5,D_ENFORCE(4)
+        cmpwi   5,0
+        bne     deny
 
 open:
         # The kernel call below goes through the same context block.
@@ -195,6 +227,26 @@ open:
         lwz     5,D_R5(4)
         li      3,0
         blr                             # ReturnFromException: retry the store
+
+deny:
+        # The page stays protected; the Exception Manager handles the fault.
+        stw     7,D_DENIED+P_ADDR(4)
+        lwz     5,0x84(3)
+        stw     5,D_DENIED+P_PC(4)
+        lwz     5,0x94(3)
+        stw     5,D_DENIED+P_R3(4)
+        stw     1,D_DENIED+P_SP(4)
+        lhz     5,0x2AA(0)
+        lhz     0,0x2AC(0)
+        rlwimi  0,5,16,0,15
+        stw     0,D_DENIED+P_ZONE(4)
+        lwz     5,D_COUNT_DENIED(4)
+        addi    5,5,1
+        stw     5,D_COUNT_DENIED(4)
+        lwz     0,D_R0(4)
+        lwz     6,D_R6(4)
+        lwz     7,D_R7(4)
+        b       chain
 
 not_ours:
         stw     7,D_PASSED+P_ADDR(4)

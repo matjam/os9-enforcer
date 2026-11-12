@@ -13,6 +13,13 @@
 # to the original entry with every register as it arrived. The hook never
 # touches the stack.
 #
+# Deny rule: when the 68k code doing a recorded store (the next 68k
+# instruction, r24 - 2) is inside [cur_lo, cur_hi), the current
+# application's own code is writing outside its memory. The ring entry's pc
+# gets bit 0 set. With D_ENFORCE set, the hook then leaves the page
+# protected and passes the fault on, and the emulator gives the application
+# a bus error.
+#
 # Entry state, from the kernel (NKInterrupts.s LetBlueHandleOwnException):
 #   r3  = ECB (logical)          free: the original overwrites it first
 #   r4  = ECB+0x54               reloaded from there before chaining
@@ -58,7 +65,11 @@
         .set    D_CUR_HI, 0x74          # handled but not recorded
         .set    D_RING, 0x78            # RING_N entries of 32 bytes, or 0
         .set    D_COUNT_SELF, 0x7C      # handled inside [cur_lo, cur_hi)
+        .set    D_ENFORCE, 0x88         # nonzero: deny the current app's code
+        .set    D_COUNT_DENIED, 0x8C
+        .set    D_DENIED, 0x90          # the last one: pc, addr, r24, zone, a7
         .set    RING_N, 64
+        .set    APPCODE, 6              # CR bit (cr1.eq): the current app's code
 
         # Ring entry and passed-fault record fields.
         .set    R_SEQ, 0x00             # count_handled after this event
@@ -136,12 +147,25 @@ handle:
         b       open
 
 record:
+        # Deny rule: is the 68k code doing the store inside the current
+        # range? The answer is kept in CR bit APPCODE, which the exit paths
+        # restore from D_CR with the rest of CR.
+        crxor   APPCODE,APPCODE,APPCODE
+        addi    6,24,-2                 # the next 68k instruction
+        lwz     5,D_CUR_LO(3)
+        cmplw   6,5
+        blt     app_known
+        lwz     5,D_CUR_HI(3)
+        cmplw   6,5
+        bge     app_known
+        creqv   APPCODE,APPCODE,APPCODE
+app_known:
         lwz     5,D_COUNT_HANDLED(3)
         addi    5,5,1
         stw     5,D_COUNT_HANDLED(3)
         lwz     7,D_RING(3)
         cmpwi   7,0
-        beq     open
+        beq     decide
         lwz     6,D_RING_IDX(3)
         slwi    0,6,5
         add     7,7,0                   # r7 = ring entry
@@ -150,6 +174,9 @@ record:
         stw     6,D_RING_IDX(3)
         stw     5,R_SEQ(7)
         lwz     6,0x84+E(3)
+        bne     1,pc_known              # cr1.eq clear: not the app's code
+        ori     6,6,1
+pc_known:
         stw     6,R_PC(7)
         stw     4,R_ADDR(7)
         stw     24,R_R24(7)
@@ -162,6 +189,12 @@ record:
         lwz     6,0x9C+E(3)
         stw     6,R_R4(7)
         stw     1,R_A7(7)
+
+decide:
+        bne     1,open
+        lwz     5,D_ENFORCE(3)
+        cmpwi   5,0
+        bne     deny
 
 open:
         # The kernel call below goes through the same context block; keep
@@ -213,6 +246,27 @@ open:
         mtcrf   0xFF,4
         li      3,0
         blr                             # ReturnFromException: retry the store
+
+deny:
+        # The page stays protected; the emulator turns the fault into a bus
+        # error for the application.
+        stw     4,D_DENIED+P_ADDR(3)
+        lwz     5,0x84+E(3)
+        stw     5,D_DENIED+P_PC(3)
+        stw     24,D_DENIED+P_R24(3)
+        stw     1,D_DENIED+P_A7(3)
+        lhz     5,0x2AA(0)
+        lhz     6,0x2AC(0)
+        rlwimi  6,5,16,0,15
+        stw     6,D_DENIED+P_ZONE(3)
+        lwz     5,D_COUNT_DENIED(3)
+        addi    5,5,1
+        stw     5,D_COUNT_DENIED(3)
+        lwz     0,D_R0(3)
+        lwz     5,D_R5(3)
+        lwz     6,D_R6(3)
+        lwz     7,D_R7(3)
+        b       chain
 
 chain_write:
         # Keep the details: this fault is about to kill the application,

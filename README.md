@@ -95,6 +95,12 @@ cursor exactly, `move` (and the commands built on it) reads the cursor position
 from the guest's low memory (`RawMouse`, 0x82C), moves by the remaining
 distance, and repeats until it matches. A move takes about two seconds.
 
+To open an icon, double-click it with `dclick`, aimed at a solid part of the
+icon. The Finder hit-tests the icon's mask, so a click in the hole of a CD
+icon lands on the desktop and deselects everything.
+
+To switch applications, press Cmd-Tab (`tools/qmp.py key cmd-tab`).
+
 ## Snapshots
 
 `clean-install` is Mac OS 9.2.2 straight after the installer, before its
@@ -249,6 +255,24 @@ kernel with r3 = 0, which runs the faulting instruction again. Anything else
 goes to the original handler with every register as it arrived. Both stay
 installed after the installing application quits.
 
+Both hooks also apply a deny rule to the stores they record. When the code
+doing the store lies inside the current range, the current application's
+own code is writing outside its memory: the hook sets bit 0 of the ring
+entry's `pc`. With `enforce` set, it also leaves the page protected and
+passes the fault on, which stops the application; it counts these in
+`count_denied` and keeps the last in `denied`. For native code the store's
+code is the faulting PC; for 68k code it is the next 68k instruction.
+
+The hooks only see faults in the blue task (Mac OS itself, including its
+interrupt-level code). A write fault in any other NanoKernel task, such as
+a Multiprocessing Services task, stops that task without reaching them. To
+check that none happened, compare the kernel's count of write faults with
+the hooks' total:
+
+```bash
+tools/faults-read.py
+```
+
 ### 68k hook
 
 A store from 68k code to a protected page never reaches the Exception
@@ -331,6 +355,8 @@ It reads everything in one pause of the guest through `tools/vdump.py`.
 
 `xlog/` (XLog) logs stores from one application into another's memory,
 across every running application. It only logs: every store is allowed.
+The same directory builds Guard, which denies some of them (see "Guard"
+below).
 
 Each running application's partition, from the Process Manager, is a
 domain. While an application is not current, XLog write-protects the whole
@@ -341,7 +367,7 @@ application's own domain, which the hooks only count.
 
 A Time Manager task runs every 16 ms:
 - When ApplZone changes (a process switch), it points the hooks' current
-  range at the new application's domain and protects the previous
+  range at the new application's partition and protects the previous
   application's domain again.
 - It takes the hooks' rings. A store is the target's own when ApplZone at
   the store is inside the target's partition. Otherwise it is logged by
@@ -372,6 +398,69 @@ tools/xlog-read.py
 
 XLog's state begins with a header giving the offsets and sizes of its parts,
 which `xlog-read.py` checks against its own copy of the layout.
+
+XLog marks a writer `(app code)` when the code doing the store is the
+writing application's own, and lists those stores at the end of its report:
+these are the stores Guard denies.
+
+## Guard
+
+Guard is XLog built with `XLOG_ENFORCE=1`. It stops an application whose
+own code writes into another application's memory, and allows everything
+else.
+
+The rule: a store into another application's protected pages is denied when
+the code doing it lies inside the current application's partition (its
+code fragment and 68k code resources are in its heap). The hook leaves the
+page protected and passes the fault on: the 68k emulator gives the
+application a bus error, and a native fault goes to the Exception Manager.
+Either way, Mac OS stops the application with "unexpectedly quit, error of
+type 1", and the target's memory is unchanged. Guard prints each denial in
+its window:
+
+```
+DENIED: Scribble's own code (native, 1E1B5C98) wrote into Finder at 1EA34100
+```
+
+Stores made by system code are allowed and logged, even when they land in
+another application's memory: the Process Manager, Window Manager and Layer
+Manager do this on every switch, and their code lives in the system heap
+and ROM, outside every partition.
+
+Limits:
+- A store by system code on an application's behalf is allowed, for example
+  `BlockMoveData` called with a bad destination. Guard looks at the code
+  doing the store, not at who called it.
+- Only other applications' partitions are protected. The system heap and
+  low memory are not.
+- An application's code must be inside its partition, or its stores are
+  treated as system code. With virtual memory on, the Code Fragment Manager
+  can map code from its file outside the partition (not tested); run Guard
+  with virtual memory off.
+- A 68k denial at interrupt time hangs the machine (the emulator cannot take
+  a bus error there). This needs the current application's own interrupt
+  task to write into another application.
+
+`scribble/` (Scribble) tests it. It stores into a word in the middle of the
+Finder's partition the value already there, so an allowed store changes
+nothing:
+- `n`: a store from its native code: denied;
+- `6`: a store from 68k code in its heap: denied;
+- `b`: `BlockMoveData`, system code: allowed;
+- `o`: a store into its own heap: allowed.
+
+A denied store stops Scribble; open it again for the next test. To build and
+run both:
+
+```bash
+cmake -S scribble -B scribble/build -DCMAKE_TOOLCHAIN_FILE=$PWD/toolchain/build/toolchain/powerpc-apple-macos/cmake/retroppc.toolchain.cmake
+cmake --build scribble/build
+SCRATCH=1 DISK=disks/os9-novm.qcow2 ./run.sh &
+tools/push.sh -n Test xlog/build/Guard.bin scribble/build/Scribble.bin
+```
+
+Open Guard first, then Scribble. Guard's state reads the same way as XLog's,
+with `tools/xlog-read.py`.
 
 To check that the hook's space in the emulator data page stays zero, take 40
 dumps half a second apart (do this before installing the hook):

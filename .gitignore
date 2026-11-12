@@ -21,6 +21,9 @@
 /wlog/build*/
 /h68k/build/
 /xlog/build/
+/scribble/build/
+
+__pycache__/
 
 # Binary files, wherever they are.
 *.bin

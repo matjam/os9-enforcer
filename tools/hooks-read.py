@@ -69,21 +69,26 @@ def show(name, addr, d, events):
              struct.unpack(">i", struct.pack(">I", f(0x1C)))[0]))
     print("  range %08X-%08X, bitmap %08X, current %08X-%08X, ring %08X" %
           (f(0x0C), f(0x10), f(0x68), f(0x70), f(0x74), f(0x78)))
+    print("  enforce %d, denied %d" % (f(0x88), f(0x8C)))
     native = name.startswith("native")
-    if f(0x50):
-        p = [f(0x54 + 4 * i) for i in range(5)]
-        print("  last passed on: pc %08X addr %08X %s %08X zone %08X sp %08X"
-              % (p[0], p[1], "r3" if native else "next 68k", p[2] if native
-                 else p[2] - 2, p[3], p[4]))
-    # Oldest first: ring_idx is the next slot the hook writes.
+    for label, count, off in (("passed on", 0x50, 0x54),
+                              ("denied", 0x8C, 0x90)):
+        if f(count):
+            p = [f(off + 4 * i) for i in range(5)]
+            print("  last %s: pc %08X addr %08X %s %08X zone %08X sp %08X"
+                  % (label, p[0], p[1], "r3" if native else "next 68k",
+                     p[2] if native else p[2] - 2, p[3], p[4]))
+    # Oldest first: ring_idx is the next slot the hook writes. Bit 0 of pc
+    # marks a store by the current application's own code.
     idx = f(0x20) % RING_N
     for i in range(RING_N if events else 0):
         e = events[8 * ((idx + i) % RING_N):][:8]
         if e[0]:
             print("  #%d pc %08X addr %08X %s %08X lr %08X zone %08X r4 %08X "
-                  "sp %08X" % (e[0], e[1], e[2], "r3" if native else
-                               "next 68k", e[3] if native else e[3] - 2,
-                               e[4], e[5], e[6], e[7]))
+                  "sp %08X%s" % (e[0], e[1] & ~3, e[2], "r3" if native else
+                                 "next 68k", e[3] if native else e[3] - 2,
+                                 e[4], e[5], e[6], e[7],
+                                 " (app code)" if e[1] & 1 else ""))
 
 
 def main():
