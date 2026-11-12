@@ -199,14 +199,17 @@ the area information; press Return to run the tests.
 Manager's system-wide handler slot.
 
 `wlog/` (WLog) write-protects its own application heap and logs stores into
-it made while another application is current. It logs native PowerPC
-stores by writer (PC, LR, application). For 68k stores it lists the last 16
-that the 68k write hook caught (see below), without the application name.
+it made while another application is current. It lists writers by store
+site and application: native stores by PC and LR, 68k stores by the 68k
+instruction after the store, marked `(68k)`.
 
 WLog installs the 68k write hook and points it at its heap. Without the
 hook, a 68k store into the protected heap at interrupt time or during a
 process switch hangs the whole machine. A Time Manager task re-protects
-pages every 16 ms. Run WLog only in a `SCRATCH=1` guest.
+pages every 16 ms. On each tick it takes the 68k stores the hook caught and
+protects their pages again. The hook records the current zone (ApplZone) at
+each store, and WLog names the application from it through the Process
+Manager when it prints the report. Run WLog only in a `SCRATCH=1` guest.
 
 `run/wlog-scenario.sh [WLog.bin]` boots a scratch guest if none is running,
 runs WLog, has the Finder draw over it, then stops it and saves screenshots
@@ -227,6 +230,19 @@ violation (exception code 21) at an address in its range, makes that page
 writable with `MPSetAreaAccess`, and returns to the faulting instruction,
 which then succeeds. Anything else goes to the emulator unchanged.
 
+For each store it handles, the hook writes an entry to an 8-entry ring:
+- a sequence number;
+- the emulator instruction that faulted, and the fault address;
+- r24, the emulator's 68k instruction pointer;
+- the current zone (ApplZone), the value stored (usually r4) and the 68k
+  stack pointer (A7, which is r1).
+
+The emulator is a threaded interpreter: each opcode handler fetches the next
+opcode with `lhau rX,2(r24)` before its own store, so at the fault r24 is
+the next 68k instruction + 2 (`h68k_next_pc()` subtracts the 2). For the
+last write fault outside the range, the hook keeps the same details in a
+separate record, `passed`. That fault kills the application.
+
 The hook lives in unused space in the emulator data page (logical
 0x68FFFB80-0x68FFFEFF: data, then code). That space stayed zero across 40
 dumps taken while the Finder and QuickTime ran. The hook stays installed
@@ -244,8 +260,8 @@ hook opens the page and the store lands), and to a protected page outside the
 range (the application is killed with error type 1 and the system stays up).
 The second run prints the hook's counters and removes it.
 
-To read the hook's counters and its last 16 events from the host while the
-guest runs:
+To read the hook's counters, its ring and the passed-on record from the host
+while the guest runs:
 
 ```bash
 tools/h68k-read.py

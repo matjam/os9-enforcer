@@ -55,17 +55,25 @@ def main():
     names = ["magic", "count_all", "count_handled", "lo", "hi", "area", "orig",
              "kstatus", "ring_idx"]
     print(", ".join("%s %08X" % (n, w(DATA + 4 * i)) for i, n in enumerate(names)))
-    print("count_passed %08X" % w(DATA + 0x50))
     print("spill CR r0 r5 r6 r7:",
           " ".join("%08X" % w(DATA + 0x24 + 4 * i) for i in range(5)))
     print("saved ECB 40 44 84 8C 94 9C:",
           " ".join("%08X" % w(DATA + 0x38 + 4 * i) for i in range(6)))
-    idx = w(DATA + 0x20) & 15
-    for i in range(16):
-        e = DATA + 0x80 + 16 * ((idx + i) & 15)
-        if w(e + 4):
-            print("  emu pc %08X addr %08X r24 %08X lr %08X"
-                  % (w(e), w(e + 4), w(e + 8), w(e + 12)))
+    print("count_passed %08X" % w(DATA + 0x50))
+    if w(DATA + 0x50):
+        p = DATA + 0x54
+        print("  last passed on: emu %08X addr %08X next 68k %08X zone %08X "
+              "a7 %08X" % (w(p), w(p + 4), w(p + 8) - 2, w(p + 12), w(p + 16)))
+    # Ring: 8 entries of 32 bytes; "next 68k" is r24 - 2, the 68k
+    # instruction after the store.
+    idx = w(DATA + 0x20) & 7
+    for i in range(8):
+        e = DATA + 0x80 + 32 * ((idx + i) & 7)
+        if w(e):
+            print("  #%d emu %08X addr %08X next 68k %08X lr %08X zone %08X "
+                  "value %08X a7 %08X" % (w(e), w(e + 4), w(e + 8),
+                                          w(e + 12) - 2, w(e + 16), w(e + 20),
+                                          w(e + 24), w(e + 28)))
     words = [w(off) for off in range(CODE, 0xF00, 4)]
     used = [i for i, x in enumerate(words) if x]
     if used:

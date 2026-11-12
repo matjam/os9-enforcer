@@ -24,6 +24,7 @@
 #include <Events.h>
 #include <Windows.h>
 #include <MixedMode.h>
+#include <Processes.h>
 
 #include "nk.h"
 #include "h68k.h"
@@ -46,8 +47,12 @@ enum {
     kTimerMs = 16
 };
 
+/* A writer: a store site seen writing this heap while another application
+   was current. For native code, pc and lr are PowerPC addresses. For 68k
+   code (is68k), pc is the 68k instruction after the store and lr is 0. */
 typedef struct {
     unsigned long pc, lr, zone, first_addr, last_addr, count;
+    int is68k;
     char app[16];
 } Writer;
 
@@ -76,9 +81,9 @@ typedef struct {
     unsigned long faults, self_faults, foreign_faults, kernel_errors;
     unsigned long timer_runs, overflow;
     unsigned long dropped; /* foreign writers past kMaxWriters */
-    /* The 68k write hook (h68k.s) opens pages without telling us which:
-       when its count moves, the next tick re-protects the whole range. */
-    unsigned long h68k_seen, h68k_reprotects;
+    /* 68k stores, caught by the 68k write hook (h68k.s) and taken from its
+       ring every tick. h68k_lost: more in one tick than the ring holds. */
+    unsigned long h68k_seen, h68k_lost, own_68k, foreign_68k;
     int nwriters;
     Writer writers[kMaxWriters];
     TMTask timer;
@@ -115,20 +120,75 @@ static void current_app(char out[16])
     out[n] = 0;
 }
 
+/* The name of the process whose partition holds a heap zone, from the
+   Process Manager (not at interrupt time). */
+static void app_for_zone(unsigned long zone, char out[16])
+{
+    ProcessSerialNumber psn = {0, kNoProcess};
+    ProcessInfoRec info;
+    Str31 name;
+    while (GetNextProcess(&psn) == noErr) {
+        memset(&info, 0, sizeof info);
+        info.processInfoLength = sizeof info;
+        info.processName = name;
+        if (GetProcessInformation(&psn, &info) != noErr)
+            continue;
+        unsigned long lo = (unsigned long)info.processLocation;
+        if (zone >= lo && zone < lo + info.processSize) {
+            int n = name[0] < 15 ? name[0] : 15;
+            memcpy(out, name + 1, n);
+            out[n] = 0;
+            return;
+        }
+    }
+    if (zone == (unsigned long)SystemZone())
+        snprintf(out, 16, "(system zone)");
+    else
+        snprintf(out, 16, "zone %08lX", zone);
+}
+
+static void record_foreign(State *s, unsigned long pc, unsigned long lr,
+                           unsigned long zone, unsigned long addr, int is68k);
+
+/* Take the 68k stores the hook caught since the last call: log them, and
+   protect their pages again (the hook leaves them writable). */
+static void drain_h68k(State *s)
+{
+    volatile H68kData *hd = h68k_data();
+    unsigned long handled = hd->count_handled;
+    unsigned long seen = s->h68k_seen;
+    if (handled == seen)
+        return;
+    if (handled - seen > kH68kRing) {
+        /* Some opened pages are no longer in the ring: protect the whole
+           range again. */
+        s->h68k_lost += handled - seen - kH68kRing;
+        if (nk_protect(s->area, s->lo, s->hi - s->lo))
+            s->kernel_errors++;
+    }
+    for (int i = 0; i < kH68kRing; i++) {
+        volatile H68kEvent *e = &hd->ring[i];
+        if (e->seq <= seen || e->seq > handled)
+            continue;
+        if (nk_protect(s->area, e->addr & ~(unsigned long)(kPage - 1), kPage))
+            s->kernel_errors++;
+        if (e->zone == s->my_zone) {
+            s->own_68k++;
+        } else {
+            s->foreign_68k++;
+            record_foreign(s, h68k_next_pc(e->r24), 0, e->zone, e->addr, 1);
+        }
+    }
+    s->h68k_seen = handled;
+}
+
 static void close_all(State *s)
 {
     for (int i = 0; i < s->nopen; i++)
         if (nk_protect(s->area, s->open[i], kPage))
             s->kernel_errors++;
     s->nopen = 0;
-
-    unsigned long handled = h68k_data()->count_handled;
-    if (handled != s->h68k_seen) {
-        s->h68k_seen = handled;
-        s->h68k_reprotects++;
-        if (nk_protect(s->area, s->lo, s->hi - s->lo))
-            s->kernel_errors++;
-    }
+    drain_h68k(s);
 }
 
 static void open_page(State *s, unsigned long page)
@@ -145,11 +205,12 @@ static void open_page(State *s, unsigned long page)
 }
 
 static void record_foreign(State *s, unsigned long pc, unsigned long lr,
-                           unsigned long zone, unsigned long addr)
+                           unsigned long zone, unsigned long addr, int is68k)
 {
     for (int i = 0; i < s->nwriters; i++) {
         Writer *w = &s->writers[i];
-        if (w->pc == pc && w->lr == lr && w->zone == zone) {
+        if (w->pc == pc && w->lr == lr && w->zone == zone &&
+            w->is68k == is68k) {
             w->count++;
             w->last_addr = addr;
             return;
@@ -165,7 +226,13 @@ static void record_foreign(State *s, unsigned long pc, unsigned long lr,
     w->zone = zone;
     w->first_addr = w->last_addr = addr;
     w->count = 1;
-    current_app(w->app);
+    w->is68k = is68k;
+    /* A 68k store is logged a tick late, when another application may be
+       current; its name comes from its zone at report time. */
+    if (is68k)
+        w->app[0] = 0;
+    else
+        current_app(w->app);
 }
 
 static long handler(ExceptionInfo *e)
@@ -193,7 +260,7 @@ static long handler(ExceptionInfo *e)
     } else {
         s->foreign_faults++;
         record_foreign(s, e->machineState->PC.lo, e->machineState->LR.lo,
-                       zone, addr);
+                       zone, addr, 0);
     }
     s->busy = 0;
     return 0;
@@ -406,6 +473,7 @@ int main(void)
 #if WLOG_TIMER
     RmvTime((QElemPtr)&s->timer);
 #endif
+    drain_h68k(s);
     h68k_set_range(0, 0);
     long uerr = nk_unprotect(s->area, lo, hi - lo);
     sys_install(g_prev);
@@ -413,13 +481,14 @@ int main(void)
 
     /* Copy the hook's results out before removing it. */
     volatile H68kData *hd = h68k_data();
-    unsigned long h68k_handled = hd->count_handled;
     unsigned long h68k_passed = hd->count_passed;
-    H68kEvent h68k_ring[16];
-    for (int i = 0; i < 16; i++)
-        h68k_ring[i] = *(H68kEvent *)&hd->ring[(hd->ring_idx + i) & 15];
+    H68kPassed passed = *(H68kPassed *)&hd->passed;
     if (!had_h68k)
         h68k_uninstall();
+
+    for (int i = 0; i < s->nwriters; i++)
+        if (s->writers[i].is68k)
+            app_for_zone(s->writers[i].zone, s->writers[i].app);
 
     if (console) {
         SetPort(console);
@@ -429,37 +498,39 @@ int main(void)
     printf("\nprotect err %ld, unprotect err %ld; in handler: kernel errors "
            "%lu, overflows %lu; timer runs %lu\n",
            err, uerr, s->kernel_errors, s->overflow, s->timer_runs);
-    printf("faults %lu: own %lu, other processes %lu\n", s->faults,
+    printf("native faults %lu: own %lu, other processes %lu\n", s->faults,
            s->self_faults, s->foreign_faults);
+    printf("68k faults %lu: own %lu, other processes %lu, lost %lu\n",
+           s->own_68k + s->foreign_68k + s->h68k_lost, s->own_68k,
+           s->foreign_68k, s->h68k_lost);
     qsort(s->writers, s->nwriters, sizeof(Writer), by_count);
     printf("writers from other processes: %d (%lu not kept)\n", s->nwriters,
            s->dropped);
     printf("count PC       LR       app             addr     block\n");
     for (int i = 0; i < s->nwriters && i < 20; i++) {
         Writer *w = &s->writers[i];
-        char where[48];
+        char where[48], lr[9];
         describe(zone, w->first_addr, where, sizeof where);
-        printf("%5lu %08lX %08lX %-15s %08lX %s %s\n", w->count, w->pc, w->lr,
+        if (w->is68k)
+            snprintf(lr, sizeof lr, "  (68k) ");
+        else
+            snprintf(lr, sizeof lr, "%08lX", w->lr);
+        printf("%5lu %08lX %s %-15s %08lX %s %s\n", w->count, w->pc, lr,
                w->app, w->first_addr, where, known_name(w->first_addr));
     }
+    printf("(for 68k writers, PC is the instruction after the store)\n");
     printf("window: ");
     for (int i = 0; i < g_nknown; i++)
         printf("%s %08lX ", g_known[i].name,
                g_known[i].mp ? g_known[i].mp : g_known[i].lo);
     printf("\n");
 
-    printf("68k writes caught by the hook: %lu (whole-range re-protects %lu); "
-           "68k write faults outside the range: %lu\n",
-           h68k_handled, s->h68k_reprotects, h68k_passed);
-    printf("last ones, oldest first (r24 is near the 68k PC):\n");
-    for (int i = 0; i < 16; i++) {
-        H68kEvent *e = &h68k_ring[i];
-        if (e->addr < lo || e->addr >= hi)
-            continue;
-        char where[48];
-        describe(zone, e->addr, where, sizeof where);
-        printf("  emu %08lX r24 %08lX addr %08lX %s %s\n", e->pc, e->r24,
-               e->addr, where, known_name(e->addr));
+    if (h68k_passed) {
+        char app[16];
+        app_for_zone(passed.zone, app);
+        printf("68k write faults outside the range: %lu; last: addr %08lX, "
+               "next 68k %08lX, %s\n", h68k_passed, passed.addr,
+               h68k_next_pc(passed.r24), app);
     }
 
     DisposePtr((Ptr)s);

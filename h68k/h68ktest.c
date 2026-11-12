@@ -33,12 +33,17 @@ static void show(void)
            "last kernel status %ld\n",
            h68k_installed(), d->count_all, d->count_handled, d->count_passed,
            (long)d->kstatus);
-    for (int i = 0; i < 16; i++) {
-        volatile H68kEvent *e = &d->ring[i];
-        if (e->addr)
-            printf("  [%d] pc %08lX addr %08lX r24 %08lX lr %08lX\n", i, e->pc,
-                   e->addr, e->r24, e->lr);
+    for (int i = 0; i < kH68kRing; i++) {
+        volatile H68kEvent *e = &d->ring[(d->ring_idx + i) % kH68kRing];
+        if (e->seq)
+            printf("  #%lu emu %08lX addr %08lX next 68k %08lX zone %08lX "
+                   "value %08lX a7 %08lX\n", e->seq, e->pc, e->addr,
+                   h68k_next_pc(e->r24), e->zone, e->r4, e->a7);
     }
+    if (d->count_passed)
+        printf("  last passed on: emu %08lX addr %08lX next 68k %08lX "
+               "zone %08lX\n", d->passed.pc, d->passed.addr,
+               h68k_next_pc(d->passed.r24), d->passed.zone);
 }
 
 /* The middle page of a fresh three-page block: no other block shares it. */
@@ -104,7 +109,10 @@ int main(void)
     printf("  word %08lX (CAFEBABE expected)\n", *target);
     *target = 0;
 
-    printf("\nB: 68k store, page protected and in the hook's range\n");
+    printf("\nB: 68k store, page protected and in the hook's range\n"
+           "  68k code at %08lX: the store is at +4, the next instruction "
+           "(rts) at +10\n  zone %08lX\n",
+           (unsigned long)c, (unsigned long)ApplicationZone());
     h68k_set_range(page, page + kPage);
     err = nk_protect(area, page, kPage);
     unsigned long bits = 0;

@@ -24,15 +24,26 @@ enum {
     kH68kData = 0x68FFFB80,   /* = ECB + 0xA80, see h68k.s */
     kH68kCode = 0x68FFFD00,
     kH68kEnd = 0x68FFFF00,
-    kH68kMagic = 'H68K'
+    kH68kMagic = 'H682',      /* changes with the data layout */
+    kH68kRing = 8
 };
 
+/* A 68k store the hook caught. Must match the R_ offsets in h68k.s. */
 typedef struct {
+    unsigned long seq;  /* count_handled after this event; 0 = empty slot */
     unsigned long pc;   /* emulator instruction that faulted */
     unsigned long addr; /* fault address */
-    unsigned long r24;  /* probably the 68k PC */
+    unsigned long r24;  /* next 68k instruction + 2; see h68k_next_pc() */
     unsigned long lr;
+    unsigned long zone; /* ApplZone at the fault: the current application */
+    unsigned long r4;   /* usually the value being stored */
+    unsigned long a7;   /* 68k stack pointer */
 } H68kEvent;
+
+/* The last write fault the hook passed on (P_ offsets in h68k.s). */
+typedef struct {
+    unsigned long pc, addr, r24, zone, a7;
+} H68kPassed;
 
 /* Must match the D_ offsets in h68k.s. */
 typedef struct {
@@ -43,18 +54,28 @@ typedef struct {
     unsigned long area;
     unsigned long orig;          /* the emulator's own entry */
     unsigned long kstatus;       /* last MPSetAreaAccess status */
-    unsigned long ring_idx;
+    unsigned long ring_idx;      /* next slot to write */
     unsigned long spill[5];      /* CR, r0, r5, r6, r7 */
     unsigned long ecb[6];
     unsigned long count_passed;  /* write faults outside the range */
-    unsigned long reserved[11];
-    H68kEvent ring[16];
+    H68kPassed passed;
+    unsigned long reserved[6];
+    H68kEvent ring[kH68kRing];
 } H68kData;
 
+_Static_assert(sizeof(H68kEvent) == 32, "h68k.s ring entry size");
 _Static_assert(offsetof(H68kData, count_passed) == 0x50, "h68k.s D_COUNT_PASSED");
+_Static_assert(offsetof(H68kData, passed) == 0x54, "h68k.s D_PASSED");
 _Static_assert(offsetof(H68kData, ring) == 0x80, "h68k.s D_RING");
 _Static_assert(kH68kData + sizeof(H68kData) <= kH68kCode, "data overlaps code");
 _Static_assert(kH68kCode + sizeof h68k_code <= kH68kEnd, "code too long");
+
+/* The address of the 68k instruction after the faulting store. The store
+   itself ends there; its start depends on its length (2 to 10 bytes). */
+static inline unsigned long h68k_next_pc(unsigned long r24)
+{
+    return r24 - 2;
+}
 
 /* A pointer to a fixed address. The empty asm hides the constant from GCC,
    which otherwise warns that the address is outside any object. */

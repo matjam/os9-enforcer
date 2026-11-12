@@ -20,6 +20,12 @@
 # byte), +0x74 fault address, +0x84 PC of the faulting instruction,
 # +0x8C LR, +0x94/+0x9C r3/r4.
 #
+# The emulator is a threaded interpreter: r24 is its 68k instruction
+# pointer, and each opcode handler fetches the next opcode (and one more
+# word) with `lhau rX,2(r24)` before its own store. At a faulting store,
+# r24 is the address of the next 68k instruction + 2. r1 is the 68k A7, and
+# r4 usually holds the value being stored.
+#
 # The code is copied to 0x68FFFD00 and the data block lives at 0x68FFFB80
 # (unused space in the emulator data page, within branch range of
 # 0x6806D440). Data offsets are below; keep common/h68k.h in step.
@@ -41,7 +47,24 @@
         .set    D_R7, 0x34
         .set    D_ECB40, 0x38           # six saved ECB words, 0x38-0x4C
         .set    D_COUNT_PASSED, 0x50    # write faults outside the range
-        .set    D_RING, 0x80            # 16 entries of 16 bytes
+        .set    D_PASSED, 0x54          # the last one: pc, addr, r24, zone, a7
+        .set    D_RING, 0x80            # RING_N entries of 32 bytes
+        .set    RING_N, 8
+
+        # Ring entry and passed-fault record fields.
+        .set    R_SEQ, 0x00             # count_handled after this event
+        .set    R_PC, 0x04              # emulator instruction that faulted
+        .set    R_ADDR, 0x08            # fault address
+        .set    R_R24, 0x0C             # next 68k instruction + 2
+        .set    R_LR, 0x10
+        .set    R_ZONE, 0x14            # ApplZone (lowmem 0x2AA)
+        .set    R_R4, 0x18              # usually the value stored
+        .set    R_A7, 0x1C              # 68k stack pointer
+        .set    P_PC, 0x00
+        .set    P_ADDR, 0x04
+        .set    P_R24, 0x08
+        .set    P_ZONE, 0x0C
+        .set    P_A7, 0x10
 
         .text
         .globl  h68k_start
@@ -87,23 +110,30 @@ h68k_start:
         lwz     5,0x9C+E(3)
         stw     5,D_ECB40+0x14(3)
 
-        # Ring entry: PPC PC, fault address, r24 (the emulator's 68k PC,
-        # as far as can be told), LR.
-        lwz     5,D_RING_IDX(3)
-        slwi    6,5,4
-        add     6,6,3
-        lwz     7,0x84+E(3)
-        stw     7,D_RING+0x0(6)
-        stw     4,D_RING+0x4(6)
-        stw     24,D_RING+0x8(6)
-        lwz     7,0x8C+E(3)
-        stw     7,D_RING+0xC(6)
-        addi    5,5,1
-        andi.   5,5,15
-        stw     5,D_RING_IDX(3)
+        # Ring entry (see R_ fields).
         lwz     5,D_COUNT_HANDLED(3)
         addi    5,5,1
         stw     5,D_COUNT_HANDLED(3)
+        lwz     6,D_RING_IDX(3)
+        addi    7,6,1
+        andi.   7,7,RING_N-1
+        stw     7,D_RING_IDX(3)
+        slwi    6,6,5
+        add     6,6,3                   # r6 = data block + 32 * index
+        stw     5,D_RING+R_SEQ(6)
+        lwz     7,0x84+E(3)
+        stw     7,D_RING+R_PC(6)
+        stw     4,D_RING+R_ADDR(6)
+        stw     24,D_RING+R_R24(6)
+        lwz     7,0x8C+E(3)
+        stw     7,D_RING+R_LR(6)
+        lhz     7,0x2AA(0)              # ApplZone is 2-byte aligned
+        lhz     5,0x2AC(0)
+        rlwimi  5,7,16,0,15
+        stw     5,D_RING+R_ZONE(6)
+        lwz     7,0x9C+E(3)
+        stw     7,D_RING+R_R4(6)
+        stw     1,D_RING+R_A7(6)
 
         # MPSetAreaAccess(area, write, write, page, 4096)
         rlwinm  6,4,0,0,19
@@ -141,6 +171,17 @@ h68k_start:
         blr                             # ReturnFromException: retry the store
 
 chain_write:
+        # Keep the details: this fault is about to kill the application,
+        # or hang the machine if the emulator cannot take a bus error now.
+        stw     4,D_PASSED+P_ADDR(3)
+        lwz     4,0x84+E(3)
+        stw     4,D_PASSED+P_PC(3)
+        stw     24,D_PASSED+P_R24(3)
+        stw     1,D_PASSED+P_A7(3)
+        lhz     4,0x2AA(0)
+        lhz     5,0x2AC(0)
+        rlwimi  5,4,16,0,15
+        stw     5,D_PASSED+P_ZONE(3)
         lwz     5,D_R5(3)
         lwz     4,D_COUNT_PASSED(3)
         addi    4,4,1
