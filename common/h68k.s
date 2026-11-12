@@ -48,6 +48,7 @@
         .set    D_ECB40, 0x38           # six saved ECB words, 0x38-0x4C
         .set    D_COUNT_PASSED, 0x50    # write faults outside the range
         .set    D_PASSED, 0x54          # the last one: pc, addr, r24, zone, a7
+        .set    D_BITMAP, 0x68          # page bitmap, or 0 for the whole range
         .set    D_RING, 0x80            # RING_N entries of 32 bytes
         .set    RING_N, 8
 
@@ -90,10 +91,31 @@ h68k_start:
         cmplw   4,5
         bge     chain_write
 
-        # A write to a page we protected.
         stw     0,D_R0(3)
         stw     6,D_R6(3)
         stw     7,D_R7(3)
+
+        # With a bitmap, handle the page only if its bit is set: bit
+        # (addr - lo) >> 12, most significant bit of each byte first.
+        lwz     5,D_BITMAP(3)
+        cmpwi   5,0
+        beq     handle
+        lwz     6,D_LO(3)
+        subf    6,6,4
+        srwi    6,6,12                  # page index
+        srwi    7,6,3
+        lbzx    7,5,7                   # its byte
+        rlwinm  6,6,0,29,31             # its bit, 0 = most significant
+        slw     7,7,6
+        andi.   7,7,0x80
+        bne     handle
+        lwz     0,D_R0(3)
+        lwz     6,D_R6(3)
+        lwz     7,D_R7(3)
+        b       chain_write
+
+handle:
+        # A write to a page we protected.
 
         # The kernel call below goes through the same context block; keep
         # the exception words it might touch.

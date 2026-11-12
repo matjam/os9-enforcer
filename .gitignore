@@ -20,6 +20,7 @@
 /probe/build/
 /wlog/build*/
 /h68k/build/
+/xlog/build/
 
 # Binary files, wherever they are.
 *.bin

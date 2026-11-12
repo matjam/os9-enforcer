@@ -24,7 +24,7 @@ enum {
     kH68kData = 0x68FFFB80,   /* = ECB + 0xA80, see h68k.s */
     kH68kCode = 0x68FFFD00,
     kH68kEnd = 0x68FFFF00,
-    kH68kMagic = 'H682',      /* changes with the data layout */
+    kH68kMagic = 'H683',      /* changes with the data layout */
     kH68kRing = 8
 };
 
@@ -57,15 +57,24 @@ typedef struct {
     unsigned long ring_idx;      /* next slot to write */
     unsigned long spill[5];      /* CR, r0, r5, r6, r7 */
     unsigned long ecb[6];
-    unsigned long count_passed;  /* write faults outside the range */
+    unsigned long count_passed;  /* write faults not handled */
     H68kPassed passed;
-    unsigned long reserved[6];
+    /* Page bitmap over [lo, hi), one bit per 4 KB page, most significant
+       bit of each byte first: only pages with their bit set are handled.
+       0 means every page in the range. */
+    const unsigned char *bitmap;
+    /* Not used by the hook: the installing program may put a pointer to
+       its own state here, so host tools can find it. */
+    unsigned long owner;
+    unsigned long reserved[4];
     H68kEvent ring[kH68kRing];
 } H68kData;
 
 _Static_assert(sizeof(H68kEvent) == 32, "h68k.s ring entry size");
 _Static_assert(offsetof(H68kData, count_passed) == 0x50, "h68k.s D_COUNT_PASSED");
 _Static_assert(offsetof(H68kData, passed) == 0x54, "h68k.s D_PASSED");
+_Static_assert(offsetof(H68kData, bitmap) == 0x68, "h68k.s D_BITMAP");
+_Static_assert(offsetof(H68kData, owner) == 0x6C, "owner pointer");
 _Static_assert(offsetof(H68kData, ring) == 0x80, "h68k.s D_RING");
 _Static_assert(kH68kData + sizeof(H68kData) <= kH68kCode, "data overlaps code");
 _Static_assert(kH68kCode + sizeof h68k_code <= kH68kEnd, "code too long");
@@ -161,6 +170,26 @@ static inline void h68k_set_range(unsigned long lo, unsigned long hi)
     d->hi = 0;
     d->lo = lo;
     d->hi = hi;
+}
+
+/* Handle only pages whose bit is set in bitmap, which covers [lo, hi) and
+   must stay allocated while installed. The caller changes bits; the hook
+   only reads them. */
+static inline void h68k_set_bitmap(unsigned long lo, unsigned long hi,
+                                   const unsigned char *bitmap)
+{
+    volatile H68kData *d = h68k_data();
+    d->hi = 0;
+    d->lo = lo;
+    d->bitmap = bitmap;
+    d->hi = hi;
+}
+
+static inline int h68k_bit(const unsigned char *bitmap, unsigned long lo,
+                           unsigned long addr)
+{
+    unsigned long page = (addr - lo) >> 12;
+    return (bitmap[page >> 3] >> (7 - (page & 7))) & 1;
 }
 
 static inline void h68k_uninstall(void)
