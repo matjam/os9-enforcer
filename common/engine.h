@@ -1,0 +1,201 @@
+/*
+ * engine.h: the protection engine shared by XLog, Guard and the Enforcer
+ * Extension, and the state the Enforcer control panel reads.
+ *
+ * Each running application's partition (from the Process Manager) is a
+ * domain. Its whole pages ([lo, hi), the partition rounded inward to pages)
+ * are write-protected while the application is not current, and their bits
+ * are set in a page bitmap over the blue area. Both write hooks manage
+ * exactly the pages whose bit is set:
+ *   - 68k code: common/h68k.s, in front of the emulator;
+ *   - native code: common/hnat.s, in front of the Exception Manager.
+ * A hook opens the faulting page, retries the store and records it in its
+ * ring, unless the address is in the hooks' current range (the current
+ * application's partition), where it only counts it.
+ *
+ * A store into another domain by the current application's own code (the
+ * code lies in its partition) is an offense. In kModeEnforce the hooks deny
+ * it: the page stays protected, the fault goes on, and Mac OS stops the
+ * application. In kModeLog it is allowed and logged. Stores by system code
+ * are always allowed. In kModeOff nothing is protected.
+ *
+ * A 16 ms Time Manager task:
+ *   - notices a process switch (ApplZone changes), points both hooks'
+ *     current range at the new application's partition, and protects all
+ *     of the previous application's domain again;
+ *   - takes the rings. A store is the target's own when ApplZone at the
+ *     store is inside the target's partition, and cross-domain otherwise:
+ *     logged by writer (PC and LR, or the 68k PC; application) and target.
+ *     The page is protected again unless it is the current application's.
+ * If a ring overflowed between ticks, every domain but the current one is
+ * protected again.
+ *
+ * A write that reaches the Exception Manager without going through the
+ * native hook (from another context) goes to a fallback handler in the
+ * Exception Manager's system-wide slot. It opens the page and records the
+ * store in a third ring.
+ *
+ * Safety rule: a protected page always has its bit set in the bitmap and a
+ * live domain behind it; otherwise a fault on it kills the application or
+ * hangs the machine. Domains are added as live, then bits, then protect;
+ * removed as dying, unprotect, then bits, then dead.
+ *
+ * The program running the engine is not a domain. Run it only with virtual
+ * memory off.
+ */
+
+#ifndef ENGINE_H
+#define ENGINE_H
+
+#include <MacTypes.h>
+#include <Processes.h>
+#include <Timer.h>
+#include <MixedMode.h>
+
+#include "hook.h"
+
+enum {
+    kMaxDomains = 32,
+    kMaxWriters = 512,
+    kFallbackRing = 16,
+    kOffenseLog = 16,
+    kEngineMagic = 'ENF1',
+    /* Gestalt selector whose value is the engine's State, while it runs. */
+    kEngineGestalt = 'Enfr'
+};
+
+enum { kModeOff, kModeLog, kModeEnforce };
+
+/* Where a store was caught. In Writer.source and Offense.source, combined
+   with kWriterAppCode: the store's code is the writing application's own. */
+enum { kSrcNative, kSrc68k, kSrcFallback, kSources };
+enum { kSrcMask = 0xFF, kWriterAppCode = 0x100 };
+
+/* engine_start errors. */
+enum {
+    kEngineNoSlot = -100,  /* Exception Manager system slot not found */
+    kEngineNoMemory = -101,
+    kEngineNoArea = -102,  /* NanoKernel area of the blue task not found */
+    kEngineHook68k = -103, /* the 68k hook would not install */
+    kEngineHookNative = -104,
+    kEngineBusy = -105     /* another engine (XLog, Guard, Enforcer) runs */
+};
+
+typedef struct {
+    volatile unsigned long live;  /* in use: its pages may be protected */
+    volatile unsigned long dying; /* being removed: never protect again */
+    unsigned long seen;           /* found by the last refresh */
+    unsigned long lo, hi;         /* whole pages inside the partition */
+    unsigned long location, size; /* the partition */
+    ProcessSerialNumber psn;
+    char name[16];
+    unsigned long self_writes, foreign_writes_in;
+} Domain;
+
+/* A cross-domain writer: a store site, the application current at the
+   store, and the domain written. For 68k stores, pc is the 68k instruction
+   after the store and lr is 0. */
+typedef struct {
+    unsigned long pc, lr, writer_zone, target_lo;
+    unsigned long first_addr, last_addr, count;
+    unsigned long source;
+    char writer[16];
+    char target[16];
+} Writer;
+
+/* A store by an application's own code into another domain. */
+typedef struct {
+    unsigned long seq;  /* 1 for the first */
+    unsigned long time; /* seconds since 1904 */
+    unsigned long pc;   /* native PC, or the 68k instruction after the store */
+    unsigned long addr, source;
+    unsigned long denied; /* the application was stopped */
+    char writer[16];
+    char target[16];
+} Offense;
+
+/* tools/xlog-read.py names these in this order. */
+typedef struct {
+    unsigned long self[kSources], foreign[kSources], lost[kSources];
+    unsigned long outside; /* ring entries outside every live domain */
+    unsigned long switches, timer_runs, kernel_errors;
+    unsigned long refreshes, added, removed;
+    unsigned long dropped, nwriters;
+    unsigned long info_errors; /* GetProcessInformation failures */
+    unsigned long app_code[kSources]; /* offenses, by where caught */
+} Counters;
+
+/* In the system heap, so it outlives a program that stops without
+   cleaning up; readers check magic and running. */
+typedef struct {
+    /* For tools/xlog-read.py: where everything is. */
+    unsigned long magic, self;
+    unsigned long off_counters, n_counters;
+    unsigned long off_domains, n_domains, domain_size;
+    unsigned long off_writers, max_writers, writer_size;
+    unsigned long off_cur;
+    unsigned long off_offenses, max_offenses, offense_size;
+    unsigned long off_mode;
+
+    /* Control. A control panel sets want_mode; engine_poll applies it. */
+    volatile unsigned long mode, want_mode;
+    volatile unsigned long running; /* cleared when the engine stops */
+    char name[16];                  /* the program running the engine */
+
+    Counters c;
+    long cur; /* domain of the current application, or -1 */
+    unsigned long cur_zone;
+    volatile unsigned long active;
+    unsigned long area;
+    unsigned long my_lo, my_hi; /* the engine's own partition */
+    unsigned long seen[kSources];
+    volatile HookData *h68k, *hnat;
+    unsigned long had68k, hadnat; /* hooks were installed before us */
+    /* The hooks' own and passed-on counts, kept because removing a hook
+       frees its data. */
+    unsigned long hook_self[2], hook_passed[2];
+    unsigned char *bitmap;
+    Domain domains[kMaxDomains];
+    Writer writers[kMaxWriters];
+    /* The last kOffenseLog offenses: number n is at (n - 1) % kOffenseLog. */
+    volatile unsigned long n_offenses;
+    Offense offenses[kOffenseLog];
+    /* Written by the fallback handler; fb_count is the last seq. */
+    volatile unsigned long fb_count, fb_idx;
+    HookEvent fb_ring[kFallbackRing];
+    TMTask timer;
+    RoutineDescriptor timer_rd;
+} State;
+
+/* Install the hooks, the fallback handler and the timer, read the process
+   list, and start in mode. name is the running program's, for the log.
+   Returns 0 and the state, or a kEngine error. */
+long engine_start(State **out, unsigned long mode, const char *name);
+
+/* Call from the program's event loop (never at interrupt time), every half
+   second or so: re-reads the process list and applies want_mode. */
+void engine_poll(State *s);
+
+/* Change mode now (event loop only). */
+void engine_set_mode(State *s, unsigned long mode);
+
+/* Stop protecting, remove the timer and the fallback handler, and remove
+   the hooks if this engine installed them. The state stays allocated. */
+void engine_stop(State *s);
+
+/* For reports. */
+int engine_domain_at(State *s, unsigned long addr);
+void engine_writer_name(State *s, unsigned long zone, char out[16]);
+
+/* The applications being tracked. Inline, so that readers of the state
+   (the control panel) need not link the engine. */
+static inline int engine_live_domains(const State *s)
+{
+    int n = 0;
+    for (int i = 0; i < kMaxDomains; i++)
+        if (s->domains[i].live && !s->domains[i].dying)
+            n++;
+    return n;
+}
+
+#endif

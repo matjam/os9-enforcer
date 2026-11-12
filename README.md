@@ -462,6 +462,80 @@ tools/push.sh -n Test xlog/build/Guard.bin scribble/build/Scribble.bin
 Open Guard first, then Scribble. Guard's state reads the same way as XLog's,
 with `tools/xlog-read.py`.
 
+## Protection engine
+
+XLog, Guard and Enforcer share one engine, `common/engine.c` (domains, the
+timer task, the fallback handler and the hooks' setup). Its state lives in
+the system heap and starts with a header that `tools/xlog-read.py` reads. It
+has three modes: off (nothing protected), log only (as XLog) and enforce (as
+Guard). Only one engine can run at a time: a second one refuses to start
+while the hooks have an owner.
+
+## Enforcer
+
+Enforcer is Guard's protection for everyday use: it starts with the
+machine, has no window, and has a control panel.
+
+- **Enforcer Extension** (file type `appe`, in the Extensions folder) is a
+  background-only application. Mac OS launches it at startup. It runs the
+  engine in the mode saved in "Enforcer Preferences" (stop, by default) and
+  publishes its state under Gestalt selector `'Enfr'`. If virtual memory is
+  on, it does not start.
+- **Enforcer** (file type `APPC`, in the Control Panels folder) is the
+  control panel, under Apple menu > Control Panels. It shows whether the
+  extension runs, two checkboxes, the last stores it caught, and counters:
+  - "Protect each application's memory from the others": off turns
+    protection off;
+  - "Stop an application that writes into another's memory": off only logs
+    those stores.
+
+  A change takes effect within half a second and is saved.
+
+When Enforcer stops an application, Mac OS shows its usual "unexpectedly
+quit" alert, and Enforcer posts a notification naming the application, the
+application whose memory it wrote into, and the address.
+
+The extension's timer task and fallback handler run code in its own
+partition. Do not force-quit it: quit it with the quit Apple event (as at
+shutdown), which removes them first.
+
+To build both:
+
+```bash
+cmake -S enforcer -B enforcer/build -DCMAKE_TOOLCHAIN_FILE=$PWD/toolchain/build/toolchain/powerpc-apple-macos/cmake/retroppc.toolchain.cmake
+cmake --build enforcer/build
+```
+
+This makes `enforcer/build/Enforcer Extension.bin` and
+`enforcer/build/Enforcer.bin`, with the names, types and creators the
+Finder needs.
+
+Testing it needs a disk that keeps its changes across a restart, so not a
+`SCRATCH=1` guest. `disks/os9-enforcer.qcow2` is an overlay on the VM-off
+overlay; to make it again (which removes Enforcer and everything else done
+on it):
+
+```bash
+qemu-img create -f qcow2 -b os9-novm.qcow2 -F qcow2 disks/os9-enforcer.qcow2
+```
+
+To install, boot it and push both files:
+
+```bash
+DISK=disks/os9-enforcer.qcow2 ./run.sh &
+tools/push.sh -n Install "enforcer/build/Enforcer Extension.bin" enforcer/build/Enforcer.bin
+```
+
+In the guest, drag each file onto the System Folder icon and click OK when
+the Finder offers to put it into the Extensions or Control Panels folder.
+Then restart. To remove Enforcer, drag both out of those folders and
+restart.
+
+A slow drag over a folder springs it open, so a scripted drag
+(`tools/qmp.py drag`) can drop inside a folder in the System Folder
+instead. To avoid that, turn off "Spring-loaded folders" in the Finder's
+Edit > Preferences; the test disk has it off.
+
 To check that the hook's space in the emulator data page stays zero, take 40
 dumps half a second apart (do this before installing the hook):
 

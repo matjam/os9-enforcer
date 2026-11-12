@@ -22,6 +22,7 @@
 /h68k/build/
 /xlog/build/
 /scribble/build/
+/enforcer/build/
 
 __pycache__/
 
