@@ -24,7 +24,7 @@ find it through the `OS9_PROTECT` environment variable, which defaults to
 | `wlog/` | WLog: the first write logger, on the 68k hook only |
 | `probe/` | Probe: the first page protection experiment |
 | `tools/` | Host scripts that read the engine's and hooks' state from the guest |
-| `kernel/` | `extract.sh`: takes the stock NanoKernel out of the test machine's Mac OS ROM file |
+| `kernel/` | Takes the stock NanoKernel out of the test machine's Mac OS ROM file (`extract.sh`), packs a ROM file (`pack.sh`) and installs it in the kernel test disk (`install.sh`) |
 
 ## Building
 
@@ -573,3 +573,52 @@ rebuilt here (it needs Apple's MPW assembler under the `empw` emulator), and
 nothing yet shows that it rebuilds byte for byte. Changes to the kernel are
 best made as patches to the stock binary, checked against
 `NanoKernel-v02.28.dis` at each patch site.
+
+### Booting a ROM file
+
+The test machine boots the Mac OS ROM file in the System Folder of
+os9-protect's `disks/os9-kernel.img`, a raw disk image (its README says
+how to make it). To pack `kernel/stock/dump` into a ROM file and install
+it, shut the machine down, then run:
+
+```bash
+kernel/pack.sh
+```
+
+```bash
+kernel/install.sh
+```
+
+`pack.sh` builds the data fork with `tbxi build` and copies the resource
+fork, type, creator and Finder flags from the stock file. It writes
+`kernel/build/Mac OS ROM`. To pack another dump, pass its folder:
+`kernel/pack.sh DUMP`.
+
+`install.sh` replaces the file in the image's System Folder, checks the
+copy's SHA-256, and removes the folders macOS adds to a volume it mounts.
+It refuses to run while QEMU has the image open. The Finder cannot do this
+inside the guest: the running system keeps its ROM file open, and the file
+is name locked (Finder flags 0x3000).
+
+To boot it:
+
+```bash
+DISK=disks/os9-kernel.img ../os9-protect/run.sh &
+```
+
+To check which kernel is running, dump it from guest memory and compare it
+with the file you built (here the stock kernel):
+
+```bash
+../os9-protect/tools/qmp.py raw '{"execute":"pmemsave","arguments":{"val":15794176,"size":105280,"filename":"/tmp/nk-live.bin"}}'
+```
+
+```bash
+cmp /tmp/nk-live.bin kernel/stock/NanoKernel-v02.28.bin
+```
+
+15794176 is 0x00F10000, where the kernel runs. The repacked stock dump
+(data fork SHA-256 `0184ce4b…6d1476`, which differs from Apple's file only
+in padding and tbxi's checksum strings) boots to the Finder, reports Mac OS
+9.2.2 with Mac OS ROM 9.2.1, and the kernel in memory matches
+`NanoKernel-v02.28.bin` byte for byte (2026-11-12).
