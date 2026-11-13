@@ -11,7 +11,8 @@
 # Set HEADLESS=1 to run without a window, SCRATCH=1 to discard disk writes,
 # CD=image to start with a disc in the CD drive (it is empty otherwise),
 # DISK=image to boot another hard disk image (default disks/os9.qcow2; for
-# example disks/os9-novm.qcow2, an overlay with virtual memory off).
+# example disks/os9-novm.qcow2, an overlay with virtual memory off). An
+# image whose name does not end in .qcow2 is opened as raw.
 # The guest has a network card (sungem) on QEMU's user-mode network: DHCP,
 # outbound internet, and the host reachable at 10.0.2.2.
 # A QMP control socket is always opened at run/qmp.sock, for screenshots
@@ -40,8 +41,15 @@ fi
 
 mkdir -p run disks
 
+# The drive format follows the file name: .qcow2 is qcow2, anything else is
+# raw. Kernel tests use a raw image, which macOS can attach and write.
+case "$DISK" in
+  *.qcow2) fmt=qcow2 ;;
+  *) fmt=raw ;;
+esac
+
 if [ ! -f "$DISK" ]; then
-  qemu-img create -f qcow2 "$DISK" 8G
+  qemu-img create -f "$fmt" "$DISK" 8G
 fi
 
 mode=${1:-run}
@@ -97,7 +105,7 @@ while :; do
     -M mac99,via=pmu \
     -m 512 \
     -boot "$boot" \
-    -drive file="$DISK",format=qcow2,media=disk \
+    -drive file="$DISK",format="$fmt",media=disk \
     -drive "$cd_drive" \
     -g 1024x768x32 \
     -prom-env 'vga-ndrv?=true' \

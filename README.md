@@ -45,7 +45,8 @@ the machine stops, set `SCRATCH=1`.
 
 To boot another disk image, set `DISK=path/to/image` (default
 `disks/os9.qcow2`). `run.sh` changes to this folder first, so the path is
-relative to it.
+relative to it. An image whose name ends in `.qcow2` is opened as qcow2,
+any other as raw.
 
 ### Disk images
 
@@ -56,6 +57,12 @@ relative to it.
   out under a hook.
 - `disks/os9-enforcer.qcow2`: an overlay on `os9-novm.qcow2` with Enforcer
   installed, for tests that must keep their changes across a restart.
+- `disks/os9-kernel.img`: a raw copy of `os9-novm.qcow2` for trying
+  modified Mac OS ROM files (see "NanoKernel" in os9-enforcer's README).
+  It is raw so that macOS can attach it and write the ROM file into its
+  System Folder while the machine is shut down. It takes about 330 MB on
+  disk (8 GB sparse). To go back to the stock ROM file, make it again as
+  below.
 
 An overlay records only its own changes, so changing the image under it
 corrupts the overlay. To make `os9-novm.qcow2` again:
@@ -72,6 +79,12 @@ else done on it):
 
 ```bash
 qemu-img create -f qcow2 -b os9-novm.qcow2 -F qcow2 disks/os9-enforcer.qcow2
+```
+
+To make `os9-kernel.img` again (back to the stock Mac OS ROM file):
+
+```bash
+qemu-img convert -O raw disks/os9-novm.qcow2 disks/os9-kernel.img
 ```
 
 ## Networking
@@ -225,6 +238,25 @@ python3 -m venv refs/tbxi-venv
 ```bash
 refs/tbxi-venv/bin/pip install ./refs/tbxi
 ```
+
+tbxi's setup quietly leaves out its C compressor when it fails to build,
+and then packs a ROM file in pure Python, which takes minutes instead of a
+second. With this machine's pyenv Python the link fails (the linker cannot
+read the SDK's library stubs), so compile and link it with Xcode's clang:
+
+```bash
+refs/tbxi-venv/bin/python -c 'import sysconfig as s; print(s.get_paths()["include"], s.get_config_var("EXT_SUFFIX"))'
+```
+
+```bash
+xcrun clang -O3 -bundle -undefined dynamic_lookup -I INCLUDE refs/tbxi/speedups/fast_lzss.c -o refs/tbxi-venv/lib/python3.12/site-packages/tbxi/fast_lzssEXT_SUFFIX
+```
+
+with INCLUDE and EXT_SUFFIX from the first command. Check it with
+`refs/tbxi-venv/bin/python -c 'import tbxi.fast_lzss'`. tbxi's BinHex
+output (`tbxi build -o NAME.hqx`) runs for minutes without finishing even
+then; os9-enforcer's `kernel/pack.sh` builds the data fork only and copies
+the resource fork from the stock file.
 
 - `refs/NanoKernel` (commit b2b5613): Elliot Nunn's reconstruction of the
   v1 NanoKernel.
