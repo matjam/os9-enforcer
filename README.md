@@ -21,13 +21,30 @@ limits.
 1. **Kernel tooling.** Done (2026-11-12): extract the stock kernel, repack
    the ROM file, install it on a test disk, boot it, and compare the kernel
    in memory (see [Working on the kernel](#working-on-the-kernel)).
-2. **Fix `stwcx.` on protected pages.** The kernel runs a faulting store
-   itself. For `stwcx.` that store fails without a fault, because the
-   caller's reservation is gone, and the caller's loop retries forever.
-   Patch `FDP_06c0` (0x5EC0) so the fault reaches the blue task as a write
-   fault. Done when SysLog protects the system heap and Scribble's `s` and
-   `S` tests run without a hang.
+2. **Fix `stwcx.` on protected pages.** Done (2026-11-12), patch 1 in
+   `kernel/nanokernel.s`. The kernel runs a faulting store itself. For
+   `stwcx.` that store failed without a fault, because the caller's
+   reservation is gone, and the caller's loop retried forever. Now, when
+   the kernel's `stwcx.` fails, it stores the word's current value back
+   under a new reservation, which faults on a write-protected page and
+   reaches the blue task. Under SysLog the patched kernel ran for 4 minutes
+   and 48,000 traps without hanging; 608 of the write faults the hooks
+   handled in one 40-second run came from the `stwcx.` of a ROM atomic
+   dequeue loop (0xFFD88980).
+
+   That run showed the next limit: keyboard and mouse stop within a
+   minute. The CPU plugin (the machine's native module for interrupt
+   routing, caches and sleep, registered with `MPRegisterCpuPlugin`) lives
+   in the system heap: its code, data and stack are 13 pages at 0x0031E000
+   on the test machine. The kernel runs it in SIGP mode, and a write fault
+   there does not reach the blue task: the kernel abandons the plugin call
+   and returns an error (`IntReturnFromSIGP`). 3,733 plugin calls failed
+   that way in 40 seconds. The blue task cannot read the plugin's range
+   (it is in the kernel's CoherenceGroup), so SysLog cannot leave it out
+   without help from the kernel. Scribble's `s` and `S` tests wait on this.
 3. **Page owners in the kernel.**
+   - The CPU plugin's pages (from `MPRegisterCpuPlugin`) belong to the
+     kernel and are never protected.
    - A table in RAM with one owner byte per 4 KB page (128 KB for 512 MB),
      allocated at boot. Owners: free, system, low memory, one per
      application.
@@ -111,10 +128,17 @@ What it showed, which the plan depends on:
 - Protecting the system heap page by page costs 1 to 3% of the CPU in
   interactive use if the few dozen pages the system writes all the time
   are left open ("Store measurement" in os9-protect's README).
-- A protected page holding a variable updated with `lwarx`/`stwcx.` hangs
-  the machine. With the system heap protected, the CPU looped in the ROM's
-  atomic increment at 0xFFD88A3C on a protected page, and no hook saw a
-  fault (step 2 of the plan).
+- With the stock kernel, a protected page holding a variable updated with
+  `lwarx`/`stwcx.` hangs the machine. With the system heap protected, the
+  CPU looped in the ROM's atomic increment at 0xFFD88A3C on a protected
+  page, and no hook saw a fault. Patch 1 fixes this (step 2 of the plan).
+- A write violation in the blue task reaches the hooks only while the
+  blue task has exceptions enabled; the kernel counts every one by cause
+  (`tools/faults-read.py` compares the counts). To see which path each one
+  takes, use os9-protect's pcwatch plugin at the kernel's delivery
+  decision, physical 0x00F12A14 (offset 0x2A14 in `ExceptionMemRetried`):
+  `regs=r9:r10,crmask=0x82208000` records the cause, the faulting PC and
+  the path (0x80200000 blue task, 0x00008000 CPU plugin, 0 another task).
 
 | Directory | What it is |
 |---|---|
@@ -156,43 +180,57 @@ only), checks its SHA-256, unpacks it with tbxi into `kernel/stock/dump/`,
 and writes `NanoKernel-v02.28.bin` and its disassembly
 `NanoKernel-v02.28.dis` (addresses are offsets in the kernel).
 
-To pack a dump into a ROM file and install it on the kernel test disk,
-shut the machine down and run:
+`kernel/nanokernel.s` is the patched kernel: the stock binary, copied in
+with `.incbin`, and each patch assembled at its offset, with new code
+after the stock kernel. To build it and pack it into a ROM file, run:
 
 ```bash
-kernel/pack.sh
+kernel/build.sh
 ```
+
+It prints every changed or added instruction (a diff of the stock and
+patched disassemblies) and writes `kernel/build/Mac OS ROM`. To install
+that file on the kernel test disk, shut the machine down and run:
 
 ```bash
 kernel/install.sh
 ```
 
-`pack.sh [DUMP]` builds the data fork with tbxi (default
-`kernel/stock/dump`) and copies the resource fork and Finder info from the
-stock file. `install.sh` writes the result into the System Folder of
-os9-protect's raw `disks/os9-kernel.img`, and refuses while QEMU has the
+`install.sh` writes the file into the System Folder of os9-protect's raw
+`disks/os9-kernel.img`, checks both forks, and refuses while QEMU has the
 image open. The Finder cannot replace the file in a running guest: the
 system keeps it open, and it is name locked.
 
-To boot it:
+`build.sh` packs with `kernel/pack.sh DUMP`, which also packs the
+unmodified dump on its own (`kernel/pack.sh`). tbxi builds both forks. The
+resource fork has to come from tbxi: its `cfrg` resource gives the data
+fork offsets of the System Enabler's code fragments, which follow the
+compressed ROM image and move when its compressed size changes. With the
+stock resource fork, a patched ROM stops during startup with "Sorry, a
+system error occurred. unimplemented trap". For the stock dump, tbxi's
+resource fork has the same resources as Apple's (types, IDs, names,
+attributes and data).
+
+To boot it (`SCRATCH=1` keeps the disk unchanged):
 
 ```bash
-DISK=disks/os9-kernel.img ../os9-protect/run.sh &
+SCRATCH=1 DISK=disks/os9-kernel.img ../os9-protect/run.sh &
 ```
 
 To check which kernel is running, dump it from guest memory and compare it
-with the one you built:
+with the one you built (105,312 bytes with patch 1):
 
 ```bash
-../os9-protect/tools/qmp.py raw '{"execute":"pmemsave","arguments":{"val":15794176,"size":105280,"filename":"/tmp/nk-live.bin"}}'
+../os9-protect/tools/qmp.py raw '{"execute":"pmemsave","arguments":{"val":15794176,"size":105312,"filename":"/tmp/nk-live.bin"}}'
 ```
 
 ```bash
-cmp /tmp/nk-live.bin kernel/stock/NanoKernel-v02.28.bin
+cmp /tmp/nk-live.bin kernel/build/NanoKernel-v02.28.bin
 ```
 
-The repacked stock dump boots to the Finder, and the kernel in memory
-matches byte for byte (2026-11-12).
+The repacked stock dump and the kernel with patch 1 both boot to the
+Finder, and the kernel in memory matches the build byte for byte
+(2026-11-12).
 
 ### The stock kernel
 
