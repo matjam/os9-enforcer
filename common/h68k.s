@@ -16,10 +16,12 @@
 # Deny rule: when the 68k code doing a recorded store (the next 68k
 # instruction, r24 - 2) is inside [cur_lo, cur_hi), the current
 # application's own code is writing outside its memory. The ring entry's pc
-# gets bit 0 set. With D_ENFORCE set, the hook then leaves the page
-# protected, stores ApplZone at D_STOP (when set) to name the application
-# to stop, and passes the fault on, and the emulator gives the application
-# a bus error.
+# gets bit 0 set. When the fault address is at or above D_DENY_FROM, the
+# hook then leaves the page protected, stores ApplZone at D_STOP (when set)
+# to name the application to stop, and passes the fault on, and the
+# emulator gives the application a bus error. A store by the emulator's own
+# code that fills a 68k-to-native call frame (D_FRAME, FRAME_LEN bytes) is
+# not the application's, although r24 then still points at its trap.
 #
 # Entry state, from the kernel (NKInterrupts.s LetBlueHandleOwnException):
 #   r3  = ECB (logical)          free: the original overwrites it first
@@ -66,11 +68,13 @@
         .set    D_CUR_HI, 0x74          # handled but not recorded
         .set    D_RING, 0x78            # RING_N entries of 32 bytes, or 0
         .set    D_COUNT_SELF, 0x7C      # handled inside [cur_lo, cur_hi)
-        .set    D_ENFORCE, 0x88         # nonzero: deny the current app's code
+        .set    D_DENY_FROM, 0x88       # deny the app's code at or above this
         .set    D_COUNT_DENIED, 0x8C
         .set    D_DENIED, 0x90          # the last one: pc, addr, r24, zone, a7
         .set    D_STOP, 0xA4            # gets the zone on a denial, or 0
-        .set    RING_N, 64
+        .set    D_FRAME, 0xA8           # the emulator's frame code, or 0
+        .set    FRAME_LEN, 0x70
+        .set    RING_N, 256
         .set    APPCODE, 6              # CR bit (cr1.eq): the current app's code
 
         # Ring entry and passed-fault record fields.
@@ -160,6 +164,11 @@ record:
         lwz     5,D_CUR_HI(3)
         cmplw   6,5
         bge     app_known
+        lwz     5,0x84+E(3)             # not if the emulator's frame code
+        lwz     7,D_FRAME(3)
+        subf    5,7,5
+        cmplwi  5,FRAME_LEN
+        blt     app_known
         creqv   APPCODE,APPCODE,APPCODE
 app_known:
         lwz     5,D_COUNT_HANDLED(3)
@@ -194,9 +203,9 @@ pc_known:
 
 decide:
         bne     1,open
-        lwz     5,D_ENFORCE(3)
-        cmpwi   5,0
-        bne     deny
+        lwz     5,D_DENY_FROM(3)
+        cmplw   4,5
+        bge     deny
 
 open:
         # The kernel call below goes through the same context block; keep

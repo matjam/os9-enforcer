@@ -17,10 +17,10 @@
 #
 # Deny rule: when the faulting PC of a recorded store is inside [cur_lo,
 # cur_hi), the current application's own code is writing outside its
-# memory. The ring entry's pc gets bit 0 set. With D_ENFORCE set, the hook
-# then leaves the page protected, stores ApplZone at D_STOP (when set) to
-# name the application to stop, and passes the fault on to the Exception
-# Manager.
+# memory. The ring entry's pc gets bit 0 set. When the fault address is at
+# or above D_DENY_FROM, the hook then leaves the page protected, stores
+# ApplZone at D_STOP (when set) to name the application to stop, and passes
+# the fault on to the Exception Manager.
 #
 # Entry state: as for h68k.s, with the NCB in r3 and NCB+0x54 (the
 # Exception Manager's TVector) in r4. Fault details in the NCB: +0x40 flags
@@ -54,11 +54,11 @@
         .set    D_RING, 0x78
         .set    D_COUNT_SELF, 0x7C
         .set    D_CTX, 0x80             # the NCB, kept across the kernel call
-        .set    D_ENFORCE, 0x88         # nonzero: deny the current app's code
+        .set    D_DENY_FROM, 0x88       # deny the app's code at or above this
         .set    D_COUNT_DENIED, 0x8C
         .set    D_DENIED, 0x90          # the last one: pc, addr, r3, zone, sp
         .set    D_STOP, 0xA4            # gets the zone on a denial, or 0
-        .set    RING_N, 64
+        .set    RING_N, 256
         .set    APPCODE, 6              # CR bit (cr1.eq): the current app's code
 
         .set    R_SEQ, 0x00
@@ -176,9 +176,9 @@ pc_known:
 
 decide:
         bne     1,open
-        lwz     5,D_ENFORCE(4)
-        cmpwi   5,0
-        bne     deny
+        lwz     5,D_DENY_FROM(4)
+        cmplw   7,5
+        bge     deny
 
 open:
         # The kernel call below goes through the same context block.

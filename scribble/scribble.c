@@ -8,6 +8,10 @@
  *   b  BlockMoveData, system code, called by this application: allowed
  *      (Guard does not look at who called the code doing the store);
  *   o  a store into this application's own heap: allowed.
+ *   s  a store from this application's native code into a word in the
+ *      middle of the system heap: SysLog and SysGuard log it and allow it
+ *      (the system heap is log only);
+ *   S  the same from 68k code.
  * A denied store stops this application; run it again for the next test.
  *
  *   t  time traps: for 2 seconds, rewrite one word on each of kBenchPages
@@ -84,6 +88,20 @@ static unsigned long hnat_count(void)
 {
     volatile HookData *d = hnat_data_ptr();
     return d ? d->count_all : 0;
+}
+
+/* A long at a 2-byte aligned address. */
+static unsigned long long_at(unsigned long addr)
+{
+    volatile unsigned short *p = hook_ptr(addr);
+    return ((unsigned long)p[0] << 16) | p[1];
+}
+
+/* A word in the middle of the system heap: from SysZone to its bkLim. */
+static volatile unsigned long *sys_target(void)
+{
+    unsigned long zone = long_at(0x2A6), end = long_at(zone);
+    return (volatile unsigned long *)(((zone + end) / 2 & ~0xFFFUL) + 0x100);
 }
 
 static unsigned long long micros(void)
@@ -209,14 +227,27 @@ int main(void)
        first word is the code address. */
     printf("main's code %08lX, 68k code %08lX\n",
            *(unsigned long *)(void *)&main, (unsigned long)c);
+    volatile unsigned long *sys = sys_target();
+    printf("system heap target %08lX\n", (unsigned long)sys);
     for (;;) {
         printf("\nn native store, 6 68k store, b BlockMoveData, o own "
-               "heap, t time traps, q quit; then Return\n");
+               "heap, s/S native/68k store into the system heap, t time "
+               "traps, q quit; then Return\n");
         int ch = getchar();
         while (ch != '\n' && getchar() != '\n')
             ;
         unsigned long v = *target;
         switch (ch) {
+        case 's':
+            v = *sys;
+            printf("native store of %08lX to %08lX\n", v, (unsigned long)sys);
+            *sys = v;
+            break;
+        case 'S':
+            v = *sys;
+            printf("68k store of %08lX to %08lX\n", v, (unsigned long)sys);
+            CallUniversalProc(upp, pi, (long)sys, (long)v);
+            break;
         case 'n':
             printf("native store of %08lX to %08lX\n", v, (unsigned long)target);
             *target = v;

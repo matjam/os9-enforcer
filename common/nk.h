@@ -91,6 +91,10 @@ static inline long nk_set_access(unsigned long area, unsigned long values,
     return nk_call(kcSetAreaAccess, &k);
 }
 
+/* Protect: read-only (PTE PP 11), for the NanoKernel too. Unprotect:
+   read/write (PP 10). kAccessSupRWUserRO (PP 01, read-only for user mode
+   only) does not stop the blue task's stores on 9.2.2 (tested: no faults),
+   so Mac OS code cannot be told from the kernel by page protection. */
 static inline long nk_protect(unsigned long area, unsigned long start,
                               unsigned long len)
 {
@@ -101,6 +105,12 @@ static inline long nk_unprotect(unsigned long area, unsigned long start,
                                 unsigned long len)
 {
     return nk_set_access(area, kAccessWrite, kAccessWrite, start, len);
+}
+
+/* A page that is plain read/write: one this code may protect and open. */
+static inline int nk_access_rw(unsigned long bits)
+{
+    return (bits & (kAccessWrite | kAccessSupRWUserRO)) == kAccessWrite;
 }
 
 /* Exception Manager (MachineExceptions.h), declared here because the

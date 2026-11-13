@@ -11,12 +11,16 @@
  *
  * Deny rule: a recorded store whose code lies inside [cur_lo, cur_hi) is
  * the current application's own code writing outside its memory. The hook
- * sets kHookAppCode in the event's pc. When enforce is set, it also leaves
- * the page protected and passes the fault on, which stops the application;
- * such faults are counted in count_denied, with the last one in denied.
- * The code's address is the faulting PC for native code and the next 68k
- * instruction (r24 - 2) for 68k code. When stop is set, a denial also
- * stores ApplZone (the application to stop) in *stop.
+ * sets kHookAppCode in the event's pc. When the fault address is at or
+ * above deny_from, it also leaves the page protected and passes the fault
+ * on, which stops the application; such faults are counted in count_denied,
+ * with the last one in denied. deny_from is ~0 to deny nothing and 0 to
+ * deny everywhere. The code's address is the faulting PC for native code
+ * and the next 68k instruction (r24 - 2) for 68k code; for 68k code, a
+ * store by the emulator's own call-frame code (frame, kHookFrameLen bytes)
+ * is not the application's, although r24 then points at its trap. When
+ * stop is set, a denial also stores ApplZone (the application to stop) in
+ * *stop.
  */
 
 #ifndef HOOK_H
@@ -24,7 +28,11 @@
 
 #include <stddef.h>
 
-enum { kHookRing = 64 }; /* ring entries; RING_N in the .s files */
+enum { kHookRing = 256 }; /* ring entries; RING_N in the .s files */
+
+/* FRAME_LEN in h68k.s: the emulator code that fills a 68k-to-native call
+   frame (9.2.2: 0x6806E300). */
+enum { kHookFrameLen = 0x70 };
 
 /* Set in HookEvent.pc (PowerPC instructions are 4-byte aligned, so the
    low bits are free): the store's code is the current application's. */
@@ -72,11 +80,12 @@ typedef struct {
     unsigned long count_self;    /* handled inside [cur_lo, cur_hi) */
     unsigned long saved_ctx;     /* hnat: the context block, during the call */
     unsigned long block;         /* hnat: the system-heap block it lives in */
-    unsigned long enforce;       /* deny stores by the current app's code */
+    unsigned long deny_from;     /* deny app-code stores at or above this */
     unsigned long count_denied;
     HookPassed denied;           /* the last store denied */
     volatile unsigned long *stop; /* gets ApplZone on a denial, or 0 */
-    unsigned long reserved[6];
+    unsigned long frame;         /* h68k: the emulator's frame code, or 0 */
+    unsigned long reserved[5];
 } HookData;
 
 _Static_assert(sizeof(HookEvent) == 32, "ring entry size");
@@ -87,10 +96,11 @@ _Static_assert(offsetof(HookData, cur_lo) == 0x70, "D_CUR_LO");
 _Static_assert(offsetof(HookData, ring) == 0x78, "D_RING");
 _Static_assert(offsetof(HookData, count_self) == 0x7C, "D_COUNT_SELF");
 _Static_assert(offsetof(HookData, saved_ctx) == 0x80, "hnat D_CTX");
-_Static_assert(offsetof(HookData, enforce) == 0x88, "D_ENFORCE");
+_Static_assert(offsetof(HookData, deny_from) == 0x88, "D_DENY_FROM");
 _Static_assert(offsetof(HookData, count_denied) == 0x8C, "D_COUNT_DENIED");
 _Static_assert(offsetof(HookData, denied) == 0x90, "D_DENIED");
 _Static_assert(offsetof(HookData, stop) == 0xA4, "D_STOP");
+_Static_assert(offsetof(HookData, frame) == 0xA8, "D_FRAME");
 _Static_assert(sizeof(HookData) == 0xC0, "data block size");
 
 /* A pointer to a fixed address. The empty asm hides the constant from GCC,
