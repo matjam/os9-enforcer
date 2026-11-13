@@ -19,7 +19,11 @@ import os
 import struct
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# vdump.py is in the test machine's tools: OS9_PROTECT, default
+# ../os9-protect next to this repository.
+sys.path.insert(0, os.path.join(os.environ.get("OS9_PROTECT", os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "..", "os9-protect")),
+    "tools"))
 import vdump  # noqa: E402
 
 ECB_SLOT = 0x68FFF14C      # ECB.ExceptionHandler

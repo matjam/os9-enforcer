@@ -17,7 +17,11 @@ import tempfile
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-QMP = os.path.join(HERE, "qmp.py")
+# qmp.py is in the test machine's tools: OS9_PROTECT, default
+# ../os9-protect next to this repository.
+QMP = os.path.join(os.environ.get("OS9_PROTECT",
+                                  os.path.join(HERE, "..", "..", "os9-protect")),
+                   "tools", "qmp.py")
 
 PAGE = 0x68FFF000
 SLOT = 0x14C

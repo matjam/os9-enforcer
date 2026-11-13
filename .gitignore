@@ -1,0 +1,19 @@
+# Only our own sources and scripts are tracked. The toolchain, QEMU and the
+# disk images live in os9-protect.
+
+# Build output (./build.sh builds each program in PROGRAM/build).
+/*/build/
+/*/build-*/
+
+__pycache__/
+
+# Binary files, wherever they are.
+*.bin
+*.img
+*.dsk
+*.o
+*.a
+*.xcoff
+*.pef
+*.png
+.DS_Store

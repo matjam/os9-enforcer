@@ -2,8 +2,7 @@ cmake_minimum_required(VERSION 3.15)
 # Retro68's add_application links with the C++ driver.
 project(Enforcer C CXX)
 
-# Build with the Retro68 PowerPC toolchain:
-#   cmake -S enforcer -B enforcer/build -DCMAKE_TOOLCHAIN_FILE=$PWD/toolchain/build/toolchain/powerpc-apple-macos/cmake/retroppc.toolchain.cmake
+# Build with the Retro68 PowerPC toolchain from os9-protect: ./build.sh enforcer
 # Produces "Enforcer Extension.bin" (a background-only application, file
 # type 'appe', for the Extensions folder) and "Enforcer.bin" (the control
 # panel, file type 'APPC', for the Control Panels folder).
