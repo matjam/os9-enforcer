@@ -292,12 +292,13 @@ What it showed, which the plan depends on:
 | `h68k/` | H68KTest: tests for both write hooks |
 | `wlog/` | WLog: the first write logger |
 | `probe/` | Probe: the first page protection experiment |
-| `tools/` | Host scripts that read the engine's and hooks' state and the guest's memory |
+| `tools/` | Host scripts that read the engine's and hooks' state and the guest's memory, and build helpers |
 
 To build them, run `./build.sh`, or name directories:
 `./build.sh xlog scribble`. Each builds a MacBinary `.bin` in its `build/`
-folder with the toolchain in `$OS9_PROTECT/toolchain`. To run them, boot a
-guest with virtual memory off and copy them in:
+folder with the toolchain in `$OS9_PROTECT/toolchain`. The `enforcer/`
+build also needs Python 3. To run them, boot a guest with virtual memory
+off and copy them in:
 
 ```bash
 SCRATCH=1 DISK=disks/os9-novm.qcow2 ../os9-protect/run.sh &
@@ -306,6 +307,33 @@ SCRATCH=1 DISK=disks/os9-novm.qcow2 ../os9-protect/run.sh &
 ```bash
 ../os9-protect/tools/push.sh -n Test xlog/build/SysLog.bin scribble/build/Scribble.bin
 ```
+
+To replace a running Enforcer Extension, quit it first: the Finder cannot
+replace a file that is in use. In Script Editor (Apple Extras, AppleScript),
+run `tell application "Enforcer Extension" to quit`. After copying the new
+one in, open it to start it, or restart. (Holding Shift from the host to
+start up with extensions off does not work: the guest does not see a key
+held down before its USB keyboard driver loads.)
+
+### Icons
+
+The icon is a blue shield with a gold rim and a memory chip on its face.
+The extension's icon stands the shield on a puzzle piece. To change them,
+edit `tools/make-icons.py` and run it: it rewrites `enforcer/icon-panel.r`
+and `enforcer/icon-extension.r`. With `-p DIR` it also writes a preview
+image of every size and color depth to `DIR/icons.png`.
+
+Each program carries its icons twice:
+- The icon family at ID 128, which its bundle (`BNDL` and `FREF` in
+  `panel.r` and `extension.r`) names for the Finder's desktop database.
+  The desktop database keeps only up to 256 colors and a 1-bit mask.
+- The same `icns` at ID −16455, the file's custom icon. Icon Services
+  draws that in 32-bit color with soft edges, also on a CD, where the
+  Finder cannot register a bundle.
+
+Retro68's Rez clears every Finder flag, so the build sets hasBundle and
+hasCustomIcon in the MacBinary header with `tools/finder-flags.py`.
+`push.sh` (`hcopy`) keeps both flags.
 
 ## Reading guest memory
 
