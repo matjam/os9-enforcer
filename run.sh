@@ -13,6 +13,7 @@
 # DISK=image to boot another hard disk image (default disks/os9.qcow2; for
 # example disks/os9-novm.qcow2, an overlay with virtual memory off). An
 # image whose name does not end in .qcow2 is opened as raw.
+# MEM=megabytes sets the RAM size (default 512; Mac OS 9 uses up to 1536).
 # The guest has a network card (sungem) on QEMU's user-mode network: DHCP,
 # outbound internet, and the host reachable at 10.0.2.2.
 # A QMP control socket is always opened at run/qmp.sock, for screenshots
@@ -26,6 +27,7 @@ set -eu
 cd "$(dirname "$0")"
 
 DISK=${DISK:-disks/os9.qcow2}
+MEM=${MEM:-512}
 CDROM=media/macos-922-uni.iso
 QMP=run/qmp.sock
 EVENTS=run/events.sock
@@ -103,7 +105,7 @@ while :; do
   "$QEMU" \
     -name "Mac OS 9.2.2" \
     -M mac99,via=pmu \
-    -m 512 \
+    -m "$MEM" \
     -boot "$boot" \
     -drive file="$DISK",format="$fmt",media=disk \
     -drive "$cd_drive" \
