@@ -211,18 +211,49 @@ limits.
      not denied. The engine refreshes the owner table every 30 ticks, so a
      partition just created can still have a stale owner. Check this when
      the Process Manager hooks of step 4 set owners at once.
-7. **Installer for users.**
-   - Ship a patcher, not a ROM file (Apple's file cannot be
-     redistributed). It checks the user's Mac OS ROM file against a
-     supported SHA-256, unpacks its parcels (LZSS), patches the kernel,
-     repacks it, and keeps the original for uninstall.
-   - Replace the open, name-locked file on the running system through the
-     File Manager: rename it, move it out of the System Folder, write the
-     new file, restart. Needs a test; the Finder refuses.
-   - Recovery: boot from the install CD and put the original back.
-   - Support Mac OS ROM 9.2.1 (Mac OS 9.2.2, NanoKernel 2.28) first.
-     OldWorld Macs load the kernel from a `krnl` resource in the System
-     file instead, which needs its own path.
+7. **Installer for users.** Done (2026-11-12): `installer/`, Enforcer
+   Installer. It patches the user's own Mac OS ROM file, so no Apple bytes
+   ship: `installer/kpatch.h` holds only the 939 bytes that differ between
+   the stock kernel and ours (`tools/make-kpatch.py`).
+   - It accepts any Mac OS ROM file whose ROM image holds NanoKernel 2.28
+     as Apple made it (CRC-32 of its 105,280 bytes, zeros after it), and
+     recognizes one it has patched.
+   - `installer/rompatch.c`:
+     - Checks both Adler-32 checksums and the image's CRC-32.
+     - Decompresses the 4 MB ROM image and finds the kernel through
+       ConfigInfo.
+     - Applies the patch, sets the image's lane checksums, and compresses
+       it again.
+     - Moves the parcels after the image, and sets the boot script's
+       `parcels-size` and `info-size` and both checksums.
+     - The System Enabler moves too (by 720 bytes); the installer moves the
+       data fork offsets in the resource fork's `cfrg` to match.
+   - `installer/lzss.c` is Okumura's LZSS. It gives back Apple's
+     compressed image byte for byte, so the patched file differs from the
+     one `kernel/build.sh` makes with tbxi only in padding bytes between
+     parcels. To test it on the host, run `tools/rompatch-test.sh`.
+   - Install writes the patched copy into the System Folder, gives it type
+     `tbxi`, moves the original into "Enforcer Backup" at the top of the
+     startup disk, and renames the copy. The File Manager renames and
+     moves the open Mac OS ROM file; Mac OS goes on using it until the
+     restart. Then Install copies the Enforcer Extension and control panel
+     from its own folder; a running extension goes to the Trash first.
+   - Remove checks that the backup has the stock kernel, puts it back, and
+     moves the patched file, the extension and the control panel to the
+     Trash.
+   - Test on `disks/os9-installer.qcow2` (an overlay on `os9-novm.qcow2`,
+     stock ROM file):
+     - Install took under 10 seconds.
+     - After the restart the extension registered the kernel's owner check.
+     - Install again replaced the running extension.
+     - After Remove and a restart, the stock instruction was back at
+       0x3630.
+     - The Trash, with the patched file, then emptied.
+   - Recovery without the installer: start up from a Mac OS 9 CD and drag
+     "Mac OS ROM" from "Enforcer Backup" into the System Folder, replacing
+     the patched one.
+   - OldWorld Macs load the kernel from a `krnl` resource in the System
+     file instead, which needs its own path. Not done.
 
 Not covered:
 - An overrun inside an application's own memory. It can only damage that
@@ -287,6 +318,7 @@ What it showed, which the plan depends on:
 |---|---|
 | `common/` | The protection engine, the 68k and native write hooks, NanoKernel calls |
 | `enforcer/` | Enforcer Extension and the Enforcer control panel |
+| `installer/` | Enforcer Installer: patches the Mac OS ROM file, installs and removes Enforcer |
 | `xlog/` | XLog, Guard, SysLog and SysGuard: console front ends on the engine |
 | `scribble/` | Scribble: stores into other memory, to test the engine |
 | `h68k/` | H68KTest: tests for both write hooks |
@@ -397,7 +429,15 @@ kernel/install.sh
 `install.sh` writes the file into the System Folder of os9-protect's raw
 `disks/os9-kernel.img`, checks both forks, and refuses while QEMU has the
 image open. The Finder cannot replace the file in a running guest: the
-system keeps it open, and it is name locked.
+system keeps it open, and it is name locked. (Enforcer Installer can: see
+step 7.)
+
+After changing the kernel, write the installer's patch again and rebuild
+it:
+
+```bash
+tools/make-kpatch.py && tools/rompatch-test.sh && ./build.sh installer
+```
 
 `build.sh` packs with `kernel/pack.sh DUMP`, which also packs the
 unmodified dump on its own (`kernel/pack.sh`). tbxi builds both forks. The

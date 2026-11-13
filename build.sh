@@ -3,8 +3,8 @@
 # machine's folder (OS9_PROTECT, default ../os9-protect next to this one).
 #
 # Usage: ./build.sh [PROGRAM...]
-# PROGRAM is a directory: enforcer, xlog, scribble, h68k, wlog or probe.
-# Without one, it builds all of them. Each builds in PROGRAM/build.
+# PROGRAM is a directory: enforcer, installer, xlog, scribble, h68k, wlog or
+# probe. Without one, it builds all of them. Each builds in PROGRAM/build.
 set -eu
 cd "$(dirname "$0")"
 os9=${OS9_PROTECT:-../os9-protect}
@@ -15,7 +15,7 @@ if [ ! -f "$toolchain" ]; then
     exit 1
 fi
 if [ $# -eq 0 ]; then
-    set -- enforcer xlog scribble h68k wlog probe
+    set -- enforcer installer xlog scribble h68k wlog probe
 fi
 for p in "$@"; do
     cmake -S "$p" -B "$p/build" -DCMAKE_TOOLCHAIN_FILE="$toolchain" >/dev/null
