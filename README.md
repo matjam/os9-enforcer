@@ -3,10 +3,11 @@
 Test machine and toolchain for adding crash containment to Mac OS 9.2.2: a
 crashed or hung application should not take the rest of the system down.
 
-The Mac software built here, Enforcer with its protection engine, write
-hooks and test programs, is in its own repository, `os9-enforcer`, next to
-this folder (`~/src/os9-enforcer`). Its `build.sh` uses this folder's
-toolchain, and its README shows how to run its programs on this machine.
+The Mac software built here is in its own repository, `os9-enforcer`, next
+to this folder (`~/src/os9-enforcer`): the NanoKernel work, the prototype
+extension and the test programs. Its `build.sh` uses this folder's
+toolchain, and its README holds the plan and shows how to boot a modified
+kernel on this machine.
 
 ## Test machine
 
@@ -58,11 +59,11 @@ any other as raw.
 - `disks/os9-enforcer.qcow2`: an overlay on `os9-novm.qcow2` with Enforcer
   installed, for tests that must keep their changes across a restart.
 - `disks/os9-kernel.img`: a raw copy of `os9-novm.qcow2` for trying
-  modified Mac OS ROM files (see "NanoKernel" in os9-enforcer's README).
-  It is raw so that macOS can attach it and write the ROM file into its
-  System Folder while the machine is shut down. It takes about 330 MB on
-  disk (8 GB sparse). To go back to the stock ROM file, make it again as
-  below.
+  modified Mac OS ROM files (see "Working on the kernel" in os9-enforcer's
+  README). It is raw so that macOS can attach it and write the ROM file
+  into its System Folder while the machine is shut down. It takes about
+  330 MB on disk (8 GB sparse). To go back to the stock ROM file, make it
+  again as below.
 
 An overlay records only its own changes, so changing the image under it
 corrupts the overlay. To make `os9-novm.qcow2` again:
@@ -354,8 +355,8 @@ runs 13 to 25 million instructions a second at the desktop and up to about
 instructions.
 
 One trap costs about 70 µs on this QEMU (Apple Silicon host), including
-Enforcer putting the protection back; os9-enforcer's README ("What a trap
-costs") describes the measurement.
+Enforcer putting the protection back. The measurement is described in
+os9-enforcer's README up to commit c491006 ("What a trap costs").
 
 Results (2026-11-12, same idle and busy phases as above, 5,300 system heap
 pages; "open for good" leaves the pages with the most traps unprotected):
@@ -390,4 +391,4 @@ costs more, because more pages get written in each tick.
 Trying it showed a harder limit: a protected page holding a variable that
 Mac OS updates with `lwarx`/`stwcx.` hangs the machine, because the
 NanoKernel retries the faulting `stwcx.` itself and no write hook ever sees
-the fault (see "Watching the system heap" in os9-enforcer's README).
+the fault (see step 2 of the plan in os9-enforcer's README).
