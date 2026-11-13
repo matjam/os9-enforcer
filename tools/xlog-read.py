@@ -32,6 +32,14 @@ HEADER = ["magic", "self", "off_counters", "n_counters", "off_domains",
 # State from off_kernel, then the kernel's control block (common/kcb.h).
 KERNEL = ["kcb", "kcb_err", "owners", "kcb_raw", "owners_raw", "kseen",
           "kevents", "klost", "kdenied"]
+# After those: the temporary memory pools (PoolStubs pointer, PoolCounters,
+# vm, pm_zone), then the Chunk table.
+POOL = ["pool", "news", "passed", "disposed", "chunks_made", "chunks_freed",
+        "chunks_dropped", "quits", "gone", "reinstalled", "vm", "pm_zone"]
+POOL_STUBS = ["magic", "enabled_inside", "osd_old", "dh_old", "ets_old"]
+CHUNK = ["live", "domain", "handle", "block", "lo", "hi", "zone", "handles",
+         "keep"]
+MAX_CHUNKS = 128
 KCB = ["magic", "version", "mode", "current", "entries", "denied_page",
        "seq", "frame", "allowed", "logged", "denied", "bail", "self"]
 KCB_RING, KCB_RING_N, KCB_EVENTS = 0x200, 496, 12
@@ -50,7 +58,7 @@ COUNTERS = (["own_" + s for s in SOURCES] + ["cross_" + s for s in SOURCES] +
             ["outside", "switches", "timer_runs", "kernel_errors",
              "refreshes", "added", "removed", "dropped", "nwriters",
              "info_errors"] + ["app_code_" + s for s in SOURCES])
-DOMAIN_SIZE, WRITER_SIZE, OFFENSE_SIZE = 60, 64, 56
+DOMAIN_SIZE, WRITER_SIZE, OFFENSE_SIZE = 68, 64, 56
 SRC_MASK, APP_CODE = 0xFF, 0x100
 
 
@@ -69,11 +77,28 @@ def collect(addr):
                    h["off_offenses"] + 4 +
                    h["max_offenses"] * h["offense_size"],
                    h["off_stopper"] + 4, h["off_sys"] + 4 * len(SYS_STATE),
-                   h["off_kernel"] + 4 * len(KERNEL))
+                   h["off_kernel"] + 4 * (len(KERNEL) + len(POOL)) +
+                   MAX_CHUNKS * 4 * len(CHUNK))
         d = read(a, size)
         o = h["off_kernel"]
         kernel = dict(zip(KERNEL, struct.unpack(
             ">%dI" % len(KERNEL), d[o:o + 4 * len(KERNEL)])))
+        o += 4 * len(KERNEL)
+        kernel.update(zip(POOL, struct.unpack(">%dI" % len(POOL),
+                                              d[o:o + 4 * len(POOL)])))
+        o += 4 * len(POOL)
+        kernel["chunks"] = []
+        for i in range(MAX_CHUNKS):
+            c = dict(zip(CHUNK, struct.unpack(">%dI" % len(CHUNK), d[
+                o + 4 * len(CHUNK) * i:o + 4 * len(CHUNK) * (i + 1)])))
+            if c["live"]:
+                c["slot"] = i
+                kernel["chunks"].append(c)
+        if kernel["pool"]:
+            kernel.update(("stub_" + n, v) for n, v in zip(
+                POOL_STUBS, struct.unpack(">%dI" % len(POOL_STUBS),
+                                          read(kernel["pool"],
+                                               4 * len(POOL_STUBS)))))
         if kernel["kcb"]:
             k = kernel["kcb"]
             kernel.update(("cb_" + n, v) for n, v in zip(KCB, struct.unpack(
@@ -135,6 +160,31 @@ def print_kernel(k):
                   (info >> 8) & 0xFF, flags, task))
 
 
+def print_pool(k):
+    """The temporary memory pools: stubs, counts and chunks."""
+    print("virtual memory %s, Process Manager zone %08X" % (
+        "on" if k["vm"] else "off", k["pm_zone"]))
+    if not k["pool"]:
+        print("temporary memory pools: not installed")
+    else:
+        print("temporary memory pools at %08X: enabled %d, inside %d; "
+              "traps were _OSDispatch %08X, DisposeHandle %08X, ExitToShell "
+              "%08X" % (k["pool"], k["stub_enabled_inside"] >> 16,
+                        k["stub_enabled_inside"] & 0xFFFF, k["stub_osd_old"],
+                        k["stub_dh_old"], k["stub_ets_old"]))
+    print("  taken %d, passed on %d, disposed %d; chunks made %d, freed %d, "
+          "dropped %d; quits %d, gone %d; stubs put back %d" % (
+              k["news"], k["passed"], k["disposed"], k["chunks_made"],
+              k["chunks_freed"], k["chunks_dropped"], k["quits"], k["gone"],
+              k["reinstalled"]))
+    for c in k["chunks"]:
+        print("  chunk [%3d] domain %d: %08X-%08X zone %08X, handle %08X -> "
+              "%08X, %d handles%s" % (
+                  c["slot"], c["domain"], c["lo"], c["hi"], c["zone"],
+                  c["handle"], c["block"], c["handles"],
+                  ", kept" if c["keep"] else ""))
+
+
 def main():
     addr = int(sys.argv[1], 0) if len(sys.argv) > 1 else None
     addr, h, d, stopper, sy, kernel = vdump.paused(collect(addr))
@@ -176,6 +226,7 @@ def main():
     print("deny from %s" % ("nowhere" if deny == 0xFFFFFFFF else
                             "%08X" % deny))
     print_kernel(kernel)
+    print_pool(kernel)
     if sy["sys"]:
         ticks = sy["p_tick"]
         print("system heap %s (domain %d%s): %08X-%08X, %d pages of %d; "
@@ -197,11 +248,12 @@ def main():
     print("domains:")
     for i in range(h["n_domains"]):
         o = h["off_domains"] + i * DOMAIN_SIZE
-        if w(o):
-            print("  [%2d] %-15s %08X-%08X partition %08X+%08X dying %d own %d "
-                  "written by others %d" % (
+        if w(o) or w(o + 64):
+            print("  [%2d] %-15s %08X-%08X partition %08X+%08X (master "
+                  "pointer %08X) dying %d%s own %d written by others %d" % (
                       i, cstr(d[o + 36:o + 52]), w(o + 12), w(o + 16),
-                      w(o + 20), w(o + 24), w(o + 4), w(o + 52), w(o + 56)))
+                      w(o + 20), w(o + 24), w(o + 60), w(o + 4),
+                      ", quit" if w(o + 64) else "", w(o + 52), w(o + 56)))
     rows = []
     for i in range(min(c["nwriters"], h["max_writers"])):
         o = h["off_writers"] + i * WRITER_SIZE

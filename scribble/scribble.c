@@ -22,8 +22,12 @@
  *      the protection back. Needs the Enforcer Extension running.
  *
  *   m  allocate 64 KB of temporary memory filled with 'SCRB' and keep it,
- *      printing its handle: for finding where the Process Manager records
- *      an application's temporary memory (README, step 4).
+ *      printing its handle and whether it is in one of Enforcer's chunks
+ *      (README, step 4);
+ *   M  allocate 1 MB of temporary memory and dispose of it: its chunk is
+ *      freed;
+ *   T  a native store into another application's temporary memory chunk
+ *      (the Finder's if it has one): Enforcer denies it.
  */
 
 #include <stdio.h>
@@ -113,6 +117,62 @@ static unsigned long long micros(void)
     MicroTime w;
     Microseconds(&w);
     return (unsigned long long)w.hi << 32 | w.lo;
+}
+
+/* Enforcer's state, or 0 when it is not running. */
+static State *engine_state(void)
+{
+    long value = 0;
+    State *s = 0;
+    if (Gestalt(kEngineGestalt, &value) == noErr && value >= 0x1000)
+        s = (State *)value;
+    return s && s->magic == kEngineMagic && s->running ? s : 0;
+}
+
+/* Whether handle h lives in one of Enforcer's temporary memory chunks:
+   its zone follows the chunk signature (common/engine.h). */
+static int in_chunk(Handle h)
+{
+    unsigned long z = (unsigned long)HandleZone(h);
+    return z > 16 && long_at(z - 16) == kChunkSig && long_at(z - 12) == z;
+}
+
+static void pool_report(void)
+{
+    State *s = engine_state();
+    if (!s) {
+        printf("Enforcer is not running\n");
+        return;
+    }
+    printf("chunks %d; taken %lu, passed %lu, disposed %lu, made %lu, "
+           "freed %lu, dropped %lu, quits %lu, gone %lu\n",
+           engine_live_chunks(s), s->pc.news, s->pc.passed, s->pc.disposed,
+           s->pc.chunks_made, s->pc.chunks_freed, s->pc.chunks_dropped,
+           s->pc.quits, s->pc.gone);
+}
+
+/* A word in the middle of a temporary memory chunk of another
+   application, the Finder's if it has one, or 0. */
+static volatile unsigned long *chunk_target(char *name)
+{
+    State *s = engine_state();
+    if (!s)
+        return 0;
+    unsigned long me = long_at(0x2AA); /* ApplZone */
+    const Chunk *pick = 0;
+    for (int i = 0; i < kMaxChunks; i++) {
+        const Chunk *c = &s->chunks[i];
+        const Domain *d = &s->domains[c->domain];
+        if (!c->live || (me >= d->location && me - d->location < d->size))
+            continue;
+        if (!pick || !strcmp(d->name, "Finder"))
+            pick = c;
+    }
+    if (!pick)
+        return 0;
+    strcpy(name, s->domains[pick->domain].name);
+    return (volatile unsigned long *)
+        ((((pick->lo + pick->hi) / 2) & ~0xFFFUL) + 0x100);
 }
 
 /* Ask the engine for a mode and wait for it to take effect. */
@@ -236,7 +296,8 @@ int main(void)
     for (;;) {
         printf("\nn native store, 6 68k store, b BlockMoveData, o own "
                "heap, s/S native/68k store into the system heap, t time "
-               "traps, m temporary memory, q quit; then Return\n");
+               "traps, m temporary memory, M 1 MB of it, T store into "
+               "another application's, q quit; then Return\n");
         int ch = getchar();
         while (ch != '\n' && getchar() != '\n')
             ;
@@ -283,9 +344,42 @@ int main(void)
             }
             for (unsigned long i = 0; i < 0x10000 / 4; i++)
                 ((unsigned long *)*h)[i] = 'SCRB';
-            printf("temporary memory: handle %08lX, block %08lX\n",
-                   (unsigned long)h, (unsigned long)*h);
+            printf("temporary memory: handle %08lX, block %08lX, %s\n",
+                   (unsigned long)h, (unsigned long)*h,
+                   in_chunk(h) ? "in a chunk" : "not in a chunk");
+            pool_report();
             continue;
+        }
+        case 'M': {
+            /* A 1 MB block, which needs a chunk of its own, disposed at
+               once: the chunk is freed. */
+            OSErr err = 0;
+            Handle h = TempNewHandle(0x100000, &err);
+            if (!h) {
+                printf("TempNewHandle failed: %d\n", err);
+                continue;
+            }
+            printf("1 MB temporary memory: block %08lX, %s\n",
+                   (unsigned long)*h,
+                   in_chunk(h) ? "in a chunk" : "not in a chunk");
+            pool_report();
+            DisposeHandle(h);
+            printf("disposed\n");
+            pool_report();
+            continue;
+        }
+        case 'T': {
+            char name[16];
+            volatile unsigned long *t = chunk_target(name);
+            if (!t) {
+                printf("no other application's chunk\n");
+                continue;
+            }
+            v = *t;
+            printf("native store of %08lX to %08lX, in %s's temporary "
+                   "memory\n", v, (unsigned long)t, name);
+            *t = v;
+            break;
         }
         case 'q':
             return 0;

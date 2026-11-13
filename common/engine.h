@@ -70,6 +70,30 @@
  * kernel leaves alone reach the hooks as before. Without patch 4 the
  * registration fails and the engine runs on the hooks alone.
  *
+ * Temporary memory pools (needs the kernel's owner check): the engine
+ * patches TempNewHandle (_OSDispatch selector 0x1D), DisposeHandle and
+ * ExitToShell with 68k stubs that call its native code. An application's
+ * temporary memory comes from chunks of its own: a chunk is temporary
+ * memory of the application from the Process Manager (so it is freed when
+ * the application quits), moved high and locked, with a Memory Manager
+ * zone on the whole pages inside it, after a 16-byte signature ('EnfT' and
+ * the zone's address). TempNewHandle allocates the handle in one of the
+ * application's chunks, making a new one when none has room. The chunk's
+ * pages are the domain's, like its partition's, and blocks only move
+ * inside them, so their owner never goes stale. A chunk of the minimum
+ * size, the application's first, is kept when empty; any other is freed
+ * when its last handle is disposed in its owner's context. A request the
+ * pools cannot take (no domain, no memory for a chunk) goes on to the
+ * Process Manager as before, without an owner.
+ *
+ * Owners must never outlive the memory: a page whose owner is stale can
+ * belong to another application, which would then be stopped for writing
+ * its own memory. The ExitToShell stub drops the application's domain and
+ * its chunks before the Process Manager frees them, and a sweep (each
+ * tick, and before each TempNewHandle) drops a domain or a chunk whose
+ * master pointer no longer points at it. A domain dropped this way is not
+ * added again while its process is still listed.
+ *
  * The program running the engine is not a domain. Run it only with virtual
  * memory off.
  */
@@ -121,7 +145,65 @@ typedef struct {
     ProcessSerialNumber psn;
     char name[16];
     unsigned long self_writes, foreign_writes_in;
+    unsigned long mp;             /* the partition's master pointer, or 0 */
+    volatile unsigned long quit;  /* dropped (ExitToShell, or its partition
+                                     freed) while the process is listed */
 } Domain;
+
+/* A temporary memory chunk (see above). */
+enum {
+    kMaxChunks = 128,
+    kChunkMin = 0x20000,  /* 128 KB */
+    kChunkSlack = 0x1000, /* zone header, master pointers, signature */
+    kChunkMasters = 32,
+    kChunkSig = 'EnfT'
+};
+
+typedef struct {
+    volatile unsigned long live;
+    long domain;
+    Handle handle;         /* the Process Manager's temporary memory */
+    unsigned long block;   /* *handle: it is locked, so it never moves */
+    unsigned long lo, hi;  /* its whole pages */
+    unsigned long zone;    /* lo + 16 */
+    unsigned long handles; /* handles made in it and not disposed */
+    unsigned long keep;    /* the domain's first chunk: kept when empty */
+} Chunk;
+
+/* The 68k stubs, in a system heap block of their own that is never freed:
+   an application's own patch of one of the traps can still lead to a
+   stub, and a disabled stub passes every call on.
+ *
+ * The engine writes the trap table entries itself (OS traps at 0x400,
+ * Toolbox traps at 0xE00) instead of calling NSetTrapAddress: the Process
+ * Manager keeps an application's NSetTrapAddress patches as that
+ * application's own and takes them out of the table whenever another
+ * process is current, and the program running the engine is an
+ * application. Each stub goes on to the routine that was in the table
+ * when the engine installed it (*_old, never changed). The Process Manager
+ * can put that routine back when it switches out an application with its
+ * own patch of the trap; the timer then puts the stub back. It writes an
+ * entry only when it holds exactly *_old, so the chain cannot loop. */
+enum { kPoolMagic = 'Pool', kPoolOsd = 28, kPoolDh = 43, kPoolEts = 12 };
+
+typedef struct {
+    unsigned long magic;
+    volatile unsigned short enabled;
+    volatile unsigned short inside; /* the engine's own TempNewHandle */
+    unsigned long osd_old, dh_old, ets_old;
+    RoutineDescriptor rd_new, rd_disposed, rd_quit;
+    unsigned short osd[kPoolOsd], dh[kPoolDh], ets[kPoolEts];
+} PoolStubs;
+
+typedef struct {
+    unsigned long news;   /* TempNewHandle calls taken into a chunk */
+    unsigned long passed; /* passed on: no domain, or no room */
+    unsigned long disposed;
+    unsigned long chunks_made, chunks_freed, chunks_dropped;
+    unsigned long quits;  /* domains dropped at ExitToShell */
+    unsigned long gone;   /* domains and chunks the sweep found freed */
+    unsigned long reinstalled; /* stubs the timer put back in the table */
+} PoolCounters;
 
 /* A cross-domain writer: a store site, the application current at the
    store, and the domain written. For 68k stores, pc is the 68k instruction
@@ -296,6 +378,14 @@ typedef struct {
     unsigned long kevents;      /* events taken */
     unsigned long klost;        /* events overwritten before the timer ran */
     unsigned long kdenied;      /* denied stores (the hooks record them) */
+
+    /* Temporary memory pools: pool is 0 when they are not installed (no
+       owner check, or no memory). */
+    PoolStubs *pool;
+    PoolCounters pc;
+    unsigned long vm;           /* virtual memory is on */
+    unsigned long pm_zone;      /* the Process Manager's zone, or 0 */
+    Chunk chunks[kMaxChunks];
 } State;
 
 /* Install the hooks, the fallback handler and the timer, read the process
@@ -317,6 +407,16 @@ void engine_set_sys(State *s, int on);
 /* Stop protecting, remove the timer and the fallback handler, and remove
    the hooks if this engine installed them. The state stays allocated. */
 void engine_stop(State *s);
+
+/* Temporary memory in chunks, and the chunks, for the control panel. */
+static inline int engine_live_chunks(const State *s)
+{
+    int n = 0;
+    for (int i = 0; i < kMaxChunks; i++)
+        if (s->chunks[i].live)
+            n++;
+    return n;
+}
 
 /* For reports. */
 int engine_domain_at(State *s, unsigned long addr);

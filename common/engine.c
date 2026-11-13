@@ -13,6 +13,7 @@
 #include <Processes.h>
 #include <Timer.h>
 #include <MixedMode.h>
+#include <Traps.h>
 
 #include "engine.h"
 #include "nk.h"
@@ -76,13 +77,19 @@ static void zone_name(char out[16], unsigned long zone)
     out[13] = 0;
 }
 
-/* The live domain whose protected pages hold addr. */
+/* The live domain whose protected pages hold addr: its partition's or one
+   of its temporary memory chunks'. */
 static int domain_at(State *s, unsigned long addr)
 {
     for (int i = 0; i < kMaxDomains; i++) {
         Domain *d = &s->domains[i];
         if (d->live && addr >= d->lo && addr < d->hi)
             return i;
+    }
+    for (int i = 0; i < kMaxChunks; i++) {
+        Chunk *c = &s->chunks[i];
+        if (c->live && addr >= c->lo && addr < c->hi)
+            return c->domain;
     }
     return -1;
 }
@@ -146,19 +153,33 @@ static void sys_runs(State *s, unsigned long from, unsigned long to,
 
 static void protect_domain(State *s, int i)
 {
-    if (i == s->sys_dom)
+    if (i == s->sys_dom) {
         sys_protect_all(s);
-    else
-        protect(s, i, s->domains[i].lo, s->domains[i].hi - s->domains[i].lo);
+        return;
+    }
+    protect(s, i, s->domains[i].lo, s->domains[i].hi - s->domains[i].lo);
+    for (int j = 0; j < kMaxChunks; j++) {
+        Chunk *c = &s->chunks[j];
+        if (c->live && c->domain == i)
+            protect(s, i, c->lo, c->hi - c->lo);
+    }
 }
 
 static void unprotect_domain(State *s, int i)
 {
     Domain *d = &s->domains[i];
-    if (i == s->sys_dom)
+    if (i == s->sys_dom) {
         sys_runs(s, 0, s->sys->n, kPageExcluded, 0);
-    else if (nk_unprotect(s->area, d->lo, d->hi - d->lo))
+        return;
+    }
+    if (nk_unprotect(s->area, d->lo, d->hi - d->lo))
         s->c.kernel_errors++;
+    for (int j = 0; j < kMaxChunks; j++) {
+        Chunk *c = &s->chunks[j];
+        if (c->live && c->domain == i &&
+            nk_unprotect(s->area, c->lo, c->hi - c->lo))
+            s->c.kernel_errors++;
+    }
 }
 
 static void protect_others(State *s)
@@ -185,6 +206,66 @@ static void set_current(State *s, int i)
     if (s->kcb)
         s->kcb->current = i >= 0 ? owner_code(s, i) : kOwnerNone;
     s->cur = i;
+}
+
+/* Stop managing a chunk's pages, before its memory is freed. Safety rule
+   (engine.h): not live first, so that nothing protects it again, then
+   open its pages, then clear their bits and owners. */
+static void drop_chunk(State *s, Chunk *c)
+{
+    c->live = 0;
+    if (nk_unprotect(s->area, c->lo, c->hi - c->lo))
+        s->c.kernel_errors++;
+    mark(s, c->lo, c->hi, kOwnerNone);
+}
+
+/* Stop managing application domain i and its chunks: its process is gone,
+   or going (quit: keep the slot while the process is still listed, so
+   that the next refresh does not add it again). */
+static void drop_domain(State *s, int i, int quit)
+{
+    Domain *d = &s->domains[i];
+    d->dying = 1;
+    if (s->cur == i) {
+        set_current(s, -1);
+        s->cur_zone = 0; /* the next tick looks again */
+    }
+    for (int j = 0; j < kMaxChunks; j++) {
+        Chunk *c = &s->chunks[j];
+        if (c->live && c->domain == i) {
+            drop_chunk(s, c);
+            s->pc.chunks_dropped++;
+        }
+    }
+    if (nk_unprotect(s->area, d->lo, d->hi - d->lo))
+        s->c.kernel_errors++;
+    mark(s, d->lo, d->hi, kOwnerNone);
+    d->quit = quit;
+    d->live = 0;
+    s->c.removed++;
+}
+
+/* Drop every domain and chunk whose master pointer no longer points at
+   it: the Process Manager has freed its memory. Reads only memory, so it
+   can run at interrupt time when that memory cannot be paged out (virtual
+   memory off). */
+static void sweep(State *s)
+{
+    for (int i = 0; i < kMaxDomains; i++) {
+        Domain *d = &s->domains[i];
+        if (d->live && !d->dying && d->mp &&
+            *(volatile unsigned long *)d->mp != d->location) {
+            drop_domain(s, i, 1);
+            s->pc.gone++;
+        }
+    }
+    for (int i = 0; i < kMaxChunks; i++) {
+        Chunk *c = &s->chunks[i];
+        if (c->live && *(volatile unsigned long *)c->handle != c->block) {
+            drop_chunk(s, c);
+            s->pc.gone++;
+        }
+    }
 }
 
 /* On a process switch, protect the previous application's domain. */
@@ -911,8 +992,14 @@ static long handler(ExceptionInfo *e)
     unsigned long addr = mi->theAddress, pc = e->machineState->PC.lo;
     int app = pc >= s->hnat->cur_lo && pc < s->hnat->cur_hi;
     /* A store the native hook denied (it is in its ring already): stop
-       the application, or let the system do it. */
-    if (app && addr >= s->deny_from) {
+       the application, or let the system do it. The hook names the
+       application in the stopper when it denies; the kernel can deny a
+       store by the application's code outside its partition (in one of its
+       temporary memory chunks), which the PC test does not see, and
+       opening that page would only fault again. */
+    if ((app && addr >= s->deny_from) ||
+        (s->stopper && s->stopper->zone &&
+         s->stopper->zone == current_zone())) {
         if (stop_native(s, e))
             return 0;
         return g_prev ? g_prev(e) : -1;
@@ -934,11 +1021,16 @@ static long handler(ExceptionInfo *e)
     return 0;
 }
 
+static void pool_keep(State *s);
+
 static void timer_proc(TMTask *tm)
 {
     State *s = g_state;
     if (s && s->active) {
         s->c.timer_runs++;
+        if (!s->vm)
+            sweep(s);
+        pool_keep(s);
         check_switch(s);
         if (s->sys_dom >= 0)
             s->sys->tick++;
@@ -968,6 +1060,69 @@ static void set_name(Domain *d, const unsigned char *name)
     d->name[n] = 0;
 }
 
+/* A process with no name: use the creator code, as 'calc'. */
+static void default_name(unsigned char *name, const ProcessInfoRec *info)
+{
+    if (name[0])
+        return;
+    unsigned long sig = info->processSignature;
+    name[0] = 6;
+    name[1] = name[6] = '\'';
+    for (int i = 0; i < 4; i++)
+        name[2 + i] = (sig >> (24 - 8 * i)) & 0xFF;
+}
+
+/* The partition's master pointer, or 0. The partition is a locked handle
+   in the Process Manager's zone: its block header ends with the handle
+   relative to that zone. */
+static unsigned long partition_mp(State *s, unsigned long loc)
+{
+    if (!s->pm_zone)
+        return 0;
+    long rel = *(volatile long *)(loc - 4);
+    if (rel < -0x1000000 || rel > 0x1000000 || (rel & 3))
+        return 0;
+    unsigned long mp = s->pm_zone + rel;
+    return *(volatile unsigned long *)mp == loc ? mp : 0;
+}
+
+/* Make slot i a domain for process psn, described by info and name.
+   Returns i, or -1 when its partition cannot be one. */
+static int add_domain(State *s, int i, const ProcessSerialNumber *psn,
+                      const ProcessInfoRec *info, const unsigned char *name)
+{
+    unsigned long loc = (unsigned long)info->processLocation;
+    unsigned long lo = (loc + kPage - 1) & kPageMask;
+    unsigned long hi = (loc + info->processSize) & kPageMask;
+    if (i < 0 || hi <= lo || lo < kSpanLo || hi > kSpanHi ||
+        (lo < s->my_hi && hi > s->my_lo))
+        return -1;
+    if (s->sys_dom >= 0 && lo < s->domains[s->sys_dom].hi &&
+        hi > s->domains[s->sys_dom].lo)
+        return -1; /* never: partitions are above the system heap */
+
+    Domain *d = &s->domains[i];
+    memset(d, 0, sizeof *d);
+    d->lo = lo;
+    d->hi = hi;
+    d->location = loc;
+    d->size = info->processSize;
+    d->psn = *psn;
+    d->mp = partition_mp(s, loc);
+    set_name(d, name);
+    d->seen = 1;
+    d->live = 1;
+    mark(s, lo, hi, owner_code(s, i));
+    protect_domain(s, i);
+    /* The current application: its zone has not changed, so make the next
+       tick look again, or it never becomes current. */
+    unsigned long z = current_zone();
+    if (z >= loc && z - loc < d->size)
+        s->cur_zone = 0;
+    s->c.added++;
+    return i;
+}
+
 static void refresh_domains(State *s)
 {
     ProcessSerialNumber me, psn = {0, kNoProcess};
@@ -988,28 +1143,23 @@ static void refresh_domains(State *s)
         name[0] = 0;
         int ok = GetProcessInformation(&psn, &info) == noErr;
         unsigned long loc = (unsigned long)info.processLocation;
-        unsigned long lo = (loc + kPage - 1) & kPageMask;
-        unsigned long hi = (loc + info.processSize) & kPageMask;
 
-        int found = -1, free_slot = -1;
+        int found = -1, free_slot = -1, quitting = 0;
         for (int i = 0; i < kMaxDomains; i++) {
             Domain *d = &s->domains[i];
             if (i == s->sys_dom)
                 continue;
-            if (d->live && same_psn(&d->psn, &psn) &&
-                (!ok || d->location == loc))
+            if (d->quit && same_psn(&d->psn, &psn)) {
+                d->seen = 1;
+                quitting = 1;
+            } else if (d->live && same_psn(&d->psn, &psn) &&
+                       (!ok || d->location == loc))
                 found = i;
-            else if (!d->live && free_slot < 0)
+            else if (!d->live && !d->quit && free_slot < 0)
                 free_slot = i;
         }
-        if (ok && !name[0]) {
-            /* A process with no name: use the creator code, as 'calc'. */
-            unsigned long sig = info.processSignature;
-            name[0] = 6;
-            name[1] = name[6] = '\'';
-            for (int i = 0; i < 4; i++)
-                name[2 + i] = (sig >> (24 - 8 * i)) & 0xFF;
-        }
+        if (quitting)
+            continue; /* dropped; its memory is being freed */
         if (!ok) {
             /* Keep a domain the Process Manager could not describe this
                time; add nothing. */
@@ -1018,6 +1168,7 @@ static void refresh_domains(State *s)
                 s->domains[found].seen = 1;
             continue;
         }
+        default_name(name, &info);
         if (found >= 0) {
             Domain *d = &s->domains[found];
             d->seen = 1;
@@ -1026,44 +1177,422 @@ static void refresh_domains(State *s)
                 set_name(d, name);
             continue;
         }
-        if (free_slot < 0 || hi <= lo || lo < kSpanLo || hi > kSpanHi ||
-            (lo < s->my_hi && hi > s->my_lo))
-            continue;
-        if (s->sys_dom >= 0 && lo < s->domains[s->sys_dom].hi &&
-            hi > s->domains[s->sys_dom].lo)
-            continue; /* never: partitions are above the system heap */
-
-        Domain *d = &s->domains[free_slot];
-        memset(d, 0, sizeof *d);
-        d->lo = lo;
-        d->hi = hi;
-        d->location = loc;
-        d->size = info.processSize;
-        d->psn = psn;
-        set_name(d, name);
-        d->seen = 1;
-        d->live = 1;
-        mark(s, lo, hi, owner_code(s, free_slot));
-        protect_domain(s, free_slot);
-        s->c.added++;
+        add_domain(s, free_slot, &psn, &info, name);
     }
 
     for (int i = 0; i < kMaxDomains; i++) {
         Domain *d = &s->domains[i];
-        if (!d->live || d->seen || i == s->sys_dom)
+        if (d->seen || i == s->sys_dom)
             continue;
-        d->dying = 1;
-        if (s->cur == i) {
-            set_current(s, -1);
-            s->cur_zone = 0; /* the next tick looks again */
-        }
-        if (nk_unprotect(s->area, d->lo, d->hi - d->lo))
-            s->c.kernel_errors++;
-        mark(s, d->lo, d->hi, kOwnerNone);
-        d->live = 0;
-        s->c.removed++;
+        if (d->live)
+            drop_domain(s, i, 0);
+        d->quit = 0; /* the process is gone: the slot is free */
     }
     s->c.refreshes++;
+}
+
+/* Add the current process as a domain, if it is not one yet. Returns its
+   slot, or -1. Event-time only. */
+static int add_current(State *s)
+{
+    ProcessSerialNumber psn;
+    ProcessInfoRec info;
+    Str31 name;
+    if (GetCurrentProcess(&psn))
+        return -1;
+    memset(&info, 0, sizeof info);
+    info.processInfoLength = sizeof info;
+    info.processName = name;
+    name[0] = 0;
+    if (GetProcessInformation(&psn, &info))
+        return -1;
+    int free_slot = -1;
+    for (int i = 0; i < kMaxDomains; i++) {
+        Domain *d = &s->domains[i];
+        if (i == s->sys_dom)
+            continue;
+        if ((d->live || d->quit) && same_psn(&d->psn, &psn))
+            return -1; /* a domain already, or quitting */
+        if (!d->live && !d->quit && free_slot < 0)
+            free_slot = i;
+    }
+    default_name(name, &info);
+    return add_domain(s, free_slot, &psn, &info, name);
+}
+
+/* Temporary memory pools (engine.h) ------------------------------------- */
+
+/* Mixed Mode procedure information for the stubs' calls into native code:
+   C calling convention, 4-byte arguments. */
+enum {
+    kPoolNewInfo = 0xF1,       /* long (long frame) */
+    kPoolDisposedInfo = 0x3C1, /* void (long zone, long err) */
+    kPoolQuitInfo = 0x01       /* void (void) */
+};
+
+/* A trap's entry in the trap table: OS traps (0xA0xx) at 0x400, Toolbox
+   traps (0xA8xx) at 0xE00. */
+static volatile unsigned long *trap_entry(unsigned short trap)
+{
+    if (trap & 0x0800)
+        return lowmem(0xE00 + 4 * (trap & 0x3FF));
+    return lowmem(0x400 + 4 * (trap & 0xFF));
+}
+
+/* The 68k stack is only 2-byte aligned. */
+static unsigned long get32(const unsigned char *p)
+{
+    return (unsigned long)p[0] << 24 | (unsigned long)p[1] << 16 |
+           (unsigned long)p[2] << 8 | p[3];
+}
+
+static void put32(unsigned char *p, unsigned long v)
+{
+    p[0] = v >> 24;
+    p[1] = v >> 16;
+    p[2] = v >> 8;
+    p[3] = v;
+}
+
+/* A handle of size bytes in chunk c, or 0. */
+static Handle chunk_alloc(Chunk *c, unsigned long size)
+{
+    THz z = (THz)c->zone;
+    if ((unsigned long)z->zcbFree < size)
+        return 0;
+    THz old = GetZone();
+    SetZone(z);
+    Handle h = NewHandle(size);
+    SetZone(old);
+    return h;
+}
+
+/* A new chunk for domain d with room for a handle of size bytes, or 0.
+   Called by d's application, in TempNewHandle, so the Process Manager
+   makes the chunk that application's temporary memory. */
+static Chunk *new_chunk(State *s, int d, unsigned long size)
+{
+    int slot = -1, kept = 0;
+    for (int i = 0; i < kMaxChunks; i++) {
+        Chunk *c = &s->chunks[i];
+        if (!c->live && slot < 0)
+            slot = i;
+        else if (c->live && c->domain == d && c->keep)
+            kept = 1;
+    }
+    unsigned long csize = (size + kChunkSlack + kPage - 1) & kPageMask;
+    if (slot < 0 || csize < size || csize > 0x40000000UL)
+        return 0;
+    if (csize < kChunkMin)
+        csize = kChunkMin;
+    OSErr err = noErr;
+    s->pool->inside = 1; /* the stub passes this one on */
+    Handle h = TempNewHandle(csize + kPage, &err);
+    s->pool->inside = 0;
+    if (!h)
+        return 0;
+    MoveHHi(h);
+    HLock(h);
+    unsigned long b = (unsigned long)*h;
+    unsigned long lo = (b + kPage - 1) & kPageMask;
+    unsigned long hi = (b + csize + kPage) & kPageMask;
+    if (hi > kSpanHi || (s->kcb && (hi >> 12) > s->kcb->entries)) {
+        DisposeHandle(h);
+        return 0;
+    }
+    THz z = (THz)(lo + 16);
+    THz old = GetZone();
+    InitZone(NULL, kChunkMasters, (Ptr)hi, z); /* makes z current */
+    SetZone(old);
+    unsigned long *sig = (unsigned long *)lo;
+    sig[0] = kChunkSig;
+    sig[1] = (unsigned long)z;
+
+    Chunk *c = &s->chunks[slot];
+    c->domain = d;
+    c->handle = h;
+    c->block = b;
+    c->lo = lo;
+    c->hi = hi;
+    c->zone = (unsigned long)z;
+    c->handles = 0;
+    c->keep = !kept && csize == kChunkMin;
+    mark(s, lo, hi, owner_code(s, d));
+    c->live = 1;
+    if (d != s->cur)
+        protect(s, d, lo, hi - lo);
+    s->pc.chunks_made++;
+    return c;
+}
+
+/* TempNewHandle, from the _OSDispatch stub. frame is the 68k stack at the
+   stub: the return address, the selector (a word), the OSErr pointer, the
+   size, then the function result. Returns 0 when it has stored the
+   result (the stub then returns to the caller), or 1 to pass the call on
+   to the Process Manager. */
+static long pool_new(unsigned long frame)
+{
+    State *s = g_state;
+    if (!s || !s->running || !s->kcb || !s->pool)
+        return 1;
+    unsigned char *f = (unsigned char *)frame;
+    OSErr *res = (OSErr *)get32(f + 6);
+    long size = (long)get32(f + 10);
+    sweep(s);
+    int d = domain_of_zone(s, current_zone());
+    if (d < 0)
+        d = add_current(s);
+    if (size < 0 || d < 0 || d == s->sys_dom || s->domains[d].dying) {
+        s->pc.passed++;
+        return 1;
+    }
+    Handle h = 0;
+    Chunk *c = 0;
+    for (int i = 0; i < kMaxChunks && !h; i++) {
+        c = &s->chunks[i];
+        if (c->live && c->domain == d)
+            h = chunk_alloc(c, size);
+    }
+    if (!h) {
+        c = new_chunk(s, d, size);
+        if (c)
+            h = chunk_alloc(c, size);
+    }
+    if (!h) {
+        s->pc.passed++;
+        return 1;
+    }
+    c->handles++;
+    s->pc.news++;
+    put32(f + 14, (unsigned long)h);
+    if (res)
+        *res = noErr;
+    return 0;
+}
+
+/* After DisposeHandle of a handle in a chunk (the zone at zone), from its
+   stub; err is DisposeHandle's result. Frees the chunk when it is empty,
+   not kept, and the caller is its owner. */
+static void pool_disposed(unsigned long zone, long err)
+{
+    State *s = g_state;
+    if (!s || !s->running || (short)err)
+        return;
+    for (int i = 0; i < kMaxChunks; i++) {
+        Chunk *c = &s->chunks[i];
+        if (!c->live || c->zone != zone)
+            continue;
+        s->pc.disposed++;
+        if (c->handles)
+            c->handles--;
+        if (c->handles || c->keep ||
+            domain_of_zone(s, current_zone()) != c->domain)
+            return;
+        Handle h = c->handle;
+        drop_chunk(s, c);
+        s->pc.chunks_freed++;
+        DisposeHandle(h);
+        return;
+    }
+}
+
+/* ExitToShell, from its stub, in the quitting application's context:
+   drop its domain and chunks before the Process Manager frees them. */
+static void pool_quit(void)
+{
+    State *s = g_state;
+    if (!s || !s->running)
+        return;
+    int d = domain_of_zone(s, current_zone());
+    if (d < 0 || d == s->sys_dom)
+        return;
+    drop_domain(s, d, 1);
+    s->pc.quits++;
+}
+
+/* Install the stubs, disabled. The stubs, as assembled:
+
+   _OSDispatch:
+     00 tst.w   enabled          ; off: pass
+     06 beq.s   30
+     08 tst.w   inside           ; the engine's own call: pass
+     0E bne.s   30
+     10 cmpi.w  #$001D,4(sp)     ; not TempNewHandle: pass
+     16 bne.s   30
+     18 pea     (sp)             ; pool_new(frame)
+     1A movea.l #rd_new,a0
+     20 jsr     (a0)
+     22 addq.l  #4,sp
+     24 tst.l   d0
+     26 bne.s   30
+     28 movea.l (sp)+,a0         ; taken: drop the selector and arguments
+     2A lea     10(sp),sp
+     2E jmp     (a0)
+     30 move.l  osd_old,-(sp)
+     36 rts
+
+   DisposeHandle (A0 the handle; the trap dispatcher keeps A1, D1, D2):
+     00 tst.w   enabled
+     06 beq.s   4E
+     08 move.l  a0,d2            ; no handle, or an empty one: pass
+     0A beq.s   4E
+     0C movea.l d2,a1
+     0E move.l  (a1),d2
+     10 beq.s   4E
+     12 movea.l d2,a1
+     14 move.l  a0,d2
+     16 sub.l   -4(a1),d2        ; its zone: handle - relative handle
+     1A movea.l d2,a1
+     1C cmpi.l  #'EnfT',-16(a1)  ; not a chunk's zone: pass
+     24 bne.s   4E
+     26 cmpa.l  -12(a1),a1
+     2A bne.s   4E
+     2C move.l  a1,-(sp)         ; dispose, then pool_disposed(zone, d0)
+     2E movea.l dh_old,a1
+     34 jsr     (a1)
+     36 move.l  d0,-(sp)
+     38 move.l  4(sp),-(sp)
+     3C movea.l #rd_disposed,a1
+     42 jsr     (a1)
+     44 addq.l  #4,sp
+     46 move.l  (sp)+,d0
+     48 addq.l  #4,sp
+     4A tst.w   d0
+     4C rts
+     4E move.l  dh_old,-(sp)
+     54 rts
+
+   _ExitToShell:
+     00 tst.w   enabled
+     06 beq.s   10
+     08 movea.l #rd_quit,a0      ; pool_quit()
+     0E jsr     (a0)
+     10 move.l  ets_old,-(sp)
+     16 rts
+*/
+static PoolStubs *pool_install(void)
+{
+    PoolStubs *p = (PoolStubs *)NewPtrSysClear(sizeof(PoolStubs));
+    UniversalProcPtr un = NewRoutineDescriptor((ProcPtr)pool_new,
+                                               kPoolNewInfo, kPowerPCISA);
+    UniversalProcPtr ud = NewRoutineDescriptor((ProcPtr)pool_disposed,
+                                               kPoolDisposedInfo, kPowerPCISA);
+    UniversalProcPtr uq = NewRoutineDescriptor((ProcPtr)pool_quit,
+                                               kPoolQuitInfo, kPowerPCISA);
+    if (!p || !un || !ud || !uq) {
+        if (p)
+            DisposePtr((Ptr)p);
+        return 0;
+    }
+    PoolStubs t;
+    memset(&t, 0, sizeof t);
+    t.magic = kPoolMagic;
+    BlockMoveData(un, &t.rd_new, sizeof(RoutineDescriptor));
+    BlockMoveData(ud, &t.rd_disposed, sizeof(RoutineDescriptor));
+    BlockMoveData(uq, &t.rd_quit, sizeof(RoutineDescriptor));
+    DisposeRoutineDescriptor(un);
+    DisposeRoutineDescriptor(ud);
+    DisposeRoutineDescriptor(uq);
+    /* The trap table must be where the engine writes it. */
+    volatile unsigned long *osd_e = trap_entry(_OSDispatch);
+    volatile unsigned long *dh_e = trap_entry(_DisposeHandle);
+    volatile unsigned long *ets_e = trap_entry(_ExitToShell);
+    t.osd_old = *osd_e;
+    t.dh_old = *dh_e;
+    t.ets_old = *ets_e;
+    if (t.osd_old != (unsigned long)NGetTrapAddress(_OSDispatch,
+                                                    kToolboxTrapType) ||
+        t.dh_old != (unsigned long)NGetTrapAddress(_DisposeHandle,
+                                                   kOSTrapType) ||
+        t.ets_old != (unsigned long)NGetTrapAddress(_ExitToShell,
+                                                    kToolboxTrapType)) {
+        DisposePtr((Ptr)p);
+        return 0;
+    }
+
+    /* Addresses in the block the stubs run from. */
+    unsigned long en = (unsigned long)&p->enabled;
+    unsigned long in = (unsigned long)&p->inside;
+    unsigned long oo = (unsigned long)&p->osd_old;
+    unsigned long dold = (unsigned long)&p->dh_old;
+    unsigned long eo = (unsigned long)&p->ets_old;
+    unsigned long rn = (unsigned long)&p->rd_new;
+    unsigned long rd = (unsigned long)&p->rd_disposed;
+    unsigned long rq = (unsigned long)&p->rd_quit;
+    const unsigned short osd[kPoolOsd] = {
+        0x4A79, HI16(en), LO16(en), 0x6728,
+        0x4A79, HI16(in), LO16(in), 0x6620,
+        0x0C6F, 0x001D, 0x0004, 0x6618,
+        0x4857, 0x207C, HI16(rn), LO16(rn), 0x4E90, 0x588F,
+        0x4A80, 0x6608,
+        0x205F, 0x4FEF, 0x000A, 0x4ED0,
+        0x2F39, HI16(oo), LO16(oo), 0x4E75};
+    const unsigned short dh[kPoolDh] = {
+        0x4A79, HI16(en), LO16(en), 0x6746,
+        0x2408, 0x6742, 0x2242, 0x2411, 0x673C,
+        0x2242, 0x2408, 0x94A9, 0xFFFC, 0x2242,
+        0x0CA9, 0x456E, 0x6654, 0xFFF0, 0x6628,
+        0xB3E9, 0xFFF4, 0x6622,
+        0x2F09, 0x2279, HI16(dold), LO16(dold), 0x4E91,
+        0x2F00, 0x2F2F, 0x0004, 0x227C, HI16(rd), LO16(rd), 0x4E91,
+        0x588F, 0x201F, 0x588F, 0x4A40, 0x4E75,
+        0x2F39, HI16(dold), LO16(dold), 0x4E75};
+    const unsigned short ets[kPoolEts] = {
+        0x4A79, HI16(en), LO16(en), 0x6708,
+        0x207C, HI16(rq), LO16(rq), 0x4E90,
+        0x2F39, HI16(eo), LO16(eo), 0x4E75};
+    memcpy(t.osd, osd, sizeof osd);
+    memcpy(t.dh, dh, sizeof dh);
+    memcpy(t.ets, ets, sizeof ets);
+    BlockMove(&t, p, sizeof t); /* flushes the code caches */
+    *osd_e = (unsigned long)p->osd;
+    *dh_e = (unsigned long)p->dh;
+    *ets_e = (unsigned long)p->ets;
+    return p;
+}
+
+/* Put back a stub that the Process Manager has taken out of the table (it
+   holds the stub's own next routine again). Interrupt time. */
+static void pool_keep(State *s)
+{
+    PoolStubs *p = s->pool;
+    if (!p || !p->enabled)
+        return;
+    volatile unsigned long *e = trap_entry(_OSDispatch);
+    if (*e == p->osd_old) {
+        *e = (unsigned long)p->osd;
+        s->pc.reinstalled++;
+    }
+    e = trap_entry(_DisposeHandle);
+    if (*e == p->dh_old) {
+        *e = (unsigned long)p->dh;
+        s->pc.reinstalled++;
+    }
+    e = trap_entry(_ExitToShell);
+    if (*e == p->ets_old) {
+        *e = (unsigned long)p->ets;
+        s->pc.reinstalled++;
+    }
+}
+
+/* Disable the stubs and take out those still first in their traps. The
+   block stays (engine.h). */
+static void pool_remove(State *s)
+{
+    PoolStubs *p = s->pool;
+    if (!p)
+        return;
+    p->enabled = 0;
+    s->pool = 0;
+    volatile unsigned long *e = trap_entry(_ExitToShell);
+    if (*e == (unsigned long)p->ets)
+        *e = p->ets_old;
+    e = trap_entry(_DisposeHandle);
+    if (*e == (unsigned long)p->dh)
+        *e = p->dh_old;
+    e = trap_entry(_OSDispatch);
+    if (*e == (unsigned long)p->osd)
+        *e = p->osd_old;
 }
 
 void engine_set_mode(State *s, unsigned long mode)
@@ -1252,6 +1781,18 @@ long engine_start(State **out, unsigned long mode, const char *name)
             s->h68k->frame = 0x6806E300;
     }
     kcb_start(s);
+    {
+        long vm = 0;
+        s->vm = Gestalt(gestaltVMAttr, &vm) == noErr &&
+                (vm & gestaltVMPresent);
+        /* The Process Manager's zone, from a handle of its own. */
+        OSErr e = noErr;
+        Handle t = TempNewHandle(4, &e);
+        if (t) {
+            s->pm_zone = (unsigned long)HandleZone(t);
+            DisposeHandle(t);
+        }
+    }
     s->seen[kSrc68k] = s->h68k->count_handled;
     s->seen[kSrcNative] = s->hnat->count_handled;
     /* For tools/xlog-read.py. */
@@ -1280,6 +1821,13 @@ long engine_start(State **out, unsigned long mode, const char *name)
 
     refresh_domains(s);
     engine_set_mode(s, mode);
+    /* Temporary memory pools, with the kernel's owner check only: the
+       hooks' current range is the partition alone. */
+    if (s->kcb) {
+        s->pool = pool_install();
+        if (s->pool)
+            s->pool->enabled = 1;
+    }
     *out = s;
     return 0;
 }
@@ -1288,6 +1836,7 @@ void engine_poll(State *s)
 {
     if (!s->running)
         return;
+    sweep(s);
     refresh_domains(s);
     if (s->want_mode != s->mode)
         engine_set_mode(s, s->want_mode);
@@ -1300,6 +1849,9 @@ void engine_stop(State *s)
 {
     if (!s->running)
         return;
+    /* No more chunks. Those made stay with their applications, as
+       ordinary temporary memory. */
+    pool_remove(s);
     /* Stop denying and protecting, stop the tick, take what the rings
        hold, then open everything before the hooks stop managing it. */
     set_deny(s, kModeOff);
