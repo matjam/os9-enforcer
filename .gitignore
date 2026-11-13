@@ -1,14 +1,11 @@
-# Only our own sources, scripts and patches are tracked. Third-party trees
-# are fetched and built by scripts (qemu/build.sh) or cloned (see "Reference
-# sources" in the README).
+# Only our own scripts and patches are tracked. Third-party trees are
+# fetched and built by scripts (qemu/build.sh) or cloned (see "Reference
+# sources" in the README). The Mac programs are in os9-enforcer.
 
 /disks/
 /media/
-# run/ holds guest logs, screenshots, sockets and memory dumps; keep only
-# the scripts in it.
-/run/*
-!/run/*.sh
-!/run/*.py
+# run/ holds guest logs, screenshots, sockets and memory dumps.
+/run/
 # qemu/build.sh downloads the release tarball, unpacks and patches it in
 # qemu/src, and builds in qemu/build.
 /qemu/src/
@@ -17,12 +14,6 @@
 /qemu/*.tar.*
 /toolchain/
 /refs/
-/probe/build/
-/wlog/build*/
-/h68k/build/
-/xlog/build/
-/scribble/build/
-/enforcer/build/
 /tools/storewatch/build/
 
 __pycache__/
