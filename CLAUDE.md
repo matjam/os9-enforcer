@@ -6,9 +6,9 @@ learned on the way.
 
 ## Conventions
 
-- The test machine (QEMU), its disks, the Retro68 toolchain and the tools
-  that drive the guest are in `os9-protect`, next to this repository.
-  Scripts here find it through `OS9_PROTECT` (default `../os9-protect`).
+- The test machine (QEMU), its disks and the tools that drive the guest
+  are in `os9-protect`, next to this repository. Scripts here find it
+  through `OS9_PROTECT` (default `../os9-protect`).
 - Commit each working step to `main`. There is no remote.
 - Commit only our own sources, scripts and patches. Apple's files stay out
   of git: `kernel/stock/` and `kernel/build/` are ignored, and the
@@ -26,6 +26,24 @@ in its `build/` folder. The `enforcer/` build also needs Python 3.
 
 `common/hooks.cmake` (`hooks_embed`) assembles the write hooks into each
 engine program and links DriverServicesLib.
+
+The toolchain is Retro68's PowerPC toolchain (GCC 16, Multiversal
+Interfaces). `toolchain/find.sh` picks one for `build.sh`,
+`kernel/build.sh` and `tools/make-dist.sh`, in this order:
+1. `RETRO68`, if set;
+2. `toolchain/build/toolchain`, built by `toolchain/build.sh` from the
+   `toolchain/Retro68` submodule;
+3. os9-protect's.
+
+The submodule is pinned to the commit os9-protect's toolchain was built
+from (a4a389c41). To move it, check out the new commit in
+`toolchain/Retro68`, commit the submodule, and rebuild both toolchains.
+
+`tools/make-dist.sh` puts the three programs users install, and an HFS
+image holding them, in `dist/`. `.github/workflows/build.yml` builds the
+toolchain, every program and `dist/` on each push, and keeps `dist/` as
+the artifact "Enforcer". It caches the toolchain under the submodule
+commit and the hash of `toolchain/build.sh`; either change rebuilds it.
 
 ## Test machine
 

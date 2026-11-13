@@ -122,15 +122,53 @@ Compatibility:
 
 ## Building
 
-The programs build with the Retro68 PowerPC toolchain from the
-`os9-protect` repository, next to this one. To build all of them, run:
+Enforcer builds with Retro68's PowerPC toolchain, which this repository
+builds from source: Retro68 is a Git submodule in `toolchain/Retro68`.
+The build needs no Apple files.
+
+To install the packages the toolchain needs on macOS, run:
+
+```bash
+brew install boost cmake ninja gmp mpfr libmpc bison texinfo
+```
+
+On Debian or Ubuntu, run:
+
+```bash
+sudo apt-get install cmake ninja-build g++ libgmp-dev libmpfr-dev libmpc-dev libboost-all-dev bison flex texinfo ruby python3
+```
+
+To build the toolchain, run this once. It fetches the submodule and builds
+into `toolchain/build`:
+
+```bash
+toolchain/build.sh
+```
+
+To build the programs, run:
 
 ```bash
 ./build.sh
 ```
 
-Each program builds a MacBinary `.bin` in its `build/` folder.
-`CLAUDE.md` describes the test machine, the tests and the kernel work.
+To collect Enforcer Installer, the Enforcer Extension and the Enforcer
+control panel in `dist/`, run:
+
+```bash
+tools/make-dist.sh
+```
+
+`dist/` holds each program as a MacBinary `.bin` file, and all three on
+the HFS disk image `Enforcer.dsk`, for an emulator. Keep the three
+programs in one folder: the installer copies the other two from its own
+folder.
+
+To use a Retro68 toolchain you already have, set `RETRO68` to its folder
+(the one that holds `bin/`).
+
+GitHub Actions builds every push and keeps `dist/` as the artifact
+"Enforcer". `CLAUDE.md` describes the test machine, the tests and the
+kernel work.
 
 | Directory | What it is |
 |---|---|
@@ -144,4 +182,5 @@ Each program builds a MacBinary `.bin` in its `build/` folder.
 | `h68k/` | H68KTest: tests for both write hooks |
 | `wlog/` | WLog: the first write logger |
 | `probe/` | Probe: the first page protection experiment |
+| `toolchain/` | Retro68 (a submodule) and the scripts that build and find its toolchain |
 | `tools/` | Host scripts: read the engine's state and the guest's memory, build helpers |
