@@ -27,15 +27,23 @@ enum { kTimerMs = 16, kBusErrorVector = 0x08 };
 /* SysPages.flags */
 enum { kPageExcluded = 1, kPageHot = 2, kPageCooled = 4 };
 
-/* The bitmap covers the whole blue area, one bit per page. */
+/* The bitmap covers logical memory up to 2 GB, one bit per page: Mac OS 9
+   uses up to 1.5 GB of RAM, from 0, and the Process Manager places
+   applications from the top of it down. */
 #define kSpanLo 0UL
-#define kSpanHi 0x40000000UL
+#define kSpanHi 0x80000000UL
+/* With virtual memory on, how far above logical RAM the owner table goes:
+   the Code Fragment Manager maps code files there (engine.h, kCodeOwned). */
+#define kMappedSpan 0x10000000UL
 #define kBitmapBytes ((kSpanHi - kSpanLo) / kPage / 8)
 #define kPageMask (~(unsigned long)(kPage - 1))
 
 static State *g_state;
 static ExceptionHandler g_prev;
 static InstallFn g_sys_install;
+/* The program's own ExitToShell patch (self_exit) and the routine it
+   chains to. */
+static UniversalProcPtr g_exit_rd, g_exit_old;
 
 static inline volatile void *lowmem(unsigned long addr)
 {
@@ -1523,17 +1531,67 @@ static void pool_disposed(unsigned long zone, long err)
 }
 
 /* ExitToShell, from its stub, in the quitting application's context:
-   drop its domain and chunks before the Process Manager frees them. */
+   drop its domain and chunks before the Process Manager frees them. When
+   the quitting application is the program running the engine and it did
+   not call engine_stop (it crashed), stop the engine: the timer, the
+   handler and the stubs call its code, which is freed next. */
 static void pool_quit(void)
 {
     State *s = g_state;
     if (!s || !s->running)
         return;
-    int d = domain_of_zone(s, current_zone());
+    unsigned long zone = current_zone();
+    if (zone >= s->my_lo && zone < s->my_hi) {
+        engine_stop(s);
+        return;
+    }
+    if (!s->pool || !s->pool->enabled)
+        return;
+    int d = domain_of_zone(s, zone);
     if (d < 0 || d == s->sys_dom)
         return;
     drop_domain(s, d, 1);
     s->pc.quits++;
+}
+
+/* The program running the engine quits without engine_stop (it crashed):
+   stop the engine before the Process Manager frees the program's code,
+   which the timer, the handler and the stubs call.
+ *
+ * This is the program's own patch of _ExitToShell, made with
+ * NSetTrapAddress, so the Process Manager puts it in the trap table
+ * whenever the program is current. The engine's pool stub cannot be relied
+ * on here: the Process Manager can put another routine in the trap table
+ * when the program becomes current, and the timer puts the stub back only
+ * on its next tick (Scribble X: the program's ExitToShell, called right
+ * after a switch, went around the stub). */
+enum { kExitInfo = 0 }; /* pascal void (void) */
+
+static pascal void self_exit(void)
+{
+    State *s = g_state;
+    unsigned long zone = current_zone();
+    if (s && s->running && zone >= s->my_lo && zone < s->my_hi)
+        engine_stop(s);
+    CallUniversalProc(g_exit_old, kExitInfo); /* never returns */
+}
+
+static void self_exit_install(void)
+{
+    g_exit_rd = NewRoutineDescriptor((ProcPtr)self_exit, kExitInfo,
+                                     kPowerPCISA);
+    if (!g_exit_rd)
+        return;
+    g_exit_old = NGetTrapAddress(_ExitToShell, kToolboxTrapType);
+    NSetTrapAddress(g_exit_rd, _ExitToShell, kToolboxTrapType);
+}
+
+/* In the program's own context. */
+static void self_exit_remove(void)
+{
+    if (g_exit_rd &&
+        NGetTrapAddress(_ExitToShell, kToolboxTrapType) == g_exit_rd)
+        NSetTrapAddress(g_exit_old, _ExitToShell, kToolboxTrapType);
 }
 
 /* An application's native code (engine.h, kCodeOwned) ------------------ */
@@ -1970,7 +2028,7 @@ static void pool_launch(void)
      54 rts
 
    _ExitToShell:
-     00 tst.w   enabled
+     00 tst.w   quit_hook
      06 beq.s   10
      08 movea.l #rd_quit,a0      ; pool_quit()
      0E jsr     (a0)
@@ -2069,8 +2127,9 @@ static PoolStubs *pool_install(void)
         0x2F00, 0x2F2F, 0x0004, 0x227C, HI16(rd), LO16(rd), 0x4E91,
         0x588F, 0x201F, 0x588F, 0x4A40, 0x4E75,
         0x2F39, HI16(dold), LO16(dold), 0x4E75};
+    unsigned long qh = (unsigned long)&p->quit_hook;
     const unsigned short ets[kPoolEts] = {
-        0x4A79, HI16(en), LO16(en), 0x6708,
+        0x4A79, HI16(qh), LO16(qh), 0x6708,
         0x207C, HI16(rq), LO16(rq), 0x4E90,
         0x2F39, HI16(eo), LO16(eo), 0x4E75};
     memcpy(t.osd, osd, sizeof osd);
@@ -2122,7 +2181,7 @@ static void remove_one(volatile unsigned long *e, unsigned long old,
 static void pool_keep(State *s)
 {
     PoolStubs *p = s->pool;
-    if (!p || !p->enabled)
+    if (!p) /* disabled stubs pass every call on */
         return;
     keep_one(s, trap_entry(_OSDispatch), p->osd_old, p->osd);
     keep_one(s, trap_entry(_DisposeHandle), p->dh_old, p->dh);
@@ -2137,6 +2196,7 @@ static void pool_remove(State *s)
     if (!p)
         return;
     p->enabled = 0;
+    p->quit_hook = 0;
     s->pool = 0;
     remove_one(lowmem(kGNEFilter), p->gne_old, p->gne);
     remove_one(trap_entry(_ExitToShell), p->ets_old, p->ets);
@@ -2152,6 +2212,11 @@ void engine_set_mode(State *s, unsigned long mode)
     s->want_mode = mode;
     if (mode == old)
         return;
+    /* Off leaves temporary memory as Mac OS has it: new handles come from
+       the Process Manager again. Chunks already made stay with their
+       applications. */
+    if (s->pool)
+        s->pool->enabled = mode != kModeOff;
     if (mode == kModeOff) {
         /* After mode is off, the timer protects nothing, so every page
            opened here stays open. */
@@ -2178,15 +2243,15 @@ static void kcb_start(State *s)
     /* One byte per page of logical RAM, inside the bitmap's span; a table
        page covers kPage pages. (MemTop is no use: on 9.2.2 it ends a
        little above the system heap, below the applications.) */
-    long ram = 0;
-    if (Gestalt(gestaltLogicalRAMSize, &ram) || ram <= 0 ||
-        (unsigned long)ram > kSpanHi)
-        ram = kSpanHi;
-    /* With virtual memory on, the Code Fragment Manager maps code files
-       above logical RAM (engine.h, kCodeOwned): cover the whole span. */
+    long lram = 0;
+    unsigned long ram = kSpanHi;
+    if (Gestalt(gestaltLogicalRAMSize, &lram) == noErr && lram > 0)
+        ram = (unsigned long)lram;
     if (s->vm)
+        ram = ram < kSpanHi - kMappedSpan ? ram + kMappedSpan : kSpanHi;
+    if (ram > kSpanHi)
         ram = kSpanHi;
-    unsigned long entries = (unsigned long)ram >> 12;
+    unsigned long entries = (ram + kPage - 1) >> 12;
     unsigned long most = (unsigned long)kKcbTablePages * kPage;
     if (entries > most)
         entries = most;
@@ -2417,9 +2482,13 @@ long engine_start(State **out, unsigned long mode, const char *name)
        hooks' current range is the partition alone. */
     if (s->kcb) {
         s->pool = pool_install();
-        if (s->pool)
-            s->pool->enabled = 1;
+        if (s->pool) {
+            s->pool->enabled = s->mode != kModeOff;
+            s->pool->quit_hook = 1;
+        }
     }
+    /* After the pool stubs: the patch goes on to them. */
+    self_exit_install();
     *out = s;
     return 0;
 }
@@ -2470,6 +2539,7 @@ void engine_stop(State *s)
     }
     s->sys_on = 0;
     kcb_stop(s);
+    self_exit_remove();
     g_sys_install(g_prev);
     hold_all(s, 0);
 

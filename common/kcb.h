@@ -5,10 +5,10 @@
  *
  * The engine allocates the block (16 KB, page aligned, physically
  * contiguous) and an owner table (one byte per 4 KB page of logical memory,
- * from 0 to MemTop), puts the physical address of each table page in
+ * from 0 up to 2 GB), puts the physical address of each table page in
  * pages[], and registers the block's physical address with MP call 109. A
- * kernel without patch 4 has no call 109 and returns an error, and the
- * engine runs on its hooks alone.
+ * kernel without patch 4 has no call 109 and returns an error, and a kernel
+ * with another version of the block returns paramErr.
  *
  * With the block registered and mode kKcbLog or kKcbEnforce, the kernel
  * decides each store to a write-protected page whose owner byte is not 0,
@@ -27,10 +27,10 @@
 
 enum {
     kKcbMagic = 'ENFK',
-    kKcbVersion = 1,
+    kKcbVersion = 2,          /* 1: 64 table pages and 496 events */
     kKcbSize = 0x4000,
-    kKcbRing = 496,
-    kKcbTablePages = 64,      /* 64 pages of 4096 entries: 1 GB */
+    kKcbRing = 488,
+    kKcbTablePages = 128,     /* 128 pages of 4096 entries: 2 GB */
     kKcbFrameLen = 0x70,
     kMPEnforcer = 109
 };
@@ -88,7 +88,7 @@ _Static_assert(offsetof(KernelCB, frame) == 0x1C, "CB_FRAME");
 _Static_assert(offsetof(KernelCB, self) == 0x30, "CB_SELF");
 _Static_assert(offsetof(KernelCB, skipped) == 0x34, "CB_SKIPPED");
 _Static_assert(offsetof(KernelCB, pages) == 0x100, "CB_PAGES");
-_Static_assert(offsetof(KernelCB, ring) == 0x200, "CB_RING");
+_Static_assert(offsetof(KernelCB, ring) == 0x300, "CB_RING");
 _Static_assert(sizeof(KEvent) == 32, "event size");
 _Static_assert(sizeof(KernelCB) == kKcbSize, "block size");
 

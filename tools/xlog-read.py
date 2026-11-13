@@ -44,7 +44,7 @@ MAX_CHUNKS = 128
 KCB = ["magic", "version", "mode", "current", "entries", "denied_page",
        "seq", "frame", "allowed", "logged", "denied", "bail", "self",
        "skipped"]
-KCB_RING, KCB_RING_N, KCB_EVENTS = 0x200, 496, 12
+KCB_RING, KCB_RING_N, KCB_EVENTS = 0x300, 488, 12
 EVF = [(1, "68k"), (2, "task"), (4, "offense"), (8, "denied"),
        (16, "skipped")]
 STOPPER = ["magic", "old_vector", "zone"] + ["stops_" + s for s in

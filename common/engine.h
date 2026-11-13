@@ -250,6 +250,10 @@ typedef struct {
     unsigned long gne_old;
     RoutineDescriptor rd_launch;
     unsigned short gne[kPoolGne];
+    /* The ExitToShell stub calls the engine while this is set: from
+       engine_start to engine_stop, pools on or off, so the engine stops
+       when the program running it quits without engine_stop (a crash). */
+    volatile unsigned short quit_hook;
 } PoolStubs;
 
 typedef struct {

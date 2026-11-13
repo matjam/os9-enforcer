@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.15)
 project(Scribble C CXX)
 
 # Build with the Retro68 PowerPC toolchain from os9-protect: ./build.sh scribble
-add_application(Scribble scribble.c CONSOLE)
+add_application(Scribble scribble.c scribble.r CONSOLE)
 target_compile_options(Scribble PRIVATE -O2 -Wall)
 # engine.h and hook.h, for the trap timing test (it reads Enforcer's state).
 target_include_directories(Scribble PRIVATE ../common)

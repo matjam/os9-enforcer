@@ -133,6 +133,13 @@ static void status_text(const Engine *e, Str255 out)
     case kStatusCode:
         if (e->value == kEnforcerVMOn) {
             add(out, "Virtual memory is on. Turn it off and restart.");
+        } else if (e->value == kEnforcerNoKernel) {
+            add(out, "Enforcer is off: the Mac OS ROM file is not patched. "
+                     "Open Enforcer Installer and click Install.");
+        } else if (e->value == kEnforcerOtherKernel) {
+            add(out, "Enforcer is off: the Mac OS ROM file has another "
+                     "version's patch. Open Enforcer Installer and click "
+                     "Install.");
         } else {
             add(out, "Enforcer could not start (error ");
             add_num(out, kEnforcerFailed - e->value);
@@ -265,9 +272,6 @@ static void draw_footer(const Engine *e)
         add(s, " stopped, ");
         add_num(s, k->skipped);
         add(s, " blocked");
-    } else if (e->s->kcb_err == -4) {
-        add(s, "NanoKernel not patched: writes by Multiprocessing tasks "
-               "are not checked");
     } else {
         add(s, "NanoKernel owner check off (error ");
         add_num(s, e->s->kcb_err);

@@ -229,6 +229,19 @@ static int all_zero(const unsigned char *p, size_t n)
     return 1;
 }
 
+/* Every release of Enforcer's kernel patch checks the control block's
+   magic with `lis r17,'EN'` and `ori r17,r17,'FK'` (enf_register in
+   kernel/nanokernel.s). Apple's kernels have no such pair. */
+static int has_mark(const unsigned char *k, size_t n)
+{
+    static const unsigned char mark[8] = {0x3E, 0x20, 0x45, 0x4E,
+                                          0x62, 0x31, 0x46, 0x4B};
+    for (size_t i = 0; i + sizeof mark <= n; i += 4)
+        if (!memcmp(k + i, mark, sizeof mark))
+            return 1;
+    return 0;
+}
+
 int rom_open(Rom *rom, const unsigned char *data, size_t len)
 {
     const unsigned char *end_tag, *p, *child;
@@ -341,6 +354,8 @@ int rom_open(Rom *rom, const unsigned char *data, size_t len)
             rom->kernel = kKernelStock;
         else if (crc32_of(k, KPATCH_SIZE) == KPATCH_CRC)
             rom->kernel = kKernelPatched;
+        else if (has_mark(k, KPATCH_SIZE))
+            rom->kernel = kKernelOther;
     }
     return kRomOK;
 }

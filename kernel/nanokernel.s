@@ -65,7 +65,8 @@ kernel:
 # registers with MP call 109, by its physical address. Keep common/kcb.h in
 # step.
         .set    CB_MAGIC, 0x000                 # 'ENFK'
-        .set    CB_VERSION, 0x004               # 1
+        .set    CB_VERSION, 0x004               # 2
+        .set    VERSION, 2                      # the layout below
         .set    CB_MODE, 0x008                  # MODE_*
         .set    CB_CURRENT, 0x00C               # the current application's owner
         .set    CB_ENTRIES, 0x010               # pages the owner table covers
@@ -79,8 +80,9 @@ kernel:
         .set    CB_SELF, 0x030                  # the current application's own,
         .set    CB_SKIPPED, 0x034               # dropped
         .set    CB_PAGES, 0x100                 # owner table pages, physical
-        .set    CB_RING, 0x200                  # RING_N events of 32 bytes
-        .set    RING_N, 496                     # to the block's end
+                                                # (128 of them: 2 GB)
+        .set    CB_RING, 0x300                  # RING_N events of 32 bytes
+        .set    RING_N, 488                     # to the block's end
         .set    FRAME_LEN, 0x70                 # as common/hook.h kHookFrameLen
         .set    EV_SEQ, 0x00
         .set    EV_PC, 0x04
@@ -203,14 +205,19 @@ cpup_keep_writable:
 # protection violation (DSISR) outside the CPU plugin; anything else goes
 # on as before.
 #
-# Patch 3, with no control block registered or in MODE_PASS: the blue
-# task's store goes on to its hooks, as in the stock kernel, and another
-# task's store is allowed. A write fault in a task other than the blue
-# task does not reach the hooks (the kernel stops the task,
-# UnhandledDataFault), and MP tasks keep stacks and data in the system
-# heap. Each such open is counted in task_log: a count, three zero words,
-# then a ring of 16 entries (the task's PC, the address, the task's ID and
-# the new PTE's lower word).
+# With no control block registered, every store goes on to the fault path
+# as in the stock kernel.
+#
+# Patch 3, in MODE_PASS (the engine is off, or turning off): a store into a
+# page the engine owns (an owner byte that is not 0) is allowed in a task
+# other than the blue task; the blue task's goes on to its hooks. A write
+# fault in a task other than the blue task does not reach the hooks (the
+# kernel stops the task, UnhandledDataFault), and the engine may still
+# have such pages protected while it opens them. A page with no owner
+# (the ROM image, another program's protection) faults as in the stock
+# kernel. Each open is counted in task_log: a count, three zero words, then
+# a ring of 16 entries (the task's PC, the address, the task's ID and the
+# new PTE's lower word).
 #
 # Patch 4, with a control block registered (MP call 109, enf_register) in
 # MODE_LOG or MODE_ENFORCE: the kernel decides for every task. It looks up
@@ -283,11 +290,15 @@ tw_base:
         mflr    26                              # r26: tw_base, for the data
         lwz     31, enf_cb - tw_base(26)        # the control block, or 0
         cmpwi   31, 0
-        beq     2f
+        beq     fault                           # none: as the stock kernel
         lwz     9, CB_MODE(31)
         cmpwi   9, MODE_PASS
         bne     check
-2:      li      31, 0                           # patch 3
+        mr      8, 27                           # patch 3: the page's owner
+        bl      owner_of
+        cmpwi   8, 0
+        beq     fault                           # not the engine's page
+        li      31, 0
         andis.  9, 28, FLAG_BLUE
         bne     fault                           # the blue task: its hooks
         b       open                            # another task: allowed
@@ -501,7 +512,7 @@ enf_register:
         cmpw    16, 17
         bne     1f
         lwz     16, CB_VERSION(3)
-        cmpwi   16, 1
+        cmpwi   16, VERSION
         beq     2f
 1:      li      3, -50
         b       MPReturn

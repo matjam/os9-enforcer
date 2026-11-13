@@ -7,17 +7,20 @@
  * It publishes its state under the Gestalt selector 'Enfr' for the
  * Enforcer control panel. Values below 0x1000 are status codes, not a
  * state:
- *   kEnforcerVMOn      virtual memory is on, so it did not start (earlier
- *                      versions; this one runs with virtual memory);
- *   kEnforcerFailed+n  engine_start failed with error -n.
+ *   kEnforcerVMOn         virtual memory is on, so it did not start
+ *                         (earlier versions; this one runs with it);
+ *   kEnforcerNoKernel     the NanoKernel is not patched;
+ *   kEnforcerOtherKernel  the NanoKernel has another release's patch;
+ *   kEnforcerFailed+n     engine_start or the kernel's owner check failed
+ *                         with error -n.
+ * It runs only with the kernel's owner check registered: on the engine's
+ * hooks alone, a protected page can hang the machine (an lwarx/stwcx. loop)
+ * and a store into one kills an MP task.
  *
  * The mode (off, log only, enforce) and whether to watch the system heap
  * are kept in "Enforcer Preferences" in the Preferences folder. The control
  * panel requests a change through the state's want_mode and want_sys; this
- * program applies it and saves it. It watches the system heap (log only)
- * only when the NanoKernel's owner check is registered (State kcb): with
- * the stock kernel, protecting the system heap hangs the machine (README,
- * step 2).
+ * program applies it and saves it.
  *
  * When it stops an application, it posts a notification naming the
  * application, the one whose memory it tried to write into, and the
@@ -199,6 +202,16 @@ static pascal OSErr ae_ignore(const AppleEvent *e, AppleEvent *reply,
     return noErr;
 }
 
+/* For tests (Scribble X): quit at once, without engine_stop, the way a
+   crash ends this program. The engine's ExitToShell stub stops the engine
+   (pool_quit in common/engine.c). */
+static pascal OSErr ae_exit(const AppleEvent *e, AppleEvent *reply,
+                            int32_t refcon)
+{
+    ExitToShell();
+    return noErr;
+}
+
 static void install_ae(void)
 {
     AEEventHandlerUPP quit = NewAEEventHandlerUPP(ae_quit);
@@ -211,6 +224,8 @@ static void install_ae(void)
                           false);
     AEInstallEventHandler(kCoreEventClass, kAEPrintDocuments, ignore, 0,
                           false);
+    AEInstallEventHandler(kEnforcerExtCreator, kEnforcerExitEvent,
+                          NewAEEventHandlerUPP(ae_exit), 0, false);
 }
 
 int main(void)
@@ -219,12 +234,25 @@ int main(void)
 
     Prefs prefs = load_prefs();
     State *s;
-    long err = engine_start(&s, prefs.mode, "Enforcer");
+    long err = engine_start(&s, kModeOff, "Enforcer");
     if (err) {
         publish(kEnforcerFailed - err);
         return 0;
     }
-    if (prefs.sys && s->kcb)
+    /* Without the kernel's owner check, protecting other applications'
+       pages can hang the machine (an lwarx/stwcx. loop on a protected
+       page) and kills MP tasks that store into them. Run only with it. */
+    if (!s->kcb) {
+        long why = s->kcb_err;
+        engine_stop(s);
+        publish(why == paramErr ? kEnforcerOtherKernel
+                : why == kEngineNoMemory || why == kEngineNoArea
+                    ? kEnforcerFailed - why
+                    : kEnforcerNoKernel);
+        return 0;
+    }
+    engine_set_mode(s, prefs.mode);
+    if (prefs.sys)
         engine_set_sys(s, 1);
     s->want_sys = prefs.sys;
     publish((long)s);
@@ -242,18 +270,10 @@ int main(void)
             AEProcessAppleEvent(&ev);
         unsigned long now = TickCount();
         if (now - last_poll >= kPollTicks) {
-            /* With the stock kernel, keep the request (for the panel and
-               the preferences) but never watch the system heap. */
-            unsigned long want_sys = s->want_sys;
-            if (!s->kcb)
-                s->want_sys = 0;
             engine_poll(s);
-            unsigned long sys = s->kcb ? s->sys_on : want_sys;
-            if (!s->kcb)
-                s->want_sys = want_sys;
-            if (s->mode != saved_mode || sys != saved_sys) {
+            if (s->mode != saved_mode || s->sys_on != saved_sys) {
                 saved_mode = s->mode;
-                saved_sys = sys;
+                saved_sys = s->sys_on;
                 save_prefs(saved_mode, saved_sys);
             }
             last_poll = now;

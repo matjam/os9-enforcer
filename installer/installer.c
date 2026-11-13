@@ -260,6 +260,16 @@ static int find_rom(Setup *s)
     }
 }
 
+/* Whether the file spec names is program i: Enforcer's creator. The
+   installer replaces and removes only its own files, whatever their
+   names. */
+static int is_ours(const FSSpec *spec, int i)
+{
+    FInfo fi;
+    return FSpGetFInfo((FSSpec *)spec, &fi) == noErr &&
+           fi.fdCreator == kPrograms[i].creator;
+}
+
 /* Reads a Mac OS ROM file and says which kernel it has. */
 static int kernel_of(FSSpec *spec, int *rom_err)
 {
@@ -365,7 +375,7 @@ static void examine(Setup *s)
         (id = folder_id(&dir)) != 0 && s->have_rom &&
         FSMakeFSSpec(s->vref, id, s->rom.name, &s->backup) == noErr)
         s->have_backup = 1;
-    if (s->have_backup && s->kernel == kKernelUnknown) {
+    if (s->have_backup && s->kernel == kKernelOther) {
         int backup_err;
         s->older = kernel_of(&s->backup, &backup_err) == kKernelStock;
     }
@@ -388,7 +398,8 @@ static void examine(Setup *s)
             s->programs_here = 0;
         if (FindFolder(kOnSystemDisk, kPrograms[i].folder, false, &fv, &fd) ==
                 noErr &&
-            make_spec(fv, fd, kPrograms[i].name, &spec) == noErr)
+            make_spec(fv, fd, kPrograms[i].name, &spec) == noErr &&
+            is_ours(&spec, i))
             s->programs_installed = 1;
     }
 }
@@ -419,6 +430,12 @@ static void show(const Setup *s)
                  "original Mac OS ROM file and remove Enforcer, click "
                  "Remove.");
         can_install = 1;
+    } else if (s->kernel == kKernelOther) {
+        snprintf(text, sizeof text,
+                 "Your Mac OS ROM file has another release of Enforcer, "
+                 "but the folder \xD2%s\xD3 has no original Mac OS ROM file "
+                 "to update it from. Put the original from your Mac OS 9 "
+                 "CD there, then open this installer again.", kBackupName);
     } else {
         snprintf(text, sizeof text,
                  "Enforcer cannot be installed on this Mac: its Mac OS ROM "
@@ -488,7 +505,7 @@ static OSErr swap_in(Setup *s, FSSpec *tmp)
     if (err)
         return err;
     if (FSMakeFSSpec(s->vref, id, s->rom.name, &old) == noErr) {
-        err = FSpDelete(&old); /* an older backup */
+        err = move_to_trash(&old); /* an older backup */
         if (err)
             return err;
     }
@@ -518,6 +535,8 @@ static OSErr copy_program(const Setup *s, int i)
         return err;
     err = make_spec(fv, fd, kPrograms[i].name, &dst);
     if (err == noErr) {
+        if (!is_ours(&dst, i))
+            return dupFNErr; /* another program's file has the name */
         err = FSpDelete(&dst);
         if (err == fBsyErr) /* running: Mac OS has it open */
             err = move_to_trash(&dst);
@@ -603,6 +622,13 @@ static int install(Setup *s)
     for (i = 0; i < kNPrograms; i++) {
         set_text(kStatus, "Installing %s.", kPrograms[i].name);
         oe = copy_program(s, i);
+        if (oe == dupFNErr) {
+            set_text(kStatus, "Enforcer could not install %s: a file of "
+                              "another program has that name. Rename it, "
+                              "then click Install again.",
+                     kPrograms[i].name);
+            return 0;
+        }
         if (oe) {
             set_text(kStatus, "Enforcer could not install %s (error %d).",
                      kPrograms[i].name, (int)oe);
@@ -622,7 +648,10 @@ static int remove_enforcer(Setup *s)
     OSErr oe;
     int rom_err, i;
 
-    if (s->have_backup && s->kernel != kKernelStock) {
+    /* Only a Mac OS ROM file Enforcer patched is replaced: another one
+       (Apple's own, newer) stays, whatever is in the backup. */
+    if (s->have_backup &&
+        (s->kernel == kKernelPatched || s->kernel == kKernelOther)) {
         if (kernel_of(&s->backup, &rom_err) != kKernelStock) {
             set_text(kStatus, "The Mac OS ROM file in \xD2%s\xD3 is not the "
                               "original, so Enforcer did not put it back.",
@@ -663,7 +692,7 @@ static int remove_enforcer(Setup *s)
         short fv;
         long fd;
         if (FindFolder(kOnSystemDisk, kPrograms[i].folder, false, &fv, &fd) ||
-            make_spec(fv, fd, kPrograms[i].name, &spec))
+            make_spec(fv, fd, kPrograms[i].name, &spec) || !is_ours(&spec, i))
             continue;
         oe = move_to_trash(&spec);
         if (oe) {

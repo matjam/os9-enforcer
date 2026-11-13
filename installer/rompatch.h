@@ -48,6 +48,8 @@ enum {
 enum {
     kKernelStock,      /* NanoKernel 2.28 as Apple made it */
     kKernelPatched,    /* this release's patch is applied */
+    kKernelOther,      /* another release's patch: Enforcer's owner check
+                          is there (kEnforcerMark), the bytes differ */
     kKernelUnknown
 };
 

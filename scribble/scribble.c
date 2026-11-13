@@ -48,6 +48,10 @@
  * stopping this application there (README, step 10).
  *   D  a Time Manager task half a second later installs a deferred task,
  *      which stores into the Finder's memory.
+ *
+ *   X  send the Enforcer Extension the Apple event that makes it call
+ *      ExitToShell without stopping the engine, as a crash ends it. The
+ *      engine must stop itself; the Mac must keep running.
  */
 
 #include <stdio.h>
@@ -59,6 +63,7 @@
 #include <Events.h>
 #include <Gestalt.h>
 #include <Timer.h>
+#include <AppleEvents.h>
 
 #include "engine.h"
 
@@ -438,8 +443,9 @@ int main(void)
                "heap, s/S native/68k store into the system heap, t time "
                "traps, m temporary memory, M 1 MB of it, T store into "
                "another application's, P page 600 MB, Y from an MP task, "
-               "V from a Time Manager task, D from a deferred task, q quit; "
-               "then Return\n");
+               "V from a Time Manager task, D from a deferred task, X make "
+               "the Enforcer Extension quit as in a crash, q quit; then "
+               "Return\n");
         int ch = getchar();
         while (ch != '\n' && getchar() != '\n')
             ;
@@ -486,6 +492,39 @@ int main(void)
             tf_armed = 1;
             printf("in 5 seconds, a store into %s at %08lX: make the "
                    "Finder current now\n", name, (unsigned long)t);
+            continue;
+        }
+        case 'X': {
+            ProcessSerialNumber psn = {0, kNoProcess};
+            ProcessInfoRec info;
+            int found = 0;
+            while (!found && GetNextProcess(&psn) == noErr) {
+                memset(&info, 0, sizeof info);
+                info.processInfoLength = sizeof info;
+                found = GetProcessInformation(&psn, &info) == noErr &&
+                        info.processSignature == 'EnfX';
+            }
+            if (!found) {
+                printf("the Enforcer Extension is not running\n");
+                continue;
+            }
+            AEAddressDesc to;
+            AppleEvent ev, reply;
+            OSErr err = AECreateDesc(typeProcessSerialNumber, &psn,
+                                     sizeof psn, &to);
+            if (!err) {
+                err = AECreateAppleEvent('EnfX', 'exit', &to,
+                                         kAutoGenerateReturnID,
+                                         kAnyTransactionID, &ev);
+                AEDisposeDesc(&to);
+            }
+            if (!err) {
+                err = AESend(&ev, &reply, kAENoReply, kAENormalPriority,
+                             kAEDefaultTimeout, NULL, NULL);
+                AEDisposeDesc(&ev);
+            }
+            printf("exit event sent to the Enforcer Extension: error %d\n",
+                   (int)err);
             continue;
         }
         case 'D': {
