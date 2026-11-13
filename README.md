@@ -138,8 +138,9 @@ On Debian or Ubuntu, run:
 sudo apt-get install cmake ninja-build g++ libgmp-dev libmpfr-dev libmpc-dev libboost-all-dev bison flex texinfo ruby python3
 ```
 
-To build the toolchain, run this once. It fetches the submodule and builds
-into `toolchain/build`:
+To build the toolchain, run this once. It fetches the submodule (1.7 GB)
+and builds into `toolchain/build` (2.3 GB); on an 8-core Mac it takes about
+7 minutes:
 
 ```bash
 toolchain/build.sh
