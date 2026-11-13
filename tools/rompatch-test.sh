@@ -33,8 +33,21 @@ cfrg "$built" "$tmp/cfrg-built"
 
 "$tmp/test" "$stock" "$tmp/out" "$built" "$tmp/cfrg" "$tmp/cfrg-out"
 if cmp -s "$tmp/cfrg-out" "$tmp/cfrg-built"; then
-    echo "cfrg identical to the tbxi-built file's"
+    echo "cfrg: the same as the tbxi-built file's"
 else
-    echo "cfrg DIFFERS from the tbxi-built file's"
+    echo "cfrg: DIFFERENT from the tbxi-built file's"
+    exit 1
+fi
+
+# The two data forks, unpacked by tbxi, must match. (cat copies only the
+# data fork. The raw Parcels file holds the padding, so it is left out.)
+cat "$built" >"$tmp/built"
+"$os9/refs/tbxi-venv/bin/tbxi" dump "$tmp/out" -o "$tmp/dump-out" >/dev/null 2>&1
+"$os9/refs/tbxi-venv/bin/tbxi" dump "$tmp/built" -o "$tmp/dump-built" >/dev/null 2>&1
+if diff -r -x Parcels "$tmp/dump-out" "$tmp/dump-built" >/dev/null; then
+    echo "tbxi dump: the same as the tbxi-built file's"
+else
+    echo "tbxi dump: DIFFERENT from the tbxi-built file's"
+    diff -r -x Parcels "$tmp/dump-out" "$tmp/dump-built" | head -20
     exit 1
 fi

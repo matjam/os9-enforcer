@@ -112,10 +112,12 @@ int main(int argc, char **argv)
         for (i = 0; i < out_len && i < exp_len && out[i] == expected[i]; i++)
             ;
         if (i == out_len && out_len == exp_len)
-            printf("identical to %s\n", argv[3]);
+            printf("byte for byte the same as %s\n", argv[3]);
         else
-            printf("DIFFERS from %s at 0x%zX (lengths %zu, %zu)\n", argv[3],
-                   i, out_len, exp_len);
+            printf("first byte different from %s at 0x%zX (lengths %zu, "
+                   "%zu): tbxi pads between parcels with 0x99, Apple's file "
+                   "(kept here) with other bytes\n", argv[3], i, out_len,
+                   exp_len);
     }
     if (argc > 5) {
         size_t clen;
