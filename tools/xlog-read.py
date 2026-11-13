@@ -35,15 +35,18 @@ KERNEL = ["kcb", "kcb_err", "owners", "kcb_raw", "owners_raw", "kseen",
 # After those: the temporary memory pools (PoolStubs pointer, PoolCounters,
 # vm, pm_zone), then the Chunk table.
 POOL = ["pool", "news", "passed", "disposed", "chunks_made", "chunks_freed",
-        "chunks_dropped", "quits", "gone", "reinstalled", "vm", "pm_zone"]
+        "chunks_dropped", "quits", "gone", "reinstalled", "launched", "vm",
+        "pm_zone", "owners_size"]
 POOL_STUBS = ["magic", "enabled_inside", "osd_old", "dh_old", "ets_old"]
 CHUNK = ["live", "domain", "handle", "block", "lo", "hi", "zone", "handles",
          "keep"]
 MAX_CHUNKS = 128
 KCB = ["magic", "version", "mode", "current", "entries", "denied_page",
-       "seq", "frame", "allowed", "logged", "denied", "bail", "self"]
+       "seq", "frame", "allowed", "logged", "denied", "bail", "self",
+       "skipped"]
 KCB_RING, KCB_RING_N, KCB_EVENTS = 0x200, 496, 12
-EVF = [(1, "68k"), (2, "task"), (4, "offense"), (8, "denied")]
+EVF = [(1, "68k"), (2, "task"), (4, "offense"), (8, "denied"),
+       (16, "skipped")]
 STOPPER = ["magic", "old_vector", "zone"] + ["stops_" + s for s in
                                              ["native", "68k", "fallback"]]
 # State from off_sys, then the SysPages header and its SysCounters.
@@ -58,7 +61,8 @@ COUNTERS = (["own_" + s for s in SOURCES] + ["cross_" + s for s in SOURCES] +
             ["outside", "switches", "timer_runs", "kernel_errors",
              "refreshes", "added", "removed", "dropped", "nwriters",
              "info_errors"] + ["app_code_" + s for s in SOURCES])
-DOMAIN_SIZE, WRITER_SIZE, OFFENSE_SIZE = 68, 64, 56
+DOMAIN_SIZE, WRITER_SIZE, OFFENSE_SIZE = 80, 64, 56
+CODE_STATES = ["not looked for", "in the partition", "owned", "failed"]
 SRC_MASK, APP_CODE = 0xFF, 0x100
 
 
@@ -143,10 +147,10 @@ def print_kernel(k):
           "%08X (%d pages), frame %08X" % (
               k["kcb"], ["pass", "log", "enforce"][mode] if mode < 3 else mode,
               k["cb_current"], k["owners"], k["cb_entries"], k["cb_frame"]))
-    print("  kernel: allowed %d, offenses allowed %d, denied %d, left to the "
-          "hooks %d, own (current application) %d; events %d" % (
-              k["cb_allowed"], k["cb_logged"], k["cb_denied"], k["cb_bail"],
-              k["cb_self"], k["cb_seq"]))
+    print("  kernel: allowed %d, offenses allowed %d, denied %d, dropped %d, "
+          "left to the hooks %d, own (current application) %d; events %d" % (
+              k["cb_allowed"], k["cb_logged"], k["cb_denied"],
+              k["cb_skipped"], k["cb_bail"], k["cb_self"], k["cb_seq"]))
     print("  engine: taken %d (last %d), lost %d, denied %d" % (
         k["kevents"], k["kseen"], k["klost"], k["kdenied"]))
     if k["events"]:
@@ -173,10 +177,11 @@ def print_pool(k):
                         k["stub_enabled_inside"] & 0xFFFF, k["stub_osd_old"],
                         k["stub_dh_old"], k["stub_ets_old"]))
     print("  taken %d, passed on %d, disposed %d; chunks made %d, freed %d, "
-          "dropped %d; quits %d, gone %d; stubs put back %d" % (
+          "dropped %d; quits %d, gone %d; stubs put back %d; added at an "
+          "event call %d" % (
               k["news"], k["passed"], k["disposed"], k["chunks_made"],
               k["chunks_freed"], k["chunks_dropped"], k["quits"], k["gone"],
-              k["reinstalled"]))
+              k["reinstalled"], k["launched"]))
     for c in k["chunks"]:
         print("  chunk [%3d] domain %d: %08X-%08X zone %08X, handle %08X -> "
               "%08X, %d handles%s" % (
@@ -254,6 +259,14 @@ def main():
                       i, cstr(d[o + 36:o + 52]), w(o + 12), w(o + 16),
                       w(o + 20), w(o + 24), w(o + 60), w(o + 4),
                       ", quit" if w(o + 64) else "", w(o + 52), w(o + 56)))
+            st = w(o + 76)
+            what = (CODE_STATES[st] if st < 3 else
+                    "failed at step %d" % (st - 3))
+            if st == 2:
+                what += " %08X-%08X" % (w(o + 68), w(o + 72))
+            elif st > 3:
+                what += " (%08X %08X)" % (w(o + 68), w(o + 72))
+            print("       native code outside the partition: %s" % what)
     rows = []
     for i in range(min(c["nwriters"], h["max_writers"])):
         o = h["off_writers"] + i * WRITER_SIZE
@@ -279,7 +292,9 @@ def main():
         t = w(e + 4) % 86400  # seconds since 1904, local time
         target = cstr(d[e + 40:e + 56])
         # The system heap is log only: a store into it is never denied.
-        if w(e + 20):
+        if w(e + 20) == 2:
+            what = "blocked (store dropped)"
+        elif w(e + 20):
             what = "denied"
         elif target == "System heap":
             what = "logged"

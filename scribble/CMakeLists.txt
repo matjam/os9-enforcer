@@ -7,3 +7,5 @@ add_application(Scribble scribble.c CONSOLE)
 target_compile_options(Scribble PRIVATE -O2 -Wall)
 # engine.h and hook.h, for the trap timing test (it reads Enforcer's state).
 target_include_directories(Scribble PRIVATE ../common)
+# MP tasks, for the Y test.
+target_link_libraries(Scribble MPLibrary)

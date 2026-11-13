@@ -15,7 +15,10 @@
  *   4. Copies the Enforcer Extension and the Enforcer control panel from
  *      the installer's folder into the Extensions and Control Panels
  *      folders.
- * If the kernel is already patched, Install only does step 4.
+ * If the kernel is already patched, Install only does step 4. If it has an
+ * earlier release's patch and Enforcer Backup holds the stock file,
+ * Install patches the backup, writes the copy, moves the earlier patched
+ * file to the Trash and gives the copy its name, then does step 4.
  *
  * Remove puts the original Mac OS ROM file back, and moves the patched one,
  * the extension and the control panel to the Trash.
@@ -61,8 +64,7 @@ enum {
     kRootDir = 2,
     kAttrDir = 0x10,           /* ioFlAttrib: a folder */
     kFlagInited = 0x0100,      /* Finder flags */
-    kWatchCursor = 4,
-    kVMPresent = 1             /* gestaltVMAttr */
+    kWatchCursor = 4
 };
 
 static const char kTempName[] = "Mac OS ROM (Enforcer)";
@@ -88,11 +90,12 @@ typedef struct {
     int rom_err;
     int have_backup;
     FSSpec backup;         /* Enforcer Backup:Mac OS ROM */
+    int older;             /* the ROM file has another patch (an earlier
+                              release's) and the backup the stock kernel */
     short app_vref;        /* the installer's folder */
     long app_dir;
     int programs_here;     /* both programs are next to the installer */
     int programs_installed;
-    int vm_on;
 } Setup;
 
 static DialogPtr g_dialog;
@@ -347,14 +350,11 @@ static void examine(Setup *s)
     ProcessSerialNumber psn;
     ProcessInfoRec info;
     FSSpec app, spec, dir;
-    LONGINT vm = 0;
     long id;
     int i;
 
     memset(s, 0, sizeof *s);
     s->kernel = kKernelUnknown;
-    if (Gestalt(gestaltVMAttr, &vm) == noErr && (vm & kVMPresent))
-        s->vm_on = 1;
     if (FindFolder(kOnSystemDisk, 'macs', false, &s->vref, &s->sys_dir))
         return;
     s->have_rom = find_rom(s);
@@ -365,6 +365,10 @@ static void examine(Setup *s)
         (id = folder_id(&dir)) != 0 && s->have_rom &&
         FSMakeFSSpec(s->vref, id, s->rom.name, &s->backup) == noErr)
         s->have_backup = 1;
+    if (s->have_backup && s->kernel == kKernelUnknown) {
+        int backup_err;
+        s->older = kernel_of(&s->backup, &backup_err) == kKernelStock;
+    }
 
     memset(&info, 0, sizeof info);
     info.processInfoLength = sizeof info;
@@ -408,6 +412,13 @@ static void show(const Setup *s)
                  "file and remove Enforcer, click Remove. To update the "
                  "extension and control panel, click Install.");
         can_install = 1;
+    } else if (s->older) {
+        snprintf(text, sizeof text,
+                 "An earlier release of Enforcer is installed. To update "
+                 "it, click Install, then restart. To put back the "
+                 "original Mac OS ROM file and remove Enforcer, click "
+                 "Remove.");
+        can_install = 1;
     } else {
         snprintf(text, sizeof text,
                  "Enforcer cannot be installed on this Mac: its Mac OS ROM "
@@ -419,9 +430,6 @@ static void show(const Setup *s)
                  "control panel in the same folder as this installer.");
         can_install = 0;
     }
-    if (s->vm_on && strlen(text) < 200)
-        strcat(text, " Virtual memory is on: Enforcer starts only when it "
-                     "is off (Memory control panel).");
     set_text(kStatus, "%s", text);
     enable(kInstall, can_install);
     enable(kRemove, can_remove);
@@ -545,12 +553,14 @@ static int install(Setup *s)
     OSErr oe;
     int err, i;
 
-    if (s->kernel == kKernelStock) {
+    if (s->kernel == kKernelStock || s->older) {
+        /* An update patches the original, from the backup. */
+        FSSpec *src = s->older ? &s->backup : &s->rom;
         set_text(kStatus, "Reading the Mac OS ROM file.");
-        oe = read_fork(&s->rom, 0, &data, &dlen);
+        oe = read_fork(src, 0, &data, &dlen);
         if (oe)
             return fail("Enforcer could not read the Mac OS ROM file", oe);
-        oe = read_fork(&s->rom, 1, &rsrc, &rlen);
+        oe = read_fork(src, 1, &rsrc, &rlen);
         if (oe) {
             free(data);
             return fail("Enforcer could not read the Mac OS ROM file", oe);
@@ -573,7 +583,15 @@ static int install(Setup *s)
         if (oe)
             return fail("Enforcer could not write the patched Mac OS ROM "
                         "file", oe);
-        oe = swap_in(s, &tmp);
+        if (s->older) {
+            /* The backup stays; the earlier patched file goes to the
+               Trash (Mac OS goes on using it until the restart). */
+            oe = move_to_trash(&s->rom);
+            if (!oe)
+                oe = FSpRename(&tmp, s->rom.name);
+            FlushVol(NULL, s->vref);
+        } else
+            oe = swap_in(s, &tmp);
         if (oe) {
             set_text(kStatus, "Enforcer could not replace the Mac OS ROM file "
                               "(error %d). Your System Folder may now hold "

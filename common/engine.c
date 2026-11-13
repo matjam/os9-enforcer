@@ -59,6 +59,19 @@ static unsigned long now_seconds(void)
     return lowmem_long(0x20C); /* Time: seconds since 1904 */
 }
 
+/* With virtual memory on, keep (on) or stop keeping a block the engine
+   uses at interrupt time or in the hooks in physical memory: a page fault
+   there cannot be served. Nothing with virtual memory off. */
+static void hold(State *s, const volatile void *p, unsigned long len, int on)
+{
+    if (!s->vm || !p || !len)
+        return;
+    if (on)
+        HoldMemory((void *)p, len);
+    else
+        UnholdMemory((void *)p, len);
+}
+
 static void copy_name(char out[16], const char *in)
 {
     int i = 0;
@@ -133,6 +146,53 @@ static void mark(State *s, unsigned long lo, unsigned long hi,
     unsigned long n = s->kcb->entries;
     for (unsigned long p = lo >> 12; p < hi >> 12 && p < n; p++)
         s->owners[p] = owner;
+}
+
+/* Give application domain i the owner bytes of its code's pages in
+   [lo, hi) that are outside its partition and have no owner (engine.h,
+   kCodeOwned). Only the owner table changes. */
+static void own_code(State *s, int i, unsigned long lo, unsigned long hi)
+{
+    Domain *d = &s->domains[i];
+    unsigned char code = owner_code(s, i);
+    unsigned long n = s->kcb->entries;
+    lo &= kPageMask;
+    hi = (hi + kPage - 1) & kPageMask;
+    for (unsigned long p = lo >> 12; p < hi >> 12 && p < n; p++) {
+        unsigned long a = p << 12;
+        if ((a < d->lo || a >= d->hi) && s->owners[p] == kOwnerNone)
+            s->owners[p] = code;
+    }
+    d->code_lo = lo;
+    d->code_hi = hi;
+    d->code_state = kCodeOwned;
+}
+
+static void disown_code(State *s, int i)
+{
+    Domain *d = &s->domains[i];
+    if (d->code_state != kCodeOwned || !s->kcb)
+        return;
+    unsigned char code = owner_code(s, i);
+    unsigned long n = s->kcb->entries;
+    for (unsigned long p = d->code_lo >> 12; p < d->code_hi >> 12 && p < n;
+         p++)
+        if (s->owners[p] == code)
+            s->owners[p] = kOwnerNone;
+    d->code_lo = d->code_hi = 0;
+    d->code_state = kCodeUnknown;
+}
+
+/* The live domain whose native code outside its partition holds pc. */
+static int code_domain(State *s, unsigned long pc)
+{
+    for (int i = 0; i < kMaxDomains; i++) {
+        Domain *d = &s->domains[i];
+        if (d->live && d->code_state == kCodeOwned && pc >= d->code_lo &&
+            pc < d->code_hi)
+            return i;
+    }
+    return -1;
 }
 
 /* Protect pages of application domain i, unless protection is off or the
@@ -240,6 +300,7 @@ static void drop_domain(State *s, int i, int quit)
     if (nk_unprotect(s->area, d->lo, d->hi - d->lo))
         s->c.kernel_errors++;
     mark(s, d->lo, d->hi, kOwnerNone);
+    disown_code(s, i);
     d->quit = quit;
     d->live = 0;
     s->c.removed++;
@@ -615,7 +676,7 @@ static void sys_start(State *s)
         return;
     int slot = -1;
     for (int i = 0; i < kMaxDomains && slot < 0; i++)
-        if (!s->domains[i].live)
+        if (!s->domains[i].live && !s->domains[i].quit)
             slot = i;
     if (slot < 0)
         return;
@@ -629,6 +690,7 @@ static void sys_start(State *s)
         sp = sys_alloc(cap);
         if (!sp)
             return;
+        hold(s, sp, GetPtrSize((Ptr)sp), 1); /* the timer uses it */
         s->sys = sp;
     } else {
         /* Watched before: keep the counters, start the pages afresh. */
@@ -751,6 +813,11 @@ static void drain(State *s, int src, volatile HookEvent *ring, unsigned long n,
             continue;
         }
         int app = (e->pc & kHookAppCode) != 0;
+        /* The hooks know only the partition: native code outside it
+           (engine.h, kCodeOwned) is the application's too. */
+        if (!app && src != kSrc68k && domain_of_zone(s, zone) >= 0 &&
+            code_domain(s, e->pc & ~3UL) == domain_of_zone(s, zone))
+            app = 1;
         int t = domain_at(s, addr);
         if (t < 0 || t == s->sys_dom) {
             s->c.outside++;
@@ -789,16 +856,18 @@ static unsigned long kernel_zone(State *s, unsigned writer, unsigned current)
     return lowmem_long(0x2A6); /* SysZone */
 }
 
-/* One store the kernel allowed and recorded, as the hooks' drain does with
-   theirs. The writer is known from the store's code here, not from
-   ApplZone: a store is the target's own when its code is the target's, or
-   when system code stores into the application current at the time. */
+/* One store the kernel allowed or dropped and recorded, as the hooks'
+   drain does with theirs. The writer is known from the store's code here,
+   not from ApplZone: a store is the target's own when its code is the
+   target's, or when system code stores into the application current at the
+   time. A dropped store never opened its page. */
 static void kernel_event(State *s, const KEvent *e)
 {
     unsigned flags = kev_flags(e->info), writer = kev_writer(e->info);
     unsigned current = (e->info >> 8) & 0xFF;
     int src = flags & kEvf68k ? kSrc68k : kSrcNative;
     int app = (flags & kEvfOffense) != 0;
+    int skipped = (flags & kEvfSkipped) != 0;
     unsigned long addr = e->addr;
     HookEvent h;
     h.seq = e->seq;
@@ -828,9 +897,10 @@ static void kernel_event(State *s, const KEvent *e)
         s->c.foreign[src]++;
         record(s, src | (app ? kWriterAppCode : 0), pc, lr, h.zone, t, addr);
         if (app)
-            record_offense(s, src, pc, h.zone, t, addr, 0);
+            record_offense(s, src, pc, h.zone, t, addr,
+                           skipped ? kOffenseBlocked : kOffenseAllowed);
     }
-    if (t != s->cur)
+    if (t != s->cur && !skipped)
         protect(s, t, addr & kPageMask, kPage);
 }
 
@@ -991,6 +1061,11 @@ static long handler(ExceptionInfo *e)
         return g_prev ? g_prev(e) : -1;
     unsigned long addr = mi->theAddress, pc = e->machineState->PC.lo;
     int app = pc >= s->hnat->cur_lo && pc < s->hnat->cur_hi;
+    if (!app && s->cur >= 0) {
+        Domain *cd = &s->domains[s->cur];
+        app = cd->code_state == kCodeOwned && pc >= cd->code_lo &&
+              pc < cd->code_hi;
+    }
     /* A store the native hook denied (it is in its ring already): stop
        the application, or let the system do it. The hook names the
        application in the stopper when it denies; the kernel can deny a
@@ -1410,6 +1485,389 @@ static void pool_quit(void)
     s->pc.quits++;
 }
 
+/* An application's native code (engine.h, kCodeOwned) ------------------ */
+
+static unsigned get16(const unsigned char *p)
+{
+    return (unsigned)p[0] << 8 | p[1];
+}
+
+static int read_at(int16_t ref, unsigned long off, void *buf, long len)
+{
+    LONGINT n = len;
+    return SetFPos(ref, fsFromStart, (long)off) == noErr &&
+           FSRead(ref, &n, buf) == noErr && n == len;
+}
+
+/* From the file's 'cfrg' 0 resource, read from its resource fork with the
+   File Manager (the application has the fork open; a Resource Manager call
+   could close it): the data fork offset, length and name of its PowerPC
+   application fragment. Returns 0, or the step that failed. */
+static int app_fragment(FSSpec *spec, unsigned long *off,
+                        unsigned long *len, unsigned char *name)
+{
+    int16_t ref;
+    unsigned char h[16], b[64];
+    if (FSpOpenRF(spec, fsRdPerm, &ref))
+        return 1;
+    int r = 2;
+    if (!read_at(ref, 0, h, 16))
+        goto out;
+    unsigned long data = get32(h), map = get32(h + 4);
+    if (!read_at(ref, map + 24, b, 2))
+        goto out;
+    unsigned long types = map + get16(b);
+    if (!read_at(ref, types, b, 2))
+        goto out;
+    unsigned ntypes = (get16(b) + 1) & 0xFFFF;
+    r = 3;
+    for (unsigned i = 0; i < ntypes && i < 512; i++) {
+        if (!read_at(ref, types + 2 + 8 * i, b, 8))
+            goto out;
+        if (get32(b) != 'cfrg')
+            continue;
+        unsigned count = (get16(b + 4) + 1) & 0xFFFF;
+        unsigned long refs = types + get16(b + 6);
+        for (unsigned j = 0; j < count && j < 512; j++) {
+            if (!read_at(ref, refs + 12 * j, b, 12))
+                goto out;
+            if (get16(b))
+                continue; /* not ID 0 */
+            unsigned long at = data + (get32(b + 4) & 0xFFFFFF);
+            r = 4;
+            if (!read_at(ref, at + 4, b, 32))
+                goto out;
+            unsigned long members = get32(b + 28);
+            at += 4 + 32;
+            r = 5;
+            for (unsigned long k = 0; k < members && k < 64; k++) {
+                if (!read_at(ref, at, b, 64))
+                    goto out;
+                unsigned size = get16(b + 40);
+                /* PowerPC, an application, in the data fork */
+                if (get32(b) == 'pwpc' && b[22] == 1 && b[23] == 1) {
+                    *off = get32(b + 24);
+                    *len = get32(b + 28);
+                    memcpy(name, b + 42, b[42] < 21 ? b[42] + 1 : 0);
+                    if (b[42] >= 21) /* longer than this read */
+                        name[0] = 0;
+                    r = 0;
+                    goto out;
+                }
+                if (size < 43)
+                    goto out;
+                at += size;
+            }
+            goto out;
+        }
+    }
+    r = -1; /* no 'cfrg' resource: a 68k application */
+out:
+    FSClose(ref);
+    return r;
+}
+
+/* PEF pattern-initialized data: the 8 bytes (a transition vector) at
+   offset want of the unpacked section. */
+typedef struct {
+    unsigned long pos, want;
+    unsigned char w[8];
+} Unpack;
+
+static void emit(Unpack *u, const unsigned char *src, unsigned long count)
+{
+    if (u->pos + count <= u->want || u->pos >= u->want + 8) {
+        u->pos += count;
+        return;
+    }
+    for (unsigned long i = 0; i < count; i++, u->pos++)
+        if (u->pos >= u->want && u->pos < u->want + 8)
+            u->w[u->pos - u->want] = src ? src[i] : 0;
+}
+
+static unsigned long pidata_arg(const unsigned char **p,
+                                const unsigned char *end)
+{
+    unsigned long v = 0;
+    for (int i = 0; i < 5 && *p < end; i++) {
+        unsigned char b = *(*p)++;
+        v = v << 7 | (b & 0x7F);
+        if (!(b & 0x80))
+            break;
+    }
+    return v;
+}
+
+static int pidata_tvector(const unsigned char *p, unsigned long n,
+                          unsigned long want, unsigned long tv[2])
+{
+    const unsigned char *end = p + n;
+    Unpack u = {0, want, {0}};
+    while (p < end && u.pos < want + 8) {
+        unsigned op = *p >> 5;
+        unsigned long count = *p++ & 31, custom, rep;
+        if (!count)
+            count = pidata_arg(&p, end);
+        switch (op) {
+        case 0: /* zero */
+            emit(&u, 0, count);
+            break;
+        case 1: /* block copy */
+            if (count > (unsigned long)(end - p))
+                return 0;
+            emit(&u, p, count);
+            p += count;
+            break;
+        case 2: /* repeated block */
+            rep = pidata_arg(&p, end) + 1;
+            if (count > (unsigned long)(end - p))
+                return 0;
+            for (unsigned long r = 0; r < rep && u.pos < want + 8; r++)
+                if (u.pos + count * (rep - r) <= want) {
+                    u.pos += count * (rep - r);
+                    break;
+                } else
+                    emit(&u, p, count);
+            p += count;
+            break;
+        case 3: /* repeated custom blocks with common data */
+        case 4: /* and with zeros */
+        {
+            custom = pidata_arg(&p, end);
+            rep = pidata_arg(&p, end);
+            const unsigned char *common = op == 3 ? p : 0;
+            if (op == 3) {
+                if (count > (unsigned long)(end - p))
+                    return 0;
+                p += count;
+            }
+            emit(&u, common, count);
+            for (unsigned long r = 0; r < rep && u.pos < want + 8; r++) {
+                if (custom > (unsigned long)(end - p))
+                    return 0;
+                emit(&u, p, custom);
+                p += custom;
+                emit(&u, common, count);
+            }
+            break;
+        }
+        default:
+            return 0;
+        }
+    }
+    if (u.pos < want + 8)
+        return 0;
+    tv[0] = get32(u.w);
+    tv[1] = get32(u.w + 4);
+    return 1;
+}
+
+/* What the PEF container at off in the data fork says about its main
+   symbol, a transition vector in a data section: its offset in that
+   section, its two words before relocation (the main routine's offset in
+   the code section, and the TOC's offset in the data section), and the
+   code section's length. Returns 0, or the step that failed. */
+typedef struct {
+    unsigned long main_off, raw_code, raw_toc, code_len;
+    unsigned long align; /* the code section's, as a mask */
+    unsigned char code_head[32], main_head[16]; /* the code section's first
+                                                   bytes, and main's */
+} PefMain;
+
+static int pef_main(FSSpec *spec, unsigned long off, PefMain *m)
+{
+    int16_t ref;
+    unsigned char h[40];
+    if (FSpOpenDF(spec, fsRdPerm, &ref))
+        return 6;
+    int r = 7;
+    if (!read_at(ref, off, h, 40) || get32(h) != 'Joy!' ||
+        get32(h + 4) != 'peff' || get32(h + 8) != 'pwpc')
+        goto out;
+    unsigned nsec = get16(h + 32);
+    unsigned long loader = 0, code_off = 0;
+    int code = -1;
+    r = 8;
+    for (unsigned i = 0; i < nsec && i < 64; i++) {
+        if (!read_at(ref, off + 40 + 28 * i, h, 28))
+            goto out;
+        if (h[24] == 0 && code < 0 && get32(h + 4) == 0) {
+            code = (int)i;
+            m->code_len = get32(h + 8);
+            code_off = get32(h + 20);
+            m->align = (1UL << (h[26] < 12 ? h[26] : 12)) - 1;
+        } else if (h[24] == 4)
+            loader = get32(h + 20);
+    }
+    if (code < 0 || !loader || !read_at(ref, off + loader, h, 8))
+        goto out;
+    unsigned long main_sec = get32(h), tv[2];
+    m->main_off = get32(h + 4);
+    r = 9;
+    if (main_sec >= nsec ||
+        !read_at(ref, off + 40 + 28 * main_sec, h, 28) ||
+        get32(h + 4) != 0)
+        goto out;
+    unsigned long sec_off = get32(h + 20), sec_len = get32(h + 16);
+    if (h[24] == 1) { /* unpacked data */
+        unsigned char wb[8];
+        if (!read_at(ref, off + sec_off + m->main_off, wb, 8))
+            goto out;
+        tv[0] = get32(wb);
+        tv[1] = get32(wb + 4);
+    } else if (h[24] == 2 && sec_len <= 0x100000) { /* pattern data */
+        r = 10;
+        Ptr buf = NewPtrSys((long)sec_len);
+        if (!buf)
+            goto out;
+        int ok = read_at(ref, off + sec_off, buf, (long)sec_len) &&
+                 pidata_tvector((unsigned char *)buf, sec_len, m->main_off,
+                                tv);
+        DisposePtr(buf);
+        if (!ok)
+            goto out;
+    } else
+        goto out;
+    r = 11;
+    if (m->code_len < 32 || tv[0] + 16 > m->code_len ||
+        !read_at(ref, off + code_off, m->code_head, 32) ||
+        !read_at(ref, off + code_off + tv[0], m->main_head, 16))
+        goto out;
+    m->raw_code = tv[0];
+    m->raw_toc = tv[1];
+    r = 0;
+out:
+    FSClose(ref);
+    return r;
+}
+
+/* Whether len bytes at a are mapped and hold the bytes at want: they are
+   held in physical memory while they are compared (an address with no
+   page fails the hold, instead of faulting). */
+static int memory_is(unsigned long a, const unsigned char *want,
+                     unsigned long len)
+{
+    if (HoldMemory((void *)a, len))
+        return 0;
+    int same = memcmp((const void *)a, want, len) == 0;
+    UnholdMemory((void *)a, len);
+    return same;
+}
+
+/* The code section of domain i's main fragment, found from main's
+   transition vector in its partition: at address a, the vector's second
+   word is the data section's address (a - main_off) plus raw_toc, and its
+   first word is the code section's address plus raw_code. A candidate
+   counts only when that code section is aligned as the container says,
+   above the system heap, inside the owner table, in no other application's
+   partition, and holds the container's code bytes at its start and at
+   main. Returns the code section's address, or 0. The data section is in
+   the application heap, near its start; the search reads at most 32 MB. */
+static unsigned long find_main(State *s, int i, const PefMain *m)
+{
+    const Domain *d = &s->domains[i];
+    unsigned long sys_end = lowmem_long(lowmem_long(0x2A6)); /* bkLim */
+    unsigned long top = s->kcb->entries << 12;
+    unsigned long lo = (d->location + 3) & ~3UL;
+    unsigned long hi = d->location + d->size;
+    if (hi - lo > 0x2000000)
+        hi = lo + 0x2000000;
+    for (unsigned long a = lo; a + 8 <= hi; a += 4) {
+        const unsigned long *v = (const unsigned long *)a;
+        if (v[1] != a - m->main_off + m->raw_toc || v[0] < m->raw_code)
+            continue;
+        unsigned long base = v[0] - m->raw_code, end = base + m->code_len;
+        if ((base & m->align) || base < sys_end || end > top || end < base ||
+            (base < s->my_hi && end > s->my_lo))
+            continue;
+        int other = 0;
+        for (int j = 0; j < kMaxDomains && !other; j++) {
+            const Domain *o = &s->domains[j];
+            other = j != i && o->live && base < o->location + o->size &&
+                    end > o->location;
+        }
+        if (!other && memory_is(base, m->code_head, 32) &&
+            memory_is(v[0], m->main_head, 16))
+            return base;
+    }
+    return 0;
+}
+
+/* Find and own application domain i's native code. It reads the
+   application's file and its partition, so it can run in any process.
+   Event time. */
+static void find_code(State *s, int i)
+{
+    Domain *d = &s->domains[i];
+    if (!s->vm || !s->kcb) {
+        d->code_state = kCodeInside;
+        return;
+    }
+    d->code_state = kCodeFailed;
+    ProcessInfoRec info;
+    FSSpec spec;
+    memset(&info, 0, sizeof info);
+    info.processInfoLength = sizeof info;
+    info.processAppSpec = &spec;
+    if (GetProcessInformation(&d->psn, &info))
+        return;
+    unsigned long off, len;
+    unsigned char name[64];
+    int r = app_fragment(&spec, &off, &len, name);
+    if (r) {
+        d->code_state = r < 0 ? kCodeInside : kCodeFailed + r;
+        return;
+    }
+    PefMain m;
+    memset(&m, 0, sizeof m);
+    r = pef_main(&spec, off, &m);
+    if (r) {
+        d->code_state = kCodeFailed + r;
+        return;
+    }
+    unsigned long lo = find_main(s, i, &m);
+    if (!lo) {
+        d->code_lo = m.raw_code; /* for xlog-read */
+        d->code_hi = m.raw_toc;
+        d->code_state = kCodeFailed + 12;
+        return;
+    }
+    if (lo >= d->location && lo - d->location < d->size) {
+        d->code_state = kCodeInside;
+        return;
+    }
+    own_code(s, i, lo, lo + m.code_len);
+}
+
+/* The GetNextEvent filter stub, when ApplZone has changed since the last
+   such call: add the current application as a domain if it
+   is not one yet (it has just been launched), and find its native code if
+   that has not been looked for. */
+static void pool_launch(void)
+{
+    State *s = g_state;
+    PoolStubs *p = s ? s->pool : 0;
+    if (!p)
+        return;
+    unsigned long zone = current_zone();
+    p->last = zone;
+    if (!s->running)
+        return;
+    int d = domain_of_zone(s, zone);
+    if (d < 0) {
+        if ((zone >= s->my_lo && zone < s->my_hi) ||
+            zone == lowmem_long(0x2A6) || zone == s->pm_zone)
+            return;
+        d = add_current(s);
+        if (d < 0)
+            return;
+        s->pc.launched++;
+    }
+    if (d != s->sys_dom && !s->domains[d].dying &&
+        s->domains[d].code_state == kCodeUnknown)
+        find_code(s, d);
+}
+
 /* Install the stubs, disabled. The stubs, as assembled:
 
    _OSDispatch:
@@ -1469,7 +1927,26 @@ static void pool_quit(void)
      0E jsr     (a0)
      10 move.l  ets_old,-(sp)
      16 rts
+
+   jGNEFilter (A1 the event record, the result in D0 and at 4(sp); every
+   register kept):
+     00 tst.w   enabled
+     06 beq.s   24
+     08 movem.l d0-d2/a0-a1,-(sp)
+     0C move.l  $02AA.w,d0       ; ApplZone unchanged: nothing to do
+     10 cmp.l   last,d0
+     16 beq.s   20
+     18 movea.l #rd_launch,a0    ; pool_launch()
+     1E jsr     (a0)
+     20 movem.l (sp)+,d0-d2/a0-a1
+     24 tst.l   gne_old          ; on to the filter installed before, if any
+     2A beq.s   34
+     2C move.l  gne_old,-(sp)
+     32 rts
+     34 rts
 */
+enum { kGNEFilter = 0x29A };
+
 static PoolStubs *pool_install(void)
 {
     PoolStubs *p = (PoolStubs *)NewPtrSysClear(sizeof(PoolStubs));
@@ -1479,7 +1956,9 @@ static PoolStubs *pool_install(void)
                                                kPoolDisposedInfo, kPowerPCISA);
     UniversalProcPtr uq = NewRoutineDescriptor((ProcPtr)pool_quit,
                                                kPoolQuitInfo, kPowerPCISA);
-    if (!p || !un || !ud || !uq) {
+    UniversalProcPtr ul = NewRoutineDescriptor((ProcPtr)pool_launch,
+                                               kPoolQuitInfo, kPowerPCISA);
+    if (!p || !un || !ud || !uq || !ul) {
         if (p)
             DisposePtr((Ptr)p);
         return 0;
@@ -1490,16 +1969,20 @@ static PoolStubs *pool_install(void)
     BlockMoveData(un, &t.rd_new, sizeof(RoutineDescriptor));
     BlockMoveData(ud, &t.rd_disposed, sizeof(RoutineDescriptor));
     BlockMoveData(uq, &t.rd_quit, sizeof(RoutineDescriptor));
+    BlockMoveData(ul, &t.rd_launch, sizeof(RoutineDescriptor));
     DisposeRoutineDescriptor(un);
     DisposeRoutineDescriptor(ud);
     DisposeRoutineDescriptor(uq);
+    DisposeRoutineDescriptor(ul);
     /* The trap table must be where the engine writes it. */
     volatile unsigned long *osd_e = trap_entry(_OSDispatch);
     volatile unsigned long *dh_e = trap_entry(_DisposeHandle);
     volatile unsigned long *ets_e = trap_entry(_ExitToShell);
+    volatile unsigned long *gne_e = lowmem(kGNEFilter);
     t.osd_old = *osd_e;
     t.dh_old = *dh_e;
     t.ets_old = *ets_e;
+    t.gne_old = *gne_e;
     if (t.osd_old != (unsigned long)NGetTrapAddress(_OSDispatch,
                                                     kToolboxTrapType) ||
         t.dh_old != (unsigned long)NGetTrapAddress(_DisposeHandle,
@@ -1544,11 +2027,45 @@ static PoolStubs *pool_install(void)
     memcpy(t.osd, osd, sizeof osd);
     memcpy(t.dh, dh, sizeof dh);
     memcpy(t.ets, ets, sizeof ets);
+    unsigned long last = (unsigned long)&p->last;
+    unsigned long rl = (unsigned long)&p->rd_launch;
+    unsigned long go = (unsigned long)&p->gne_old;
+    const unsigned short gne[kPoolGne] = {
+        0x4A79, HI16(en), LO16(en), 0x671C,
+        0x48E7, 0xE0C0,
+        0x2038, 0x02AA,
+        0xB0B9, HI16(last), LO16(last), 0x6708,
+        0x207C, HI16(rl), LO16(rl), 0x4E90,
+        0x4CDF, 0x0307,
+        0x4AB9, HI16(go), LO16(go), 0x6708,
+        0x2F39, HI16(go), LO16(go), 0x4E75,
+        0x4E75};
+    memcpy(t.gne, gne, sizeof gne);
     BlockMove(&t, p, sizeof t); /* flushes the code caches */
     *osd_e = (unsigned long)p->osd;
     *dh_e = (unsigned long)p->dh;
     *ets_e = (unsigned long)p->ets;
+    *gne_e = (unsigned long)p->gne;
     return p;
+}
+
+/* Put back the stub at the trap table entry e (stub) if the Process
+   Manager has put back the routine it goes on to (old). */
+static void keep_one(State *s, volatile unsigned long *e, unsigned long old,
+                     const unsigned short *stub)
+{
+    if (*e == old) {
+        *e = (unsigned long)stub;
+        s->pc.reinstalled++;
+    }
+}
+
+/* Take out the stub at e if it is still first. */
+static void remove_one(volatile unsigned long *e, unsigned long old,
+                       const unsigned short *stub)
+{
+    if (*e == (unsigned long)stub)
+        *e = old;
 }
 
 /* Put back a stub that the Process Manager has taken out of the table (it
@@ -1558,21 +2075,9 @@ static void pool_keep(State *s)
     PoolStubs *p = s->pool;
     if (!p || !p->enabled)
         return;
-    volatile unsigned long *e = trap_entry(_OSDispatch);
-    if (*e == p->osd_old) {
-        *e = (unsigned long)p->osd;
-        s->pc.reinstalled++;
-    }
-    e = trap_entry(_DisposeHandle);
-    if (*e == p->dh_old) {
-        *e = (unsigned long)p->dh;
-        s->pc.reinstalled++;
-    }
-    e = trap_entry(_ExitToShell);
-    if (*e == p->ets_old) {
-        *e = (unsigned long)p->ets;
-        s->pc.reinstalled++;
-    }
+    keep_one(s, trap_entry(_OSDispatch), p->osd_old, p->osd);
+    keep_one(s, trap_entry(_DisposeHandle), p->dh_old, p->dh);
+    keep_one(s, trap_entry(_ExitToShell), p->ets_old, p->ets);
 }
 
 /* Disable the stubs and take out those still first in their traps. The
@@ -1584,15 +2089,10 @@ static void pool_remove(State *s)
         return;
     p->enabled = 0;
     s->pool = 0;
-    volatile unsigned long *e = trap_entry(_ExitToShell);
-    if (*e == (unsigned long)p->ets)
-        *e = p->ets_old;
-    e = trap_entry(_DisposeHandle);
-    if (*e == (unsigned long)p->dh)
-        *e = p->dh_old;
-    e = trap_entry(_OSDispatch);
-    if (*e == (unsigned long)p->osd)
-        *e = p->osd_old;
+    remove_one(lowmem(kGNEFilter), p->gne_old, p->gne);
+    remove_one(trap_entry(_ExitToShell), p->ets_old, p->ets);
+    remove_one(trap_entry(_DisposeHandle), p->dh_old, p->dh);
+    remove_one(trap_entry(_OSDispatch), p->osd_old, p->osd);
 }
 
 void engine_set_mode(State *s, unsigned long mode)
@@ -1633,6 +2133,10 @@ static void kcb_start(State *s)
     if (Gestalt(gestaltLogicalRAMSize, &ram) || ram <= 0 ||
         (unsigned long)ram > kSpanHi)
         ram = kSpanHi;
+    /* With virtual memory on, the Code Fragment Manager maps code files
+       above logical RAM (engine.h, kCodeOwned): cover the whole span. */
+    if (s->vm)
+        ram = kSpanHi;
     unsigned long entries = (unsigned long)ram >> 12;
     unsigned long most = (unsigned long)kKcbTablePages * kPage;
     if (entries > most)
@@ -1647,13 +2151,24 @@ static void kcb_start(State *s)
     unsigned char *t =
         (unsigned char *)(((unsigned long)traw + kPage - 1) & kPageMask);
     err = kEngineNoArea;
+    /* The kernel uses them by physical address: with virtual memory on,
+       keep them in physical memory where they are, and make the block one
+       physical range. */
+    if (s->vm) {
+        if (LockMemoryContiguous(k, kKcbSize))
+            goto fail;
+        if (LockMemory(t, tsize)) {
+            UnlockMemory(k, kKcbSize);
+            goto fail;
+        }
+    }
     unsigned long phys = kcb_physical(k, kKcbSize);
     if (!phys)
-        goto fail;
+        goto unlock;
     for (unsigned long i = 0; i < tsize / kPage; i++) {
         unsigned long p = kcb_physical(t + i * kPage, kPage);
         if (!p)
-            goto fail;
+            goto unlock;
         k->pages[i] = p;
     }
     k->magic = kKcbMagic;
@@ -1663,16 +2178,22 @@ static void kcb_start(State *s)
     k->frame = s->h68k->frame;
     err = kcb_register(phys);
     if (err)
-        goto fail;
+        goto unlock;
     s->kcb_raw = kraw;
     s->owners_raw = traw;
     s->owners = t;
+    s->owners_size = tsize;
     s->kseen = 0;
     s->kcb = k;
     s->h68k->kdeny = &k->denied_page;
     s->hnat->kdeny = &k->denied_page;
     s->kcb_err = 0;
     return;
+unlock:
+    if (s->vm) {
+        UnlockMemory(k, kKcbSize);
+        UnlockMemory(t, tsize);
+    }
 fail:
     if (kraw)
         DisposePtr(kraw);
@@ -1690,11 +2211,26 @@ static void kcb_stop(State *s)
     kcb_register(0);
     s->h68k->kdeny = 0;
     s->hnat->kdeny = 0;
+    if (s->vm) {
+        UnlockMemory(s->kcb, kKcbSize);
+        UnlockMemory(s->owners, s->owners_size);
+    }
     s->kcb = 0;
     s->owners = 0;
     DisposePtr(s->kcb_raw);
     DisposePtr(s->owners_raw);
     s->kcb_raw = s->owners_raw = 0;
+}
+
+static void hold_all(State *s, int on)
+{
+    hold(s, s, sizeof(State), on);
+    hold(s, s->bitmap, kBitmapBytes, on);
+    hold(s, (void *)s->my_lo, s->my_hi - s->my_lo, on);
+    hold(s, s->h68k->ring, kHookRing * sizeof(HookEvent), on);
+    hold(s, (void *)s->hnat->block, GetPtrSize((Ptr)s->hnat->block), on);
+    if (s->sys)
+        hold(s, s->sys, GetPtrSize((Ptr)s->sys), on);
 }
 
 long engine_start(State **out, unsigned long mode, const char *name)
@@ -1780,11 +2316,13 @@ long engine_start(State **out, unsigned long mode, const char *name)
         if (fc[0] == 0x90650214 && fc[1] == 0x90C50218 && fc[2] == 0x90050210)
             s->h68k->frame = 0x6806E300;
     }
-    kcb_start(s);
     {
         long vm = 0;
         s->vm = Gestalt(gestaltVMAttr, &vm) == noErr &&
                 (vm & gestaltVMPresent);
+    }
+    kcb_start(s);
+    {
         /* The Process Manager's zone, from a handle of its own. */
         OSErr e = noErr;
         Handle t = TempNewHandle(4, &e);
@@ -1805,6 +2343,11 @@ long engine_start(State **out, unsigned long mode, const char *name)
         s->h68k->stop = &s->stopper->zone;
         s->hnat->stop = &s->stopper->zone;
     }
+    /* What the timer, the hooks, the handler and the stopper use: this
+       program's code and globals, and the system heap blocks. The stopper
+       stays held: it can outlive the engine. */
+    hold_all(s, 1);
+    hold(s, s->stopper, sizeof(Stopper), 1);
 
     g_state = s;
     g_sys_install = sys_install;
@@ -1838,6 +2381,12 @@ void engine_poll(State *s)
         return;
     sweep(s);
     refresh_domains(s);
+    for (int i = 0; i < kMaxDomains; i++) {
+        Domain *d = &s->domains[i];
+        if (d->live && !d->dying && i != s->sys_dom &&
+            d->code_state == kCodeUnknown)
+            find_code(s, i);
+    }
     if (s->want_mode != s->mode)
         engine_set_mode(s, s->want_mode);
     if (s->want_sys != s->sys_on)
@@ -1873,6 +2422,7 @@ void engine_stop(State *s)
     s->sys_on = 0;
     kcb_stop(s);
     g_sys_install(g_prev);
+    hold_all(s, 0);
 
     s->hook_self[0] = s->h68k->count_self;
     s->hook_passed[0] = s->h68k->count_passed;

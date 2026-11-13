@@ -7,7 +7,8 @@
  * It publishes its state under the Gestalt selector 'Enfr' for the
  * Enforcer control panel. Values below 0x1000 are status codes, not a
  * state:
- *   kEnforcerVMOn      virtual memory is on, so it did not start;
+ *   kEnforcerVMOn      virtual memory is on, so it did not start (earlier
+ *                      versions; this one runs with virtual memory);
  *   kEnforcerFailed+n  engine_start failed with error -n.
  *
  * The mode (off, log only, enforce) and whether to watch the system heap
@@ -138,7 +139,9 @@ static void add_hex(unsigned char *p, unsigned long v)
    of “Finder” at address 1EA34100. The write was blocked, so “Finder” was
    not changed and you do not need to restart." (Mac Roman curly quotes.)
    When Mac OS stopped the application instead (clean is 0), its own alert
-   has already asked for a restart, so the last part is left out. */
+   has already asked for a restart, so the last part is left out. For a
+   store the kernel dropped (kOffenseBlocked), the writer's interrupt-time
+   code or MP task goes on. */
 static void notify(const Offense *o, int clean)
 {
     NMRec *n = &g_nm[g_nm_next];
@@ -147,16 +150,31 @@ static void notify(const Offense *o, int clean)
     NMRemove(n); /* in case it is still queued; an error otherwise */
 
     str[0] = 0;
-    add(str, "Enforcer stopped \xD2");
-    add(str, o->writer);
-    add(str, "\xD3 because it tried to write into the memory of \xD2");
-    add(str, o->target);
-    add(str, "\xD3 at address ");
-    add_hex(str, o->addr);
-    add(str, ". The write was blocked, so \xD2");
-    add(str, o->target);
-    add(str, clean ? "\xD3 was not changed and you do not need to restart."
-                   : "\xD3 was not changed.");
+    if (o->denied == kOffenseBlocked) {
+        add(str, "Enforcer blocked a write by \xD2");
+        add(str, o->writer);
+        add(str, "\xD3 into the memory of \xD2");
+        add(str, o->target);
+        add(str, "\xD3 at address ");
+        add_hex(str, o->addr);
+        add(str, ". \xD2");
+        add(str, o->writer);
+        add(str, "\xD3 was not stopped: the write came from its "
+                 "interrupt-time code or a separate task. If it misbehaves, "
+                 "quit it.");
+    } else {
+        add(str, "Enforcer stopped \xD2");
+        add(str, o->writer);
+        add(str, "\xD3 because it tried to write into the memory of \xD2");
+        add(str, o->target);
+        add(str, "\xD3 at address ");
+        add_hex(str, o->addr);
+        add(str, ". The write was blocked, so \xD2");
+        add(str, o->target);
+        add(str, clean ? "\xD3 was not changed and you do not need to "
+                         "restart."
+                       : "\xD3 was not changed.");
+    }
 
     memset(n, 0, sizeof *n);
     n->qType = kNMType;
@@ -199,12 +217,6 @@ int main(void)
 {
     install_ae();
 
-    LONGINT vm = 0;
-    if (Gestalt(gestaltVMAttr, &vm) == noErr && (vm & gestaltVMPresent)) {
-        publish(kEnforcerVMOn);
-        return 0;
-    }
-
     Prefs prefs = load_prefs();
     State *s;
     long err = engine_start(&s, prefs.mode, "Enforcer");
@@ -219,6 +231,10 @@ int main(void)
 
     unsigned long last_poll = TickCount(), shown = 0, stops_shown = 0;
     unsigned long saved_mode = prefs.mode, saved_sys = prefs.sys;
+    /* The last blocked write told about: code that keeps writing (a VBL
+       task) is told about once a minute. */
+    char blocked_w[16] = "", blocked_t[16] = "";
+    unsigned long blocked_time = 0;
     EventRecord ev;
     while (!g_quit) {
         if (WaitNextEvent(everyEvent, &ev, kPollTicks, NULL) &&
@@ -250,8 +266,19 @@ int main(void)
             shown = n - kOffenseLog;
         for (; shown < n; shown++) {
             Offense *o = &s->offenses[shown % kOffenseLog];
-            if (!o->denied)
+            if (o->denied == kOffenseAllowed)
                 continue;
+            if (o->denied == kOffenseBlocked) {
+                if (!strcmp(o->writer, blocked_w) &&
+                    !strcmp(o->target, blocked_t) &&
+                    o->time - blocked_time < 60)
+                    continue;
+                strcpy(blocked_w, o->writer);
+                strcpy(blocked_t, o->target);
+                blocked_time = o->time;
+                notify(o, 0);
+                continue;
+            }
             int clean = stops_shown < stops;
             if (clean)
                 stops_shown++;

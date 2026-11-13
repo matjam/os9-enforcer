@@ -91,7 +91,10 @@ static void show_offenses(State *s, unsigned long *shown)
     for (; *shown < n; (*shown)++) {
         Offense *o = &s->offenses[*shown % kOffenseLog];
         printf("%s: %s's own code (%s, %08lX) wrote into %s at %08lX\n",
-               o->denied ? "DENIED" : "would deny", o->writer,
+               o->denied == kOffenseStopped   ? "DENIED"
+               : o->denied == kOffenseBlocked ? "BLOCKED"
+                                              : "would deny",
+               o->writer,
                source_name(o->source), o->pc, o->target, o->addr);
     }
 }

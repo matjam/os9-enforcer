@@ -38,6 +38,9 @@ kernel:
         .set    EWA_PA_CurTask, -0x008
         .set    EWA_R1, 0x004                   # IntDSI saves the task's r0-r31
         .set    EWA_R24, 0x060                  # at EWA + 4n
+        .set    EWA_R25, 0x064                  # (the emulator's: SR in bits 29-31)
+        .set    KDP_PA_ECB, 0x658               # the emulator's context block,
+        .set    ECB_R25, 0x1CC                  # physical, and its saved r25
         .set    EWA_SavedR8, -0x0E0             # MemRetryDSI saves these for a
         .set    EWA_SavedR9, -0x0DC             # user-mode access: r8, r9,
         .set    EWA_SavedR16, -0x0D8            # r16 (the flags), r17-r19, CR
@@ -73,7 +76,8 @@ kernel:
         .set    CB_LOGGED, 0x024                # allowed offenses,
         .set    CB_DENIED, 0x028                # denied,
         .set    CB_BAIL, 0x02C                  # allowed but left to the hooks,
-        .set    CB_SELF, 0x030                  # the current application's own
+        .set    CB_SELF, 0x030                  # the current application's own,
+        .set    CB_SKIPPED, 0x034               # dropped
         .set    CB_PAGES, 0x100                 # owner table pages, physical
         .set    CB_RING, 0x200                  # RING_N events of 32 bytes
         .set    RING_N, 496                     # to the block's end
@@ -89,7 +93,8 @@ kernel:
         .set    EVF_68K, 1                      # the 68k emulator's store
         .set    EVF_TASK, 2                     # not the blue task
         .set    EVF_OFFENSE, 4                  # an application's code, not
-        .set    EVF_DENIED, 8                   # its own page; and denied
+        .set    EVF_DENIED, 8                   # its own page; and denied,
+        .set    EVF_SKIPPED, 16                 # or dropped
         .set    MODE_PASS, 0                    # as without the table
         .set    MODE_LOG, 1
         .set    MODE_ENFORCE, 2
@@ -141,6 +146,7 @@ kernel:
 stwcx_probe:
         beq+    1f                              # the store happened
         lwarx   20,23,19
+probe_store:
         stwcx.  20,23,19                        # faults if write-protected
         crxor   2,2,2                           # report failure (cr0.eq = 0)
 1:      isync
@@ -218,14 +224,35 @@ cpup_keep_writable:
 # the system's.
 #
 # A store by an application's code into a page that is not its own is an
-# offense. In MODE_ENFORCE it is denied when the page is another
-# application's and the writer is the current application (CB_CURRENT) in
-# the blue task, the one application the engine can stop cleanly; any
-# other offense is allowed and marked. A store into the current
-# application's page that is not an offense is only counted (CB_SELF);
-# every other store is recorded in the block's ring, and counted. A denied
-# store goes on to the fault path with its page in CB_DENIED_PAGE, where
-# the blue task's hooks deny it and stop the application.
+# offense. In MODE_ENFORCE, an offense into another application's page is
+# decided by who is current (CB_CURRENT):
+# - into the current application's page: allowed and marked. The code can
+#   be another application's that the current one called (a Gestalt
+#   function or a callback in that application's partition), storing its
+#   results.
+# - by the current application in the blue task, with the 68k interrupt
+#   mask at 0: denied. It is the one application the engine can stop
+#   cleanly. (Stopping it from interrupt-time code would leave that
+#   interrupt's dispatcher, such as the Time Manager's, unfinished: the
+#   Time Manager then runs no task again.) The mask is in the emulator's
+#   r25 (bits 29-31): the task's own r25 when the emulator is running, or
+#   the one saved in its context block when native code is.
+# - any other (an application's interrupt-time code, or an MP task):
+#   dropped. The kernel skips the
+#   store, so memory is not changed, and the code goes on as if it had
+#   stored. The exception is stwcx_probe's store: skipping it would make the
+#   caller's lwarx and stwcx. loop run forever, so that store is allowed.
+# Offenses into the system heap, and offenses in MODE_LOG, are allowed and
+# marked. A store into the current application's page that is not an
+# offense is only counted (CB_SELF); every other store is recorded in the
+# block's ring, and counted. A denied store goes on to the fault path with
+# its page in CB_DENIED_PAGE, where the blue task's hooks deny it and stop
+# the application.
+#
+# To drop a store, the kernel sets SRR0 to the next instruction of its own
+# emulation of the store (MemRetryDSI's SRR0 is that instruction, run with
+# instruction translation off) and returns to it, as MemRetryDSI_0x100 does
+# for the case it skips. The emulation then finishes as after the store.
 #
 # To allow a store, the kernel sets the page's PTE to read/write (PP 10)
 # and runs the store again, as MemRetryDSI does after filling the HTAB. The
@@ -299,12 +326,27 @@ check:  mr      8, 27                           # the page's owner
         lwz     9, CB_MODE(31)
         cmpwi   9, MODE_ENFORCE
         bne     record
-        andi.   9, 16, EVF_TASK
-        bne     record                          # another task
         lwz     9, CB_CURRENT(31)
+        cmpw    9, 18
+        beq     record                          # into the current application
+        andi.   17, 16, EVF_TASK
+        bne     8f                              # another task
         cmpw    9, 19
-        bne     record                          # not the current application
+        bne     8f                              # not the current application
+        andis.  9, 28, FLAG_EMU                 # the 68k interrupt mask:
+        lwz     9, EWA_R25(29)                  # the emulator's r25, live
+        bne     5f
+        lwz     9, KDP_PA_ECB(1)                # or saved
+        lwz     9, ECB_R25(9)
+5:      andi.   9, 9, 7
+        bne     8f                              # interrupt time
         ori     16, 16, EVF_DENIED
+        b       record
+8:      mfsrr0  17                              # drop it, unless it is
+        addi    9, 26, probe_store - tw_base    # stwcx_probe's store
+        cmplw   17, 9
+        beq     record
+        ori     16, 16, EVF_SKIPPED
         b       record
 7:      lwz     9, CB_CURRENT(31)               # not an offense: into the
         cmpw    9, 18                           # current application's page?
@@ -340,12 +382,20 @@ record: lwz     9, CB_SEQ(31)
         stw     9, CB_RING + EV_SEQ(8)          # the entry is complete
         stw     9, CB_SEQ(31)
         andi.   9, 16, EVF_DENIED
-        beq     7f
+        beq     6f
         rlwinm  9, 27, 0, 0, 19
         stw     9, CB_DENIED_PAGE(31)
         li      8, CB_DENIED
         bl      count
         b       fault
+6:      andi.   9, 16, EVF_SKIPPED
+        beq     7f
+        li      8, CB_SKIPPED
+        bl      count
+        mfsrr0  9                               # past the emulated store
+        addi    9, 9, 4
+        mtsrr0  9
+        b       retry
 7:      andi.   9, 16, EVF_OFFENSE
         li      8, CB_ALLOWED
         beq     8f

@@ -206,7 +206,9 @@ static void draw_list(const Engine *e)
         s[0] = 0;
         add_p(s, t);
         add(s, "   ");
-        add(s, o->denied ? "Stopped " : "Logged ");
+        add(s, o->denied == kOffenseStopped   ? "Stopped "
+               : o->denied == kOffenseBlocked ? "Blocked "
+                                              : "Logged ");
         add(s, o->writer);
         MoveTo(x, y);
         TextFace(bold);
@@ -260,7 +262,9 @@ static void draw_footer(const Engine *e)
         add_num(s, k->seq + k->self);
         add(s, " writes checked, ");
         add_num(s, k->denied);
-        add(s, " stopped");
+        add(s, " stopped, ");
+        add_num(s, k->skipped);
+        add(s, " blocked");
     } else if (e->s->kcb_err == -4) {
         add(s, "NanoKernel not patched: writes by Multiprocessing tasks "
                "are not checked");

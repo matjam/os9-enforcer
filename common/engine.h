@@ -65,10 +65,14 @@
  * in the control block's ring, which the timer takes like the hooks' rings.
  * Own stores into the current application's pages are only counted. In
  * kModeEnforce it denies a store by the current application's code into
- * another application's page; the hooks then deny that store as their own
- * (HookData kdeny) and the application is stopped cleanly. Stores the
- * kernel leaves alone reach the hooks as before. Without patch 4 the
- * registration fails and the engine runs on the hooks alone.
+ * another application's page (in the blue task, not at interrupt time);
+ * the hooks then deny that store as their own (HookData kdeny) and the
+ * application is stopped cleanly. It drops any other offense into a page of
+ * an application that is not current (another application's interrupt-time
+ * code, an MP task): it skips the store, and the engine logs it as
+ * kOffenseBlocked. Stores the kernel leaves alone reach the hooks as
+ * before. Without patch 4 the registration fails and the engine runs on the
+ * hooks alone.
  *
  * Temporary memory pools (needs the kernel's owner check): the engine
  * patches TempNewHandle (_OSDispatch selector 0x1D), DisposeHandle and
@@ -94,8 +98,13 @@
  * master pointer no longer points at it. A domain dropped this way is not
  * added again while its process is still listed.
  *
- * The program running the engine is not a domain. Run it only with virtual
- * memory off.
+ * The program running the engine is not a domain.
+ *
+ * Virtual memory: what the timer, the hooks and the fallback handler use
+ * is held in physical memory (the program's partition and the system heap
+ * blocks), and the control block and owner table are locked where they
+ * are (the kernel uses them by physical address). The sweep runs at
+ * interrupt time only with virtual memory off.
  */
 
 #ifndef ENGINE_H
@@ -148,7 +157,27 @@ typedef struct {
     unsigned long mp;             /* the partition's master pointer, or 0 */
     volatile unsigned long quit;  /* dropped (ExitToShell, or its partition
                                      freed) while the process is listed */
+    unsigned long code_lo, code_hi; /* its native code's pages outside the
+                                       partition, owned in the table only */
+    unsigned long code_state;     /* kCode* */
 } Domain;
+
+/* Domain.code_state. With virtual memory on, the Code Fragment Manager can
+ * keep an application's code section outside its partition (file mapped),
+ * where the kernel would count its stores as the system's. The engine
+ * finds the code section of the application's main fragment from the
+ * application's own context, at an event call (the GetNextEvent filter
+ * stub, below), and gives its pages the application's owner byte
+ * in the owner table only: they are not protected and have no bitmap bit.
+ * Pages that already have an owner, or are in the partition, are left
+ * alone. Code in other fragments (an application's own shared libraries)
+ * still counts as the system's. */
+enum {
+    kCodeUnknown = 0, /* not looked for yet */
+    kCodeInside,      /* in the partition (virtual memory off), or none */
+    kCodeOwned,       /* code_lo-code_hi owned */
+    kCodeFailed       /* not found: kCodeFailed + the step that failed */
+};
 
 /* A temporary memory chunk (see above). */
 enum {
@@ -184,8 +213,25 @@ typedef struct {
  * can put that routine back when it switches out an application with its
  * own patch of the trap; the timer then puts the stub back. It writes an
  * entry only when it holds exactly *_old, so the chain cannot loop. */
-enum { kPoolMagic = 'Pool', kPoolOsd = 28, kPoolDh = 43, kPoolEts = 12 };
+enum {
+    kPoolMagic = 'Pool',
+    kPoolOsd = 28,
+    kPoolDh = 43,
+    kPoolEts = 12,
+    kPoolGne = 27
+};
 
+/* The GetNextEvent filter (jGNEFilter, low memory 0x29A, which every
+ * application shares; WaitNextEvent and GetNextEvent call it in the
+ * calling application's context) adds a newly launched application as a
+ * domain at its first event call, before it lets any other process run
+ * (the half-second refresh can come much later), and finds an
+ * application's native code. It calls the engine only when ApplZone
+ * differs from last, so once per process switch, and then goes on to the
+ * filter that was installed before it (gne_old, or none). The trap table
+ * cannot be used for this: each application has its own patches of
+ * _WaitNextEvent and _GetNextEvent, which the Process Manager swaps on
+ * every switch. */
 typedef struct {
     unsigned long magic;
     volatile unsigned short enabled;
@@ -193,6 +239,10 @@ typedef struct {
     unsigned long osd_old, dh_old, ets_old;
     RoutineDescriptor rd_new, rd_disposed, rd_quit;
     unsigned short osd[kPoolOsd], dh[kPoolDh], ets[kPoolEts];
+    volatile unsigned long last; /* ApplZone at the last filter call */
+    unsigned long gne_old;
+    RoutineDescriptor rd_launch;
+    unsigned short gne[kPoolGne];
 } PoolStubs;
 
 typedef struct {
@@ -203,6 +253,7 @@ typedef struct {
     unsigned long quits;  /* domains dropped at ExitToShell */
     unsigned long gone;   /* domains and chunks the sweep found freed */
     unsigned long reinstalled; /* stubs the timer put back in the table */
+    unsigned long launched; /* domains added at an event call */
 } PoolCounters;
 
 /* A cross-domain writer: a store site, the application current at the
@@ -216,13 +267,21 @@ typedef struct {
     char target[16];
 } Writer;
 
+/* Offense.denied */
+enum {
+    kOffenseAllowed = 0, /* logged only */
+    kOffenseStopped = 1, /* denied, and the application was stopped */
+    kOffenseBlocked = 2  /* the kernel dropped the store; the writer, not
+                            current (or an MP task), goes on */
+};
+
 /* A store by an application's own code into another domain. */
 typedef struct {
     unsigned long seq;  /* 1 for the first */
     unsigned long time; /* seconds since 1904 */
     unsigned long pc;   /* native PC, or the 68k instruction after the store */
     unsigned long addr, source;
-    unsigned long denied; /* the application was stopped */
+    unsigned long denied; /* kOffense* */
     char writer[16];
     char target[16];
 } Offense;
@@ -385,6 +444,7 @@ typedef struct {
     PoolCounters pc;
     unsigned long vm;           /* virtual memory is on */
     unsigned long pm_zone;      /* the Process Manager's zone, or 0 */
+    unsigned long owners_size;  /* the owner table's bytes (whole pages) */
     Chunk chunks[kMaxChunks];
 } State;
 

@@ -134,20 +134,66 @@ limits.
        (step 4).
      - A store by an application that is not current, or by another task,
        is logged and allowed, never denied: only the current application
-       can be stopped cleanly.
+       can be stopped cleanly. (Step 9 drops these stores.)
      - The control block and the owner table are system heap memory that
        any code can write.
      - The CPU plugin's pages are still kept writable by patch 2.
-4. **Pages per application.** Every page has one owner:
-   - An application's partition starts and ends on page boundaries. Its
-     heap, stack and globals are its own.
-   - Temporary memory: an application's first `TempNewHandle` assigns it a
-     page in the Process Manager's heap. Its later blocks come from its
-     pages, and it gets another page when they are full.
-   - The system heap belongs to the system.
-   - Owners are set when pages are handed out and cleared when an
-     application quits, by patches to the Memory Manager and the Process
-     Manager (from the extension, or in the ROM image).
+4. **Pages per application.** Done (2026-11-12): temporary memory pools
+   in `common/engine.c` (see the comment in `common/engine.h`). An
+   application's pages are the whole pages of its partition and of its
+   temporary memory chunks:
+   - `TempNewHandle` allocates the handle in a chunk of the calling
+     application's own. A chunk is temporary memory of that application
+     from the Process Manager (so it is freed when the application quits),
+     moved high with `MoveHHi` and locked, with a Memory Manager zone on
+     the whole pages inside it after a 16-byte signature. Blocks move only
+     inside the chunk, so the owner of its pages never goes stale. A new
+     chunk is made when no chunk of the application has room: at least
+     128 KB, or one sized for a larger request.
+   - The application's first 128 KB chunk is kept when it is empty; any
+     other chunk is freed when its last handle is disposed, in its owner's
+     context.
+   - When a chunk cannot be made, the request goes on to the Process
+     Manager and the block has no owner.
+   - An owner must never outlive the memory: a stale owner can make the
+     kernel stop an application for writing its own new memory. The
+     engine drops an application's domain and chunks when it calls
+     `ExitToShell`, before the Process Manager frees them, and a sweep
+     drops any domain or chunk whose master pointer no longer points at it
+     (each tick with virtual memory off, and before each `TempNewHandle`).
+   - Needs the kernel's owner check: the hooks' current range is the
+     partition alone.
+
+   Findings (2026-11-12, `tmem/` and Scribble on the test machine):
+   - Native code calls `TempNewHandle` (`_OSDispatch` selector 0x1D),
+     `HLock`, `HUnlock` and `DisposeHandle` through the trap table, and the
+     Process Manager's `TempHLock`, `TempHUnlock` and `TempDisposeHandle`
+     call the Memory Manager through it too. Those three work unchanged on
+     a handle in a chunk's zone.
+   - A partition and each temporary block are handles in the Process
+     Manager's zone. A block header ends with the handle relative to the
+     zone: zone + relative handle is the master pointer. After
+     `DisposeHandle` the master pointer is on the free list and no longer
+     points at the block.
+   - The Process Manager keeps an application's `NSetTrapAddress` patches
+     as that application's own: they are in the trap table only while it
+     is current. The Enforcer Extension is an application, so the engine
+     writes the trap table itself (OS traps at 0x400, Toolbox traps at
+     0xE00). Each stub goes on to the routine that was in the table when
+     the engine installed it; when a switch puts that routine back, the
+     timer puts the stub back (242 times in the first minute after
+     startup).
+   - Results: in a session with System Profiler, Sherlock, Calculator,
+     Scrapbook and Stickies, a Finder copy of 336 items and a large
+     paging run, the pools took every `TempNewHandle` from an application
+     (32,749 in one run, none passed on), freed 186 empty chunks, and
+     dropped the domains and chunks of 9 applications at `ExitToShell`;
+     the sweep found none left over. No offense was recorded but
+     Scribble's. Scribble `T` (a store into the Finder's temporary memory)
+     was denied with a clean stop.
+   - Fixed on the way: a domain added for the current application did not
+     become current until the next switch, so the kernel could not deny
+     its stores. The next tick now looks again.
 
    What the Process Manager's heap holds (2026-11-12, from memory dumps of
    the test machine; see [Reading guest memory](#reading-guest-memory)):
@@ -172,19 +218,17 @@ limits.
      0x1E7Exxxx) is in two of its blocks, so by the system's own records
      it is system code.
    - Where the Process Manager records an application's own temporary
-     memory is not found yet: a 64 KB `TempNewHandle` by Scribble (test
-     `m`) put its handle in no process entry or handle list found so far.
-     A patch to `TempNewHandle` from the extension is the other way, if
-     PowerPC callers reach it through the trap.
+     memory was not found: a 64 KB `TempNewHandle` by Scribble put its
+     handle in no process entry or handle list. The pools do not need it.
 5. **Attribution.** Judge a store by the code doing it: an application's
    code fragments and code resources in its partition, or system code in
    ROM and the system heap. For 68k code that is the emulated PC (r24).
    This covers code that runs for one application while another is current
    (VBL and Time Manager tasks, I/O completion routines, Open Transport
    notifiers) and system code writing on an application's behalf. Step 3
-   does this for code inside a partition; code an application owns
-   outside it (in temporary memory, or loaded into the system heap for
-   it) still counts as the system's.
+   does this for code inside a partition, and step 4 for code in an
+   application's temporary memory chunks. Code loaded into the system heap
+   for an application still counts as the system's.
 6. **Extension and control panel.** Done (2026-11-12): the Enforcer
    Extension and the Enforcer control panel from the prototype now use the
    NanoKernel's owner check.
@@ -213,8 +257,8 @@ limits.
      the Process Manager hooks of step 4 set owners at once.
 7. **Installer for users.** Done (2026-11-12): `installer/`, Enforcer
    Installer. It patches the user's own Mac OS ROM file, so no Apple bytes
-   ship: `installer/kpatch.h` holds only the 939 bytes that differ between
-   the stock kernel and ours (`tools/make-kpatch.py`).
+   ship: `installer/kpatch.h` holds only the 1,031 bytes that differ
+   between the stock kernel and ours (`tools/make-kpatch.py`).
    - It accepts any Mac OS ROM file whose ROM image holds NanoKernel 2.28
      as Apple made it (CRC-32 of its 105,280 bytes, zeros after it), and
      recognizes one it has patched.
@@ -226,8 +270,9 @@ limits.
        it again.
      - Moves the parcels after the image, and sets the boot script's
        `parcels-size` and `info-size` and both checksums.
-     - The System Enabler moves too (by 720 bytes); the installer moves the
-       data fork offsets in the resource fork's `cfrg` to match.
+     - The System Enabler moves too (by 800 bytes with this patch); the
+       installer moves the data fork offsets in the resource fork's `cfrg`
+       to match.
    - `installer/lzss.c` is Okumura's LZSS. It gives back Apple's
      compressed image byte for byte, so the patched file differs from the
      one `kernel/build.sh` makes with tbxi only in padding bytes between
@@ -254,13 +299,155 @@ limits.
      the patched one.
    - OldWorld Macs load the kernel from a `krnl` resource in the System
      file instead, which needs its own path. Not done.
+8. **Virtual memory.** Done (2026-11-12): Enforcer runs with virtual
+   memory on.
+   - What the kernel does with the protection, from its source
+     (`NKVMCalls.s`, `NKInterrupts.s`): the paging calls `VMMarkResident`
+     and `VMMarkBacking` change only a page's resident bit and physical
+     page, so the read-only bit that `MPSetAreaAccess` sets in the PLE
+     stays while a page goes out to disk and back. A store to a page that
+     is not resident takes the page fault path (`PagingFunc1`, then the
+     Virtual Memory Manager in the blue task); once the page is back, the
+     store faults again as a protection fault and reaches the owner check.
+     The hooks pass page faults on (they take only write violations).
+   - Two calls can change the read-only bit:
+     - `setPTEntryGivenPage` (VM call 20) writes a page's 68k page table
+       entry, read-only bit included. A protect between the Virtual Memory
+       Manager's read of the entry and its write can be lost until the
+       engine protects the page again.
+     - `VMExchangePages` swaps two pages' PLEs, protection included. Only
+       `LockMemoryContiguous` uses it.
+   - The engine:
+     - `LockMemoryContiguous` on the control block (the kernel needs one
+       physical range) and `LockMemory` on the owner table, before reading
+       their physical addresses.
+     - `HoldMemory` on the extension's partition (the timer, the fallback
+       handler and the stubs' native code run from it) and on the system
+       heap blocks the timer and hooks use.
+     - The owner table covers the whole 1 GB span (with virtual memory
+       off, it is sized from Gestalt `'lram'`).
+     - The sweep reads master pointers in the Process Manager's heap,
+       which can be paged out, so with virtual memory on it runs only at
+       event time.
+   - Finding: with virtual memory on, the Code Fragment Manager keeps an
+     application's code section outside its partition: file mapped at
+     0x3E7xxxxx (above logical RAM), or in a Process Manager heap block.
+     Scribble's code was at 0x3D3C2000, below its partition at 0x3CDF0BA0.
+     The kernel counted that code as the system's, so no native store was
+     an offense. The engine now finds each application's main code
+     section and gives its pages the application's owner byte in the owner
+     table only (`find_code` in `common/engine.c`, `kCodeOwned` in
+     `common/engine.h`):
+     - It reads the `cfrg` resource and the PEF container from the
+       application's file with the File Manager: the main symbol's offset
+       in its data section, the symbol's transition vector before
+       relocation (main's offset in the code section and the TOC's offset
+       in the data section, unpacking pattern-initialized data), and the
+       code section's length and first bytes.
+     - It searches the partition for the transition vector: a pair whose
+       second word is its own address minus main's offset plus the TOC's
+       offset. A candidate counts only when the code section it gives is
+       aligned as the container says, above the system heap, in no other
+       partition, and holds the container's code bytes at its start and at
+       main (read under `HoldMemory`, so an address with no page fails
+       instead of faulting). Without the byte check, a self-pointer
+       matched for Folder Actions and gave code at 0x0000C000.
+     - It runs from the extension at each refresh, for every domain not
+       looked at yet, and with virtual memory off it does nothing (the code
+       is in the partition).
+   - Test on `disks/os9-pool.qcow2` with virtual memory at 990 MB (512 MB
+     of RAM):
+     - The kernel's owner check registered, and the pools and the clean
+       stop worked.
+     - Scribble `P` wrote 600 MB of temporary memory and read it back,
+       so the other applications' pages went out to disk and back: 76,246
+       ticks (21 minutes on the emulated disk), 0 words wrong.
+     - Code found: Finder, Folder Actions, DVD AutoLauncher, FBC Indexing
+       Scheduler, Graphing Calculator (0x3CB31000 to 0x3CBF8000, below its
+       partition) and Scribble. Control Strip Extension had no match, so
+       its code still counts as the system's.
+     - Scribble `n` was stopped cleanly. No other offense was recorded.
+
+9. **Stores the engine cannot stop.** Done (2026-11-13): in enforce mode
+   the kernel drops them (`task_write` in `kernel/nanokernel.s`).
+   - Before, a store by an application that was not current, or by a
+     Multiprocessing Services task, into another application's page was
+     logged and allowed: only the current application can be stopped
+     cleanly.
+   - Now the kernel decides an offense into another application's page by
+     who is current:
+     - Into the current application's page: allowed and logged. The code
+       can be another application's that the current one called, such as
+       a Gestalt function in that application's partition.
+     - By the current application in the blue task, with the 68k interrupt
+       mask at 0: denied, and the application is stopped as before.
+     - Any other: dropped. The kernel moves SRR0 past its own emulated
+       store and returns to its emulation, which finishes as after the
+       store; memory is not changed and the writer goes on. stwcx_probe's
+       store is allowed instead, since dropping it would make the caller's
+       `lwarx` and `stwcx.` loop forever.
+   - The interrupt mask matters: Scribble `V` (a store from its Time
+     Manager task while it was current) was denied and Scribble stopped at
+     interrupt time, which left the Time Manager's dispatch unfinished. No
+     Time Manager task ran again, the engine's timer included, and the
+     machine hung. The mask is in the emulator's r25 (bits 29-31): the
+     task's own r25 when the emulator faulted, or the one saved in the
+     emulator's context block (KDP + 0x658, then + 0x1CC) when native code
+     did.
+   - The engine logs a dropped store as a blocked offense
+     (`kOffenseBlocked`), and the extension posts a notification that the
+     writer was not stopped, at most once a minute for the same writer and
+     target. The control panel counts them as blocked.
+   - Test on `disks/os9-pool.qcow2`: Scribble `Y` (an MP task's store into
+     the Finder) and `V` (a Time Manager task's store into Control Strip
+     Extension) both read back the old value, Scribble went on running,
+     and the engine's timer kept running.
+   - The GetNextEvent filter (`jGNEFilter`) adds a newly launched
+     application as a domain at its first event, before it lets another
+     process run. Patching `_WaitNextEvent` and `_GetNextEvent` in the trap
+     table does not work: each application has its own patches of them,
+     which the Process Manager swaps on every switch, and the engine's stub
+     went on to the extension's own patch. Background-only applications
+     get only null events, which do not reach the filter; the refresh adds
+     them.
+   - Enforcer Installer updates an earlier release: when the Mac OS ROM
+     file has another patch and Enforcer Backup holds the stock file, it
+     patches the backup, moves the earlier patched file to the Trash and
+     puts the new one in its place.
 
 Not covered:
 - An overrun inside an application's own memory. It can only damage that
   application.
 - Writes by device DMA, which do not go through the MMU.
-- Virtual memory. Keep it off until the kernel's pager and the owner table
-  are known to agree.
+
+Known holes, worst first:
+1. A store by another application's code into the current application's
+   page is allowed and logged (it can be a callback storing results).
+2. An application's deferred tasks and I/O completion routines can run
+   with the 68k interrupt mask at 0. A store by one of them, while its
+   application is current, is denied and the application stopped from
+   there, which can leave the Deferred Task Manager or the I/O
+   unfinished.
+3. A store the kernel allows opens the page for every task until the
+   engine protects it again on its next tick (16 ms).
+4. The partly used first and last pages of a partition have no owner. The
+   last one holds the top of the application's globals (its A5 world).
+5. With virtual memory on, code in an application's other fragments (its
+   own shared libraries and plug-ins), and all of its code when the
+   engine finds no match, counts as the system's.
+6. An application launched since the engine's last refresh (up to half a
+   second) has no domain until its first event or `TempNewHandle`.
+7. The control block and the owner table are in the system heap, where any
+   code can write them.
+8. The system heap is log only.
+9. Logical memory above 1 GB has no owner: the bitmap and the owner table
+   cover 1 GB.
+10. An application's own patch of `_OSDispatch`, `DisposeHandle` or
+    `ExitToShell`, made before the engine started, goes around the
+    engine's stub while that application is current. Its temporary memory
+    then has no owner, and the engine finds its quit with the sweep.
+11. With virtual memory on, a protect can be lost to `setPTEntryGivenPage`
+    (step 8) until the engine protects the page again.
 
 Later, as an opt-in debug mode for one application: a protected page after
 each large block, to catch an overrun past its end when it happens.
@@ -321,6 +508,7 @@ What it showed, which the plan depends on:
 | `installer/` | Enforcer Installer: patches the Mac OS ROM file, installs and removes Enforcer |
 | `xlog/` | XLog, Guard, SysLog and SysGuard: console front ends on the engine |
 | `scribble/` | Scribble: stores into other memory, to test the engine |
+| `tmem/` | TMem: how temporary memory and trap patches work, and a pool prototype |
 | `h68k/` | H68KTest: tests for both write hooks |
 | `wlog/` | WLog: the first write logger |
 | `probe/` | Probe: the first page protection experiment |
@@ -329,8 +517,8 @@ What it showed, which the plan depends on:
 To build them, run `./build.sh`, or name directories:
 `./build.sh xlog scribble`. Each builds a MacBinary `.bin` in its `build/`
 folder with the toolchain in `$OS9_PROTECT/toolchain`. The `enforcer/`
-build also needs Python 3. To run them, boot a guest with virtual memory
-off and copy them in:
+build also needs Python 3. To run them, boot a guest and copy them in
+(`tools/lmem.py` reads guest memory only with virtual memory off):
 
 ```bash
 SCRATCH=1 DISK=disks/os9-novm.qcow2 ../os9-protect/run.sh &

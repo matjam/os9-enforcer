@@ -46,7 +46,9 @@ enum {
     kEvf68k = 1,     /* the 68k emulator's store */
     kEvfTask = 2,    /* not the blue task (an MP task) */
     kEvfOffense = 4, /* an application's code, not into its own page */
-    kEvfDenied = 8   /* and denied: the page stays protected */
+    kEvfDenied = 8,  /* and denied: the page stays protected */
+    kEvfSkipped = 16 /* or dropped: the store was skipped, the page stays
+                        protected, and the writer goes on */
 };
 
 /* A store the kernel decided. For 68k stores, r24 is the next 68k
@@ -76,13 +78,15 @@ typedef struct {
     volatile unsigned long seq;         /* events recorded */
     unsigned long frame;                /* the emulator's frame code, or 0 */
     volatile unsigned long allowed, logged, denied, bail, self;
-    unsigned long reserved[51];
+    volatile unsigned long skipped; /* 0 with a kernel that never skips */
+    unsigned long reserved[50];
     unsigned long pages[kKcbTablePages]; /* physical */
     KEvent ring[kKcbRing];              /* event n at (n - 1) % kKcbRing */
 } KernelCB;
 
 _Static_assert(offsetof(KernelCB, frame) == 0x1C, "CB_FRAME");
 _Static_assert(offsetof(KernelCB, self) == 0x30, "CB_SELF");
+_Static_assert(offsetof(KernelCB, skipped) == 0x34, "CB_SKIPPED");
 _Static_assert(offsetof(KernelCB, pages) == 0x100, "CB_PAGES");
 _Static_assert(offsetof(KernelCB, ring) == 0x200, "CB_RING");
 _Static_assert(sizeof(KEvent) == 32, "event size");
@@ -101,6 +105,16 @@ typedef struct {
 } KcbTranslation;
 
 extern OSErr GetPhysical(KcbTranslation *addresses, unsigned long *count);
+
+/* Virtual Memory Manager calls (InterfaceLib), which the Multiversal
+   Interfaces do not declare. Hold keeps pages in physical memory; Lock
+   also keeps them at the same physical addresses, and LockMemoryContiguous
+   makes them one physical range first. */
+extern OSErr HoldMemory(void *address, unsigned long count);
+extern OSErr UnholdMemory(void *address, unsigned long count);
+extern OSErr LockMemory(void *address, unsigned long count);
+extern OSErr LockMemoryContiguous(void *address, unsigned long count);
+extern OSErr UnlockMemory(void *address, unsigned long count);
 
 /* The physical address of [addr, addr + len) when it is one physical
    range, or 0. */

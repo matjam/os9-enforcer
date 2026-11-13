@@ -27,7 +27,21 @@
  *   M  allocate 1 MB of temporary memory and dispose of it: its chunk is
  *      freed;
  *   T  a native store into another application's temporary memory chunk
- *      (the Finder's if it has one): Enforcer denies it.
+ *      (the Finder's if it has one): Enforcer denies it;
+ *   P  write and read back up to 600 MB of temporary memory, then dispose
+ *      of it: with virtual memory on, other applications' pages are paged
+ *      out and in.
+ *
+ * Stores by code of an application that is not current, which the
+ * patched NanoKernel drops in enforce mode (README, Known holes). Each one
+ * stores the target word's value with its bits flipped, reads the word
+ * back, and stores the old value again: the word read back tells whether
+ * the store was dropped.
+ *   Y  from an MP task, into the Finder's memory (this application is
+ *      current);
+ *   V  from a Time Manager task 5 seconds later, into the memory of a
+ *      background-only application; make the Finder current in those 5
+ *      seconds. The result is printed with the next command.
  */
 
 #include <stdio.h>
@@ -53,6 +67,62 @@ enum {
     kBenchMicros = 2000000,
     kHnatSlot = 0x68FFF44C /* common/hnat.h */
 };
+
+/* Multiprocessing Services (MPLibrary), not in the Multiversal
+   Interfaces. */
+typedef struct OpaqueMPTaskID *MPTaskID;
+typedef struct OpaqueMPQueueID *MPQueueID;
+typedef OSStatus (*MPTaskProc)(void *parameter);
+extern OSStatus MPCreateQueue(MPQueueID *queue);
+extern OSStatus MPDeleteQueue(MPQueueID queue);
+extern OSStatus MPCreateTask(MPTaskProc entry, void *parameter,
+                             unsigned long stack_size, MPQueueID notify,
+                             void *term1, void *term2, unsigned long options,
+                             MPTaskID *task);
+extern OSStatus MPWaitOnQueue(MPQueueID queue, void **p1, void **p2,
+                              void **p3, long timeout);
+enum { kMPForever = 0x7FFFFFFF };
+
+/* The flip-and-restore store of the Y and V tests. */
+typedef struct {
+    volatile unsigned long *target;
+    volatile unsigned long old, seen, done;
+} FlipTest;
+
+static void flip(FlipTest *f)
+{
+    unsigned long v = *f->target;
+    f->old = v;
+    *f->target = v ^ 0x5A5A5A5A;
+    f->seen = *f->target;
+    *f->target = v;
+    f->done = 1;
+}
+
+static void flip_report(const char *who, FlipTest *f)
+{
+    printf("%s: %08lX at %08lX read back as %08lX: %s\n", who, f->old,
+           (unsigned long)f->target, f->seen,
+           f->seen == f->old ? "the store was dropped" : "the store landed");
+}
+
+static OSStatus mp_flip(void *parameter)
+{
+    flip((FlipTest *)parameter);
+    return 0;
+}
+
+typedef struct {
+    TMTask tm;
+    FlipTest f;
+} TimerFlip;
+
+static void tm_flip(TMTask *tm)
+{
+    flip(&((TimerFlip *)tm)->f);
+}
+
+enum { kTimerInfo = 0x0000B802 }; /* register-based, A1 = task */
 
 /* store(addr, value), 68k, C calling convention. */
 static const unsigned short code68k[] = {
@@ -105,6 +175,44 @@ static unsigned long long_at(unsigned long addr)
     return ((unsigned long)p[0] << 16) | p[1];
 }
 
+/* Enforcer's state, or 0 when it is not running. */
+static State *engine_state(void)
+{
+    long value = 0;
+    State *s = 0;
+    if (Gestalt(kEngineGestalt, &value) == noErr && value >= 0x1000)
+        s = (State *)value;
+    return s && s->magic == kEngineMagic && s->running ? s : 0;
+}
+
+/* A word in the middle of the partition of a background-only application
+   that Enforcer manages (not this one, not the Finder), or 0. */
+static volatile unsigned long *background_target(char *name)
+{
+    State *s = engine_state();
+    if (!s)
+        return 0;
+    unsigned long me = long_at(0x2AA); /* ApplZone */
+    for (int i = 0; i < kMaxDomains; i++) {
+        const Domain *d = &s->domains[i];
+        if (!d->live || d->dying || i == s->sys_dom ||
+            (me >= d->location && me - d->location < d->size) ||
+            !strcmp(d->name, "Finder") || d->hi - d->lo < 0x2000)
+            continue;
+        ProcessInfoRec info;
+        memset(&info, 0, sizeof info);
+        info.processInfoLength = sizeof info;
+        ProcessSerialNumber psn = d->psn;
+        if (GetProcessInformation(&psn, &info) ||
+            !(info.processMode & modeOnlyBackground))
+            continue;
+        strcpy(name, d->name);
+        return (volatile unsigned long *)((((d->lo + d->hi) / 2) &
+                                           ~0xFFFUL) + 0x100);
+    }
+    return 0;
+}
+
 /* A word in the middle of the system heap: from SysZone to its bkLim. */
 static volatile unsigned long *sys_target(void)
 {
@@ -117,16 +225,6 @@ static unsigned long long micros(void)
     MicroTime w;
     Microseconds(&w);
     return (unsigned long long)w.hi << 32 | w.lo;
-}
-
-/* Enforcer's state, or 0 when it is not running. */
-static State *engine_state(void)
-{
-    long value = 0;
-    State *s = 0;
-    if (Gestalt(kEngineGestalt, &value) == noErr && value >= 0x1000)
-        s = (State *)value;
-    return s && s->magic == kEngineMagic && s->running ? s : 0;
 }
 
 /* Whether handle h lives in one of Enforcer's temporary memory chunks:
@@ -293,16 +391,62 @@ int main(void)
            *(unsigned long *)(void *)&main, (unsigned long)c);
     volatile unsigned long *sys = sys_target();
     printf("system heap target %08lX\n", (unsigned long)sys);
+    static TimerFlip tf;
+    int tf_armed = 0;
     for (;;) {
         printf("\nn native store, 6 68k store, b BlockMoveData, o own "
                "heap, s/S native/68k store into the system heap, t time "
                "traps, m temporary memory, M 1 MB of it, T store into "
-               "another application's, q quit; then Return\n");
+               "another application's, P page 600 MB, Y from an MP task, "
+               "V from a Time Manager task, q quit; then Return\n");
         int ch = getchar();
         while (ch != '\n' && getchar() != '\n')
             ;
+        if (tf_armed && tf.f.done) {
+            flip_report("Time Manager task", &tf.f);
+            RmvTime((QElemPtr)&tf.tm);
+            tf_armed = 0;
+        }
         unsigned long v = *target;
         switch (ch) {
+        case 'Y': {
+            static FlipTest f;
+            MPQueueID q;
+            MPTaskID task;
+            memset((void *)&f, 0, sizeof f);
+            f.target = target;
+            if (MPCreateQueue(&q) ||
+                MPCreateTask(mp_flip, &f, 0, q, 0, 0, 0, &task)) {
+                printf("could not start an MP task\n");
+                continue;
+            }
+            MPWaitOnQueue(q, 0, 0, 0, kMPForever);
+            MPDeleteQueue(q);
+            flip_report("MP task, into the Finder", &f);
+            continue;
+        }
+        case 'V': {
+            char name[16];
+            if (tf_armed) {
+                printf("the Time Manager task is still waiting\n");
+                continue;
+            }
+            volatile unsigned long *t = background_target(name);
+            if (!t) {
+                printf("no background-only application found\n");
+                continue;
+            }
+            memset(&tf, 0, sizeof tf);
+            tf.f.target = t;
+            tf.tm.tmAddr = (ProcPtr)NewRoutineDescriptor(
+                (ProcPtr)tm_flip, kTimerInfo, kPowerPCISA);
+            InsTime((QElemPtr)&tf.tm);
+            PrimeTime((QElemPtr)&tf.tm, 5000);
+            tf_armed = 1;
+            printf("in 5 seconds, a store into %s at %08lX: make the "
+                   "Finder current now\n", name, (unsigned long)t);
+            continue;
+        }
         case 's':
             v = *sys;
             printf("native store of %08lX to %08lX\n", v, (unsigned long)sys);
@@ -364,6 +508,41 @@ int main(void)
                    in_chunk(h) ? "in a chunk" : "not in a chunk");
             pool_report();
             DisposeHandle(h);
+            printf("disposed\n");
+            pool_report();
+            continue;
+        }
+        case 'P': {
+            /* Paging: up to 600 MB of temporary memory in 8 MB blocks, a
+               word written on every page, then all of it disposed. With
+               virtual memory on and less physical memory than that, other
+               applications' pages (protected ones too) go out to disk. */
+            enum { kBlocks = 75, kBlockSize = 0x800000 };
+            Handle hs[kBlocks];
+            int n = 0;
+            unsigned long t0 = TickCount();
+            for (; n < kBlocks; n++) {
+                OSErr err = 0;
+                hs[n] = TempNewHandle(kBlockSize, &err);
+                if (!hs[n])
+                    break;
+                HLock(hs[n]);
+                volatile unsigned long *p = (volatile unsigned long *)*hs[n];
+                for (unsigned long i = 0; i < kBlockSize / 4; i += 1024)
+                    p[i] = i;
+            }
+            unsigned long bad = 0;
+            for (int j = 0; j < n; j++) {
+                volatile unsigned long *p = (volatile unsigned long *)*hs[j];
+                for (unsigned long i = 0; i < kBlockSize / 4; i += 1024)
+                    if (p[i] != i)
+                        bad++;
+            }
+            printf("%d MB written and read back in %lu ticks, %lu wrong\n",
+                   n * (kBlockSize >> 20), TickCount() - t0, bad);
+            pool_report();
+            for (int j = 0; j < n; j++)
+                DisposeHandle(hs[j]);
             printf("disposed\n");
             pool_report();
             continue;
