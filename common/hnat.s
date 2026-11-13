@@ -20,7 +20,9 @@
 # memory. The ring entry's pc gets bit 0 set. When the fault address is at
 # or above D_DENY_FROM, the hook then leaves the page protected, stores
 # ApplZone at D_STOP (when set) to name the application to stop, and passes
-# the fault on to the Exception Manager.
+# the fault on to the Exception Manager. A recorded store to the page in the
+# word at D_KDENY (the page the kernel's owner check denied, common/kcb.h)
+# is denied in the same way, whatever its address, and the word cleared.
 #
 # Entry state: as for h68k.s, with the NCB in r3 and NCB+0x54 (the
 # Exception Manager's TVector) in r4. Fault details in the NCB: +0x40 flags
@@ -58,6 +60,7 @@
         .set    D_COUNT_DENIED, 0x8C
         .set    D_DENIED, 0x90          # the last one: pc, addr, r3, zone, sp
         .set    D_STOP, 0xA4            # gets the zone on a denial, or 0
+        .set    D_KDENY, 0xAC           # the kernel's denied page, or 0
         .set    RING_N, 256
         .set    APPCODE, 6              # CR bit (cr1.eq): the current app's code
 
@@ -175,6 +178,17 @@ pc_known:
         stw     1,R_SP(6)
 
 decide:
+        lwz     5,D_KDENY(4)            # the kernel's owner check denied
+        cmpwi   5,0                     # this page: deny
+        beq     by_rule
+        lwz     6,0(5)
+        rlwinm  0,7,0,0,19
+        cmpw    6,0
+        bne     by_rule
+        li      6,0
+        stw     6,0(5)
+        b       deny
+by_rule:
         bne     1,open
         lwz     5,D_DENY_FROM(4)
         cmplw   7,5

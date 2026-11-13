@@ -85,7 +85,11 @@ typedef struct {
     HookPassed denied;           /* the last store denied */
     volatile unsigned long *stop; /* gets ApplZone on a denial, or 0 */
     unsigned long frame;         /* h68k: the emulator's frame code, or 0 */
-    unsigned long reserved[5];
+    /* The page the kernel's owner check denied last (common/kcb.h), or 0.
+       A recorded store to that page is denied whatever its address, and
+       the word cleared. */
+    volatile unsigned long *kdeny;
+    unsigned long reserved[4];
 } HookData;
 
 _Static_assert(sizeof(HookEvent) == 32, "ring entry size");
@@ -101,6 +105,7 @@ _Static_assert(offsetof(HookData, count_denied) == 0x8C, "D_COUNT_DENIED");
 _Static_assert(offsetof(HookData, denied) == 0x90, "D_DENIED");
 _Static_assert(offsetof(HookData, stop) == 0xA4, "D_STOP");
 _Static_assert(offsetof(HookData, frame) == 0xA8, "D_FRAME");
+_Static_assert(offsetof(HookData, kdeny) == 0xAC, "D_KDENY");
 _Static_assert(sizeof(HookData) == 0xC0, "data block size");
 
 /* A pointer to a fixed address. The empty asm hides the constant from GCC,

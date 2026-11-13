@@ -21,7 +21,10 @@
 # to name the application to stop, and passes the fault on, and the
 # emulator gives the application a bus error. A store by the emulator's own
 # code that fills a 68k-to-native call frame (D_FRAME, FRAME_LEN bytes) is
-# not the application's, although r24 then still points at its trap.
+# not the application's, although r24 then still points at its trap. A
+# recorded store to the page in the word at D_KDENY (the page the kernel's
+# owner check denied, common/kcb.h) is denied in the same way, whatever its
+# address, and the word cleared.
 #
 # Entry state, from the kernel (NKInterrupts.s LetBlueHandleOwnException):
 #   r3  = ECB (logical)          free: the original overwrites it first
@@ -85,6 +88,7 @@
         .set    D_DENIED, 0x90          # the last one: pc, addr, r24, zone, a7
         .set    D_STOP, 0xA4            # gets the zone on a denial, or 0
         .set    D_FRAME, 0xA8           # the emulator's frame code, or 0
+        .set    D_KDENY, 0xAC           # the kernel's denied page, or 0
         .set    FRAME_LEN, 0x70
         .set    RING_N, 256
         .set    APPCODE, 6              # CR bit (cr1.eq): the current app's code
@@ -120,36 +124,30 @@ h68k_start:
         bne     chain
 
         stw     5,D_R5(3)
-        lwz     4,0x74+E(3)             # fault address
-        lwz     5,D_LO(3)
-        cmplw   4,5
-        blt     chain_write
-        lwz     5,D_HI(3)
-        cmplw   4,5
-        bge     chain_write
-
         stw     0,D_R0(3)
         stw     6,D_R6(3)
         stw     7,D_R7(3)
+        lwz     4,0x74+E(3)             # fault address
+        lwz     5,D_LO(3)
+        cmplw   4,5
+        blt     pass
+        lwz     6,D_HI(3)
+        cmplw   4,6
+        bge     pass
 
         # With a bitmap, handle the page only if its bit is set: bit
         # (addr - lo) >> 12, most significant bit of each byte first.
-        lwz     5,D_BITMAP(3)
-        cmpwi   5,0
+        lwz     6,D_BITMAP(3)
+        cmpwi   6,0
         beq     handle
-        lwz     6,D_LO(3)
-        subf    6,6,4
-        srwi    6,6,12                  # page index
-        srwi    7,6,3
-        lbzx    7,5,7                   # its byte
-        rlwinm  6,6,0,29,31             # its bit, 0 = most significant
-        slw     7,7,6
+        subf    5,5,4                   # addr - lo
+        srwi    5,5,12                  # page index
+        srwi    7,5,3
+        lbzx    7,6,7                   # its byte
+        rlwinm  5,5,0,29,31             # its bit, 0 = most significant
+        slw     7,7,5
         andi.   7,7,0x80
-        bne     handle
-        lwz     0,D_R0(3)
-        lwz     6,D_R6(3)
-        lwz     7,D_R7(3)
-        b       chain_write
+        beq     pass
 
 handle:
         # The current application's own pages: count only.
@@ -214,6 +212,17 @@ pc_known:
         stw     1,R_A7(7)
 
 decide:
+        lwz     5,D_KDENY(3)            # the kernel's owner check denied
+        cmpwi   5,0                     # this page: deny
+        beq     by_rule
+        lwz     6,0(5)
+        rlwinm  7,4,0,0,19
+        cmpw    6,7
+        bne     by_rule
+        li      6,0
+        stw     6,0(5)
+        b       deny
+by_rule:
         bne     1,open
         lwz     5,D_DENY_FROM(3)
         cmplw   4,5
@@ -273,45 +282,40 @@ open:
 deny:
         # The page stays protected; the emulator turns the fault into a bus
         # error for the application.
-        stw     4,D_DENIED+P_ADDR(3)
-        lwz     5,0x84+E(3)
-        stw     5,D_DENIED+P_PC(3)
-        stw     24,D_DENIED+P_R24(3)
-        stw     1,D_DENIED+P_A7(3)
-        lhz     5,0x2AA(0)
-        lhz     6,0x2AC(0)
-        rlwimi  6,5,16,0,15
-        stw     6,D_DENIED+P_ZONE(3)
-        lwz     5,D_COUNT_DENIED(3)
-        addi    5,5,1
-        stw     5,D_COUNT_DENIED(3)
         lwz     5,D_STOP(3)             # name the application to stop
         cmpwi   5,0
-        beq     deny_out
-        stw     6,0(5)
-deny_out:
+        beq     1f
+        lhz     6,0x2AA(0)
+        lhz     7,0x2AC(0)
+        rlwimi  7,6,16,0,15
+        stw     7,0(5)
+1:      addi    5,3,D_COUNT_DENIED
+        b       note
+
+pass:
+        # A write fault not handled. Keep the details: this fault is about
+        # to kill the application, or hang the machine if the emulator
+        # cannot take a bus error now.
+        addi    5,3,D_COUNT_PASSED
+note:
+        # r5: a count with its HookPassed after it (D_COUNT_PASSED and
+        # D_PASSED, or D_COUNT_DENIED and D_DENIED); r4: the address.
+        stw     4,4+P_ADDR(5)
+        lwz     4,0x84+E(3)
+        stw     4,4+P_PC(5)
+        stw     24,4+P_R24(5)
+        stw     1,4+P_A7(5)
+        lhz     6,0x2AA(0)
+        lhz     7,0x2AC(0)
+        rlwimi  7,6,16,0,15
+        stw     7,4+P_ZONE(5)
+        lwz     4,0(5)
+        addi    4,4,1
+        stw     4,0(5)
         lwz     0,D_R0(3)
         lwz     5,D_R5(3)
         lwz     6,D_R6(3)
         lwz     7,D_R7(3)
-        b       chain
-
-chain_write:
-        # Keep the details: this fault is about to kill the application,
-        # or hang the machine if the emulator cannot take a bus error now.
-        stw     4,D_PASSED+P_ADDR(3)
-        lwz     4,0x84+E(3)
-        stw     4,D_PASSED+P_PC(3)
-        stw     24,D_PASSED+P_R24(3)
-        stw     1,D_PASSED+P_A7(3)
-        lhz     4,0x2AA(0)
-        lhz     5,0x2AC(0)
-        rlwimi  5,4,16,0,15
-        stw     5,D_PASSED+P_ZONE(3)
-        lwz     5,D_R5(3)
-        lwz     4,D_COUNT_PASSED(3)
-        addi    4,4,1
-        stw     4,D_COUNT_PASSED(3)
 chain:
         lwz     4,D_CR(3)
         mtcrf   0xC0,4                  # cr0 and cr1 only (see the top)

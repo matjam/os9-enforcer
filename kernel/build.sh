@@ -58,7 +58,7 @@ echo "kernel:     $out/$kernel.bin ($size bytes)"
 # address (the test machine's kernel is at physical 0x00F10000).
 "$bin/powerpc-apple-macos-nm" "$out/nanokernel.o" | while read -r addr type name; do
     case $name in
-    task_log)
+    task_log|enf_cb)
         printf '%-11s offset 0x%X, physical 0x%08X\n' "$name:" \
             "0x$addr" $((0x$addr + 0xF10000)) ;;
     esac

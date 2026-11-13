@@ -82,25 +82,62 @@ limits.
    53,174 write faults handled (11,877 from 68k code), every acknowledge
    ended, 20 of them taken inside the hook. Scribble's `s` and `S` stores
    into the system heap were logged as the application's code and allowed.
-3. **Page owners in the kernel.**
-   - Write faults in every task go through the owner check, not only the
-     blue task's (patch 3 allows every store by another task for now).
-   - The CPU plugin's pages (from `MPRegisterCpuPlugin`) belong to the
-     kernel and are never protected (patch 2 does this for now).
-   - A table in RAM with one owner byte per 4 KB page (128 KB for 512 MB),
-     allocated at boot. Owners: free, system, low memory, one per
-     application.
-   - Kernel calls to set the owner of a range of pages and to set the
-     current owner.
-   - On a write fault the kernel checks the page's owner against the
-     current owner and the code doing the store, then allows, logs or
-     denies it. A denied store reaches the blue task as a write fault, and
-     the extension stops the application.
-   - Open question: on a switch, change page protection all at once, or
-     page by page as faults come in.
-   - New code goes in the free space after the kernel in the ROM image,
-     assembled with the Retro68 toolchain, with branches from the patch
-     sites.
+3. **Page owners in the kernel.** Done (2026-11-12): patch 4 in
+   `kernel/nanokernel.s`, with `common/kcb.h` and changes to the engine
+   and both hooks.
+   - The engine allocates a control block (16 KB, physically contiguous)
+     and an owner table (one byte per 4 KB page of logical RAM, 128 KB for
+     512 MB) in the system heap. It registers the block's physical address
+     with MP call 109, a selector the stock kernel leaves unused (there it
+     returns −4, and the engine runs on its hooks alone). Owner bytes: 0
+     none, 1 the system heap, 3 + slot for an application's domain. The
+     engine sets them together with the hooks' bitmap, and keeps the
+     current owner and the mode (pass, log, enforce) in the block.
+   - On a store to a read-only page that has an owner, in any task, the
+     kernel looks up the owner of the code doing the store: the PC, or for
+     the 68k emulator the 68k PC (r24 − 2). Code nobody owns counts as the
+     system's. A store by an application's code into a page that is not
+     its own is an offense. In enforce mode the kernel denies it when the
+     page is another application's and the writer is the current
+     application in the blue task. The denied store reaches the hooks,
+     which deny it (the kernel names the page in `HookData.kdeny`) and stop
+     the application through `ExitToShell`.
+   - Every other store is allowed: the kernel makes the page's PTE
+     writable, runs the store again and records it in the block's ring
+     (496 entries). The engine's timer takes the ring every 16 ms and
+     protects the page again. Stores into the current application's own
+     pages are only counted. On a switch the engine protects the previous
+     application's pages at once, and the new one's pages open one fault
+     at a time.
+   - Results, with SysLog and then SysGuard and Scribble: the kernel
+     decided every write fault, and neither hook was entered. SysLog ran 2
+     minutes (7,030 ticks) with keyboard and mouse working; the kernel
+     decided 49,584 stores into the system heap and none was lost.
+     Scribble's `n` and `6` (native and 68k stores into the Finder) were
+     logged under SysLog and denied under SysGuard, each with a clean stop.
+     `b` (system code) and `o` (its own heap) were allowed; `s` and `S`
+     (into the system heap) were logged and allowed. When SysGuard quits,
+     the kernel's pointer to the block is 0 again.
+   - Findings: on 9.2.2, MemTop (lowmem 0x108) ends a little above the
+     system heap, below the applications' partitions, so the engine sizes
+     the table from Gestalt `'lram'`. With virtual memory off, a system
+     heap block's logical and physical addresses still differ (the block
+     at logical 0x0133F000 was at physical 0x0169C000), so the engine
+     translates each page with `GetPhysical`.
+   - Limits, for the next steps:
+     - An allowed store opens the page for every task until the engine
+       protects it again, on its next tick.
+     - Code outside every partition and the system heap has no owner and
+       counts as the system's. On the test machine, code at 0x1E75xxxx to
+       0x1E7Exxxx writes into the Finder's heap while the Finder is
+       current: likely the Finder's code in the Process Manager's heap
+       (step 4).
+     - A store by an application that is not current, or by another task,
+       is logged and allowed, never denied: only the current application
+       can be stopped cleanly.
+     - The control block and the owner table are system heap memory that
+       any code can write.
+     - The CPU plugin's pages are still kept writable by patch 2.
 4. **Pages per application.** Every page has one owner:
    - An application's partition starts and ends on page boundaries. Its
      heap, stack and globals are its own.
@@ -116,7 +153,10 @@ limits.
    ROM and the system heap. For 68k code that is the emulated PC (r24).
    This covers code that runs for one application while another is current
    (VBL and Time Manager tasks, I/O completion routines, Open Transport
-   notifiers) and system code writing on an application's behalf.
+   notifiers) and system code writing on an application's behalf. Step 3
+   does this for code inside a partition; code an application owns
+   outside it (in temporary memory, or loaded into the system heap for
+   it) still counts as the system's.
 6. **Extension and control panel.** Carry over from the prototype: start
    at boot, policy (off, log, stop), a clean stop through `ExitToShell`,
    and a notification naming both applications.
@@ -161,7 +201,8 @@ What it showed, which the plan depends on:
   interrupt time the machine hangs.
 - Hooks in the blue task see only its faults. A write fault in a
   Multiprocessing Services task stops that task without reaching them
-  (patch 3 lets those stores through).
+  (patch 3 lets those stores through; with patch 4 the kernel decides
+  them).
 - An exception handler in the 68k emulator's context runs with external
   interrupts enabled (the kernel disables them for native-context
   handlers only). The kernel's interrupt handler tells the emulator about
@@ -269,33 +310,44 @@ SCRATCH=1 DISK=disks/os9-kernel.img ../os9-protect/run.sh &
 ```
 
 To check which kernel is running, dump it from guest memory and compare it
-with the one you built (`build.sh` prints its size; 105,940 bytes with
-patches 1 to 3):
+with the one you built (`build.sh` prints its size; 106,480 bytes with
+patches 1 to 4):
 
 ```bash
-../os9-protect/tools/qmp.py raw '{"execute":"pmemsave","arguments":{"val":15794176,"size":105940,"filename":"/tmp/nk-live.bin"}}'
+../os9-protect/tools/qmp.py raw '{"execute":"pmemsave","arguments":{"val":15794176,"size":106480,"filename":"/tmp/nk-live.bin"}}'
 ```
 
 ```bash
 cmp /tmp/nk-live.bin kernel/build/NanoKernel-v02.28.bin
 ```
 
-The last 272 bytes are `task_log`, which patch 3 writes, so once a task
-has stored to a protected page `cmp` reports a difference there (from
-byte 105,669, as `cmp` counts).
+The last 276 bytes are data the kernel writes: `task_log` (272 bytes),
+then `enf_cb` (4 bytes). Once either is written, `cmp` reports a
+difference there.
 
-The repacked stock dump and the kernel with patches 1 to 3 boot to the
+The repacked stock dump and the kernel with patches 1 to 4 boot to the
 Finder, and the kernel in memory matches the build byte for byte
 (2026-11-12).
 
-Patch 3 records each page it opens in `task_log`; `build.sh` prints its
-physical address (0x00F29CC4 now). It is a count, three zero words, then
-16 entries of four words: the task's PC, the address, the task's ID and
-the page's new PTE (lower word). The latest entry is number (count − 1)
-mod 16. To read it:
+`build.sh` prints the physical addresses of both. `enf_cb` (0x00F29FEC
+now) holds the physical address of the registered control block, or 0. To
+read it:
 
 ```bash
-../os9-protect/tools/qmp.py raw '{"execute":"pmemsave","arguments":{"val":15899844,"size":272,"filename":"/tmp/task-log.bin"}}'
+../os9-protect/tools/qmp.py hmp 'xp /1wx 0xF29FEC'
+```
+
+To read the control block, its counts and its last events from the
+engine's side, use `tools/xlog-read.py` while an engine runs.
+
+With no control block registered, or in pass mode, patch 3 records each
+page it opens for a task other than the blue task in `task_log` (0x00F29EDC
+now). It is a count, three zero words, then 16 entries of four words: the
+task's PC, the address, the task's ID and the page's new PTE (lower word).
+The latest entry is number (count − 1) mod 16. To read it:
+
+```bash
+../os9-protect/tools/qmp.py raw '{"execute":"pmemsave","arguments":{"val":15900380,"size":272,"filename":"/tmp/task-log.bin"}}'
 ```
 
 ```bash
@@ -336,6 +388,9 @@ xxd -g4 -c16 /tmp/task-log.bin
 | `SIGP`: CPU plugin call (`NKInterrupts.s`); `IntReturnFromSIGP` | 0x48E0; 0x4A38 |
 | `IntExternalSystem`: external interrupt entry | 0x4880 |
 | PIH (OpenPIC): acknowledge; end of interrupt; CR bits for the emulator | 0x16068; 0x16028; 0x15524 |
+| MP call table (entry n: routine − 4n); entry 109 (patch 4); `MPCallBad` | 0xACB8; 0xAE6C; 0xAF0C |
+| `CommonMPCallReturnPath` (result in r3) | 0xB124 |
+| `GetPTEFromPLE`; `AcquireLock` | 0x124F8; 0x2700 |
 
 Kernel structures the patches use: the CoherenceGroup pointer is the word
 at EWA − 0x338 (`mfsprg rX,0` gives the EWA); in the CoherenceGroup,

@@ -28,7 +28,14 @@ OWNER = 0x68FFFBEC
 HEADER = ["magic", "self", "off_counters", "n_counters", "off_domains",
           "n_domains", "domain_size", "off_writers", "max_writers",
           "writer_size", "off_cur", "off_offenses", "max_offenses",
-          "offense_size", "off_mode", "off_stopper", "off_sys"]
+          "offense_size", "off_mode", "off_stopper", "off_sys", "off_kernel"]
+# State from off_kernel, then the kernel's control block (common/kcb.h).
+KERNEL = ["kcb", "kcb_err", "owners", "kcb_raw", "owners_raw", "kseen",
+          "kevents", "klost", "kdenied"]
+KCB = ["magic", "version", "mode", "current", "entries", "denied_page",
+       "seq", "frame", "allowed", "logged", "denied", "bail", "self"]
+KCB_RING, KCB_RING_N, KCB_EVENTS = 0x200, 496, 12
+EVF = [(1, "68k"), (2, "task"), (4, "offense"), (8, "denied")]
 STOPPER = ["magic", "old_vector", "zone"] + ["stops_" + s for s in
                                              ["native", "68k", "fallback"]]
 # State from off_sys, then the SysPages header and its SysCounters.
@@ -53,16 +60,30 @@ def collect(addr):
         if a is None:
             a = struct.unpack(">I", read(OWNER, 4))[0]
         if not a:
-            return a, None, None, None, None
+            return a, None, None, None, None, None
         n = len(HEADER)
         h = dict(zip(HEADER, struct.unpack(">%dI" % n, read(a, 4 * n))))
-        if h["magic"] != struct.unpack(">I", b"ENF3")[0] or h["self"] != a:
-            return a, h, None, None, None
+        if h["magic"] != struct.unpack(">I", b"ENF4")[0] or h["self"] != a:
+            return a, h, None, None, None, None
         size = max(h["off_writers"] + h["max_writers"] * h["writer_size"],
                    h["off_offenses"] + 4 +
                    h["max_offenses"] * h["offense_size"],
-                   h["off_stopper"] + 4, h["off_sys"] + 4 * len(SYS_STATE))
+                   h["off_stopper"] + 4, h["off_sys"] + 4 * len(SYS_STATE),
+                   h["off_kernel"] + 4 * len(KERNEL))
         d = read(a, size)
+        o = h["off_kernel"]
+        kernel = dict(zip(KERNEL, struct.unpack(
+            ">%dI" % len(KERNEL), d[o:o + 4 * len(KERNEL)])))
+        if kernel["kcb"]:
+            k = kernel["kcb"]
+            kernel.update(("cb_" + n, v) for n, v in zip(KCB, struct.unpack(
+                ">%dI" % len(KCB), read(k, 4 * len(KCB)))))
+            last = kernel["cb_seq"]
+            events = []
+            for seq in range(max(1, last - KCB_EVENTS + 1), last + 1):
+                events.append(struct.unpack(">8I", read(
+                    k + KCB_RING + 32 * ((seq - 1) % KCB_RING_N), 32)))
+            kernel["events"] = events
         o = h["off_stopper"]
         st = struct.unpack(">I", d[o:o + 4])[0]
         stopper = None
@@ -77,7 +98,7 @@ def collect(addr):
             sys_state.update(("p_" + k, v) for k, v in zip(SYS_PAGES, struct.unpack(
                 ">%dI" % len(SYS_PAGES),
                 read(sys_state["sys"], 4 * len(SYS_PAGES)))))
-        return a, h, d, stopper, sys_state
+        return a, h, d, stopper, sys_state, kernel
     return fn
 
 
@@ -85,13 +106,42 @@ def cstr(b):
     return b.split(b"\0", 1)[0].decode("mac_roman")
 
 
+def print_kernel(k):
+    """The kernel's owner check: its counts and its last events."""
+    if not k["kcb"]:
+        err = struct.unpack(">i", struct.pack(">I", k["kcb_err"]))[0]
+        print("kernel owner check: not registered (%d%s)" % (
+            err, ": no patch 4 in the kernel" if err == -4 else ""))
+        return
+    mode = k["cb_mode"]
+    print("kernel owner check at %08X: mode %s, current owner %d, table "
+          "%08X (%d pages), frame %08X" % (
+              k["kcb"], ["pass", "log", "enforce"][mode] if mode < 3 else mode,
+              k["cb_current"], k["owners"], k["cb_entries"], k["cb_frame"]))
+    print("  kernel: allowed %d, offenses allowed %d, denied %d, left to the "
+          "hooks %d, own (current application) %d; events %d" % (
+              k["cb_allowed"], k["cb_logged"], k["cb_denied"], k["cb_bail"],
+              k["cb_self"], k["cb_seq"]))
+    print("  engine: taken %d (last %d), lost %d, denied %d" % (
+        k["kevents"], k["kseen"], k["klost"], k["kdenied"]))
+    if k["events"]:
+        print("  last events (owner/code/current: 1 system heap, 3+ domain "
+              "slot + 3):")
+    for seq, pc, addr, r24, lr, sp, info, task in k["events"]:
+        flags = ",".join(n for b, n in EVF if info & b) or "-"
+        print("  #%d %08X by %08X (r24 %08X lr %08X sp %08X) owner %d code "
+              "%d current %d %s task %08X" % (
+                  seq, addr, pc, r24, lr, sp, info >> 24, (info >> 16) & 0xFF,
+                  (info >> 8) & 0xFF, flags, task))
+
+
 def main():
     addr = int(sys.argv[1], 0) if len(sys.argv) > 1 else None
-    addr, h, d, stopper, sy = vdump.paused(collect(addr))
+    addr, h, d, stopper, sy, kernel = vdump.paused(collect(addr))
     if not addr:
         sys.exit("no engine is running (no owner in the 68k hook)")
     if d is None:
-        sys.exit("no engine state (ENF3) at %08X" % addr)
+        sys.exit("no engine state (ENF4) at %08X" % addr)
     if (h["n_counters"] != len(COUNTERS) or h["domain_size"] != DOMAIN_SIZE
             or h["writer_size"] != WRITER_SIZE
             or h["offense_size"] != OFFENSE_SIZE):
@@ -125,6 +175,7 @@ def main():
     deny = sy["deny_from"]
     print("deny from %s" % ("nowhere" if deny == 0xFFFFFFFF else
                             "%08X" % deny))
+    print_kernel(kernel)
     if sy["sys"]:
         ticks = sy["p_tick"]
         print("system heap %s (domain %d%s): %08X-%08X, %d pages of %d; "

@@ -9,6 +9,7 @@
 #include <stddef.h>
 #include <string.h>
 #include <MacMemory.h>
+#include <Gestalt.h>
 #include <Processes.h>
 #include <Timer.h>
 #include <MixedMode.h>
@@ -108,6 +109,25 @@ static void set_bits(State *s, unsigned long lo, unsigned long hi, int on)
     }
 }
 
+/* Domain i's byte in the kernel's owner table. */
+static unsigned char owner_code(State *s, int i)
+{
+    return i == s->sys_dom ? kOwnerSystem : kOwnerApp + i;
+}
+
+/* Manage the pages in [lo, hi) for owner (bitmap bits and owner bytes), or
+   stop managing them (owner 0). */
+static void mark(State *s, unsigned long lo, unsigned long hi,
+                 unsigned char owner)
+{
+    set_bits(s, lo, hi, owner != kOwnerNone);
+    if (!s->kcb)
+        return;
+    unsigned long n = s->kcb->entries;
+    for (unsigned long p = lo >> 12; p < hi >> 12 && p < n; p++)
+        s->owners[p] = owner;
+}
+
 /* Protect pages of application domain i, unless protection is off or the
    domain is going away. The system heap's pages go through sys_protect_*
    instead, which leave out its excluded and hot pages. */
@@ -162,6 +182,8 @@ static void set_current(State *s, int i)
     }
     hook_set_current(s->h68k, lo, hi);
     hook_set_current(s->hnat, lo, hi);
+    if (s->kcb)
+        s->kcb->current = i >= 0 ? owner_code(s, i) : kOwnerNone;
     s->cur = i;
 }
 
@@ -228,8 +250,16 @@ static void record(State *s, int src, unsigned long pc, unsigned long lr,
     s->c.nwriters++;
 }
 
+/* What the hooks did with a store by the current application's code: the
+   fallback handler records only the stores it let through. */
+static int hook_denied(State *s, int src, unsigned long addr)
+{
+    return src != kSrcFallback && addr >= s->deny_from;
+}
+
 static void record_offense(State *s, int src, unsigned long pc,
-                           unsigned long zone, int t, unsigned long addr)
+                           unsigned long zone, int t, unsigned long addr,
+                           int denied)
 {
     unsigned long n = s->n_offenses + 1;
     Offense *o = &s->offenses[(n - 1) % kOffenseLog];
@@ -238,9 +268,7 @@ static void record_offense(State *s, int src, unsigned long pc,
     o->pc = pc;
     o->addr = addr;
     o->source = src;
-    /* What the hooks did with it: the fallback handler records only the
-       stores it let through. */
-    o->denied = src != kSrcFallback && addr >= s->deny_from;
+    o->denied = denied;
     writer_name(s, zone, o->writer);
     copy_name(o->target, s->domains[t].name);
     s->c.app_code[src]++;
@@ -261,6 +289,12 @@ static void set_deny(State *s, unsigned long mode)
     s->deny_from = from;
     s->h68k->deny_from = from;
     s->hnat->deny_from = from;
+    /* The kernel's mode follows: kModeOff has nothing protected, and the
+       kernel then only lets other tasks store (patch 3). */
+    if (s->kcb)
+        s->kcb->mode = mode == kModeEnforce ? kKcbEnforce
+                       : mode == kModeLog   ? kKcbLog
+                                            : kKcbPass;
 }
 
 static int sys_live(State *s)
@@ -389,7 +423,7 @@ static void sys_trapped(State *s, int src, volatile HookEvent *e,
         unsigned long lr = src == kSrc68k ? 0 : e->lr;
         sp->c.app_traps++;
         record(s, src | kWriterAppCode, pc, lr, e->zone, s->sys_dom, addr);
-        record_offense(s, src, pc, e->zone, s->sys_dom, addr);
+        record_offense(s, src, pc, e->zone, s->sys_dom, addr, 0);
     }
     /* The stack pointer at the store: its page, and the one below, which
        an exception frame pushed on the stack can reach. */
@@ -488,7 +522,8 @@ static void sys_set_bits(State *s, unsigned long from, unsigned long to)
     SysPages *sp = s->sys;
     for (unsigned long p = from; p < to; p++)
         if (!(sp->flags[p] & kPageExcluded))
-            set_bits(s, sp->lo + p * kPage, sp->lo + (p + 1) * kPage, 1);
+            mark(s, sp->lo + p * kPage, sp->lo + (p + 1) * kPage,
+                 kOwnerSystem);
 }
 
 /* Start watching (event loop). Order, for the safety rule: the domain is
@@ -531,6 +566,10 @@ static void sys_start(State *s)
     sys_exclude_block(s, (void *)s->hnat->block,
                       GetPtrSize((Ptr)s->hnat->block));
     sys_exclude_block(s, s->stopper, sizeof(Stopper));
+    if (s->kcb) {
+        sys_exclude_block(s, s->kcb_raw, GetPtrSize(s->kcb_raw));
+        sys_exclude_block(s, s->owners_raw, GetPtrSize(s->owners_raw));
+    }
     unsigned long hi = sys_heap_hi(s, lo, sp->cap), n = (hi - lo) / kPage;
     sys_check_access(s, 0, n);
 
@@ -558,7 +597,7 @@ static void sys_stop(State *s)
     Domain *d = &s->domains[s->sys_dom];
     d->dying = 1;
     sys_runs(s, 0, sp->n, kPageExcluded, 0);
-    set_bits(s, sp->lo, sp->lo + sp->n * kPage, 0);
+    mark(s, sp->lo, sp->lo + sp->n * kPage, kOwnerNone);
     sp->n = 0;
     d->live = 0;
     s->sys_dom = -1;
@@ -589,7 +628,7 @@ static void sys_follow(State *s)
         sp->n = n;
         d->hi = hi;
         sys_runs(s, n, old, kPageExcluded, 0);
-        set_bits(s, sp->lo + n * kPage, sp->lo + old * kPage, 0);
+        mark(s, sp->lo + n * kPage, sp->lo + old * kPage, kOwnerNone);
         for (unsigned long p = n; p < old; p++)
             sp->flags[p] = 0;
         set_deny(s, s->mode);
@@ -646,7 +685,8 @@ static void drain(State *s, int src, volatile HookEvent *ring, unsigned long n,
             s->c.foreign[src]++;
             record(s, src | (app ? kWriterAppCode : 0), pc, lr, zone, t, addr);
             if (app)
-                record_offense(s, src, pc, zone, t, addr);
+                record_offense(s, src, pc, zone, t, addr,
+                               hook_denied(s, src, addr));
         }
         if (t != s->cur)
             protect(s, t, addr & kPageMask, kPage);
@@ -654,11 +694,115 @@ static void drain(State *s, int src, volatile HookEvent *ring, unsigned long n,
     s->seen[src] = handled;
 }
 
+/* The zone a kernel event's store is logged under: the writing code's
+   application, or for system code the application current at the store,
+   or the system heap. */
+static unsigned long kernel_zone(State *s, unsigned writer, unsigned current)
+{
+    unsigned owner = writer >= kOwnerApp ? writer : current;
+    if (owner >= kOwnerApp && owner - kOwnerApp < kMaxDomains) {
+        Domain *d = &s->domains[owner - kOwnerApp];
+        if (d->live)
+            return d->location;
+    }
+    return lowmem_long(0x2A6); /* SysZone */
+}
+
+/* One store the kernel allowed and recorded, as the hooks' drain does with
+   theirs. The writer is known from the store's code here, not from
+   ApplZone: a store is the target's own when its code is the target's, or
+   when system code stores into the application current at the time. */
+static void kernel_event(State *s, const KEvent *e)
+{
+    unsigned flags = kev_flags(e->info), writer = kev_writer(e->info);
+    unsigned current = (e->info >> 8) & 0xFF;
+    int src = flags & kEvf68k ? kSrc68k : kSrcNative;
+    int app = (flags & kEvfOffense) != 0;
+    unsigned long addr = e->addr;
+    HookEvent h;
+    h.seq = e->seq;
+    h.pc = (e->pc & ~3UL) | (app ? kHookAppCode : 0);
+    h.addr = addr;
+    h.r24 = e->r24;
+    h.lr = e->lr;
+    h.zone = kernel_zone(s, writer, current);
+    h.r4 = 0;
+    h.sp = e->sp;
+    if (in_sys(s, addr)) {
+        sys_trapped(s, src, &h, addr);
+        return;
+    }
+    int t = domain_at(s, addr);
+    if (t < 0 || t == s->sys_dom) {
+        s->c.outside++;
+        return;
+    }
+    unsigned code = writer >= kOwnerApp ? writer : current;
+    if (code == owner_code(s, t)) {
+        s->c.self[src]++;
+        s->domains[t].self_writes++;
+    } else {
+        unsigned long pc = src == kSrc68k ? hook_next_pc(h.r24) : h.pc & ~3UL;
+        unsigned long lr = src == kSrc68k ? 0 : h.lr;
+        s->c.foreign[src]++;
+        record(s, src | (app ? kWriterAppCode : 0), pc, lr, h.zone, t, addr);
+        if (app)
+            record_offense(s, src, pc, h.zone, t, addr, 0);
+    }
+    if (t != s->cur)
+        protect(s, t, addr & kPageMask, kPage);
+}
+
+/* Take the stores the kernel recorded with seq in (kseen, kcb->seq]. A
+   denied store is only counted: the hook that denies it records it. */
+static void kernel_drain(State *s)
+{
+    KernelCB *k = s->kcb;
+    if (!k)
+        return;
+    unsigned long last = k->seq, seen = s->kseen;
+    if (last == seen)
+        return;
+    if (last - seen > kKcbRing) {
+        /* Pages opened by stores no longer in the ring. */
+        s->klost += last - seen - kKcbRing;
+        if (sys_live(s))
+            s->sys->c.resweeps++;
+        protect_others(s);
+        seen = last - kKcbRing;
+    }
+    for (unsigned long n = seen + 1; n - seen <= last - seen; n++) {
+        volatile KEvent *v = &k->ring[(n - 1) % kKcbRing];
+        KEvent e;
+        e.seq = v->seq;
+        e.pc = v->pc;
+        e.addr = v->addr;
+        e.r24 = v->r24;
+        e.lr = v->lr;
+        e.sp = v->sp;
+        e.info = v->info;
+        e.task = v->task;
+        if (e.seq != n || v->seq != n) {
+            /* Overwritten while being read (a task's store). */
+            s->klost++;
+            protect_others(s);
+            continue;
+        }
+        s->kevents++;
+        if (kev_flags(e.info) & kEvfDenied)
+            s->kdenied++;
+        else
+            kernel_event(s, &e);
+    }
+    s->kseen = last;
+}
+
 static void drain_all(State *s)
 {
     drain(s, kSrc68k, s->h68k->ring, kHookRing, s->h68k->count_handled);
     drain(s, kSrcNative, s->hnat->ring, kHookRing, s->hnat->count_handled);
     drain(s, kSrcFallback, s->fb_ring, kFallbackRing, s->fb_count);
+    kernel_drain(s);
 }
 
 /* Clean stop ---------------------------------------------------------- */
@@ -899,7 +1043,7 @@ static void refresh_domains(State *s)
         set_name(d, name);
         d->seen = 1;
         d->live = 1;
-        set_bits(s, lo, hi, 1);
+        mark(s, lo, hi, owner_code(s, free_slot));
         protect_domain(s, free_slot);
         s->c.added++;
     }
@@ -915,7 +1059,7 @@ static void refresh_domains(State *s)
         }
         if (nk_unprotect(s->area, d->lo, d->hi - d->lo))
             s->c.kernel_errors++;
-        set_bits(s, d->lo, d->hi, 0);
+        mark(s, d->lo, d->hi, kOwnerNone);
         d->live = 0;
         s->c.removed++;
     }
@@ -944,6 +1088,84 @@ void engine_set_mode(State *s, unsigned long mode)
     s->mode = mode;
     if (old == kModeOff)
         protect_others(s);
+}
+
+/* The kernel's owner check (common/kcb.h): allocate the control block and
+   the owner table in the system heap, where they outlive a program that
+   stops without cleaning up, and register the block. On any failure the
+   engine runs on its hooks alone, with the reason in kcb_err. Call with
+   no domain marked yet. */
+static void kcb_start(State *s)
+{
+    /* One byte per page of logical RAM, inside the bitmap's span; a table
+       page covers kPage pages. (MemTop is no use: on 9.2.2 it ends a
+       little above the system heap, below the applications.) */
+    long ram = 0;
+    if (Gestalt(gestaltLogicalRAMSize, &ram) || ram <= 0 ||
+        (unsigned long)ram > kSpanHi)
+        ram = kSpanHi;
+    unsigned long entries = (unsigned long)ram >> 12;
+    unsigned long most = (unsigned long)kKcbTablePages * kPage;
+    if (entries > most)
+        entries = most;
+    unsigned long tsize = (entries + kPage - 1) & kPageMask;
+    char *kraw = NewPtrSysClear(kKcbSize + kPage);
+    char *traw = NewPtrSysClear(tsize + kPage);
+    long err = kEngineNoMemory;
+    if (!kraw || !traw)
+        goto fail;
+    KernelCB *k = (KernelCB *)(((unsigned long)kraw + kPage - 1) & kPageMask);
+    unsigned char *t =
+        (unsigned char *)(((unsigned long)traw + kPage - 1) & kPageMask);
+    err = kEngineNoArea;
+    unsigned long phys = kcb_physical(k, kKcbSize);
+    if (!phys)
+        goto fail;
+    for (unsigned long i = 0; i < tsize / kPage; i++) {
+        unsigned long p = kcb_physical(t + i * kPage, kPage);
+        if (!p)
+            goto fail;
+        k->pages[i] = p;
+    }
+    k->magic = kKcbMagic;
+    k->version = kKcbVersion;
+    k->mode = kKcbPass;
+    k->entries = entries;
+    k->frame = s->h68k->frame;
+    err = kcb_register(phys);
+    if (err)
+        goto fail;
+    s->kcb_raw = kraw;
+    s->owners_raw = traw;
+    s->owners = t;
+    s->kseen = 0;
+    s->kcb = k;
+    s->h68k->kdeny = &k->denied_page;
+    s->hnat->kdeny = &k->denied_page;
+    s->kcb_err = 0;
+    return;
+fail:
+    if (kraw)
+        DisposePtr(kraw);
+    if (traw)
+        DisposePtr(traw);
+    s->kcb_err = err;
+}
+
+/* Unregister and free the block, with nothing protected. */
+static void kcb_stop(State *s)
+{
+    if (!s->kcb)
+        return;
+    s->kcb->mode = kKcbPass;
+    kcb_register(0);
+    s->h68k->kdeny = 0;
+    s->hnat->kdeny = 0;
+    s->kcb = 0;
+    s->owners = 0;
+    DisposePtr(s->kcb_raw);
+    DisposePtr(s->owners_raw);
+    s->kcb_raw = s->owners_raw = 0;
 }
 
 long engine_start(State **out, unsigned long mode, const char *name)
@@ -984,6 +1206,7 @@ long engine_start(State **out, unsigned long mode, const char *name)
     s->off_mode = offsetof(State, mode);
     s->off_stopper = offsetof(State, stopper);
     s->off_sys = offsetof(State, sys_dom);
+    s->off_kernel = offsetof(State, kcb);
     s->mode = s->want_mode = kModeOff;
     copy_name(s->name, name);
     s->bitmap = bitmap;
@@ -1028,6 +1251,7 @@ long engine_start(State **out, unsigned long mode, const char *name)
         if (fc[0] == 0x90650214 && fc[1] == 0x90C50218 && fc[2] == 0x90050210)
             s->h68k->frame = 0x6806E300;
     }
+    kcb_start(s);
     s->seen[kSrc68k] = s->h68k->count_handled;
     s->seen[kSrcNative] = s->hnat->count_handled;
     /* For tools/xlog-read.py. */
@@ -1095,6 +1319,7 @@ void engine_stop(State *s)
         unprotect_domain(s, i);
     }
     s->sys_on = 0;
+    kcb_stop(s);
     g_sys_install(g_prev);
 
     s->hook_self[0] = s->h68k->count_self;

@@ -55,6 +55,21 @@
  * hangs the machine. Domains are added as live, then bits, then protect;
  * removed as dying, unprotect, then bits, then dead.
  *
+ * With the patched NanoKernel (kernel/, patch 4) the kernel decides each
+ * store first, in every task (common/kcb.h). The engine keeps an owner
+ * table next to the bitmap, one byte per page with the same pages set: 1
+ * for the system heap, kOwnerApp + slot for an application's domain. The
+ * kernel attributes a store to the owner of its code, allows it by making
+ * the page writable (only its PTE: the page is protected again when the
+ * engine protects it, or when its PTE leaves the page table) and records it
+ * in the control block's ring, which the timer takes like the hooks' rings.
+ * Own stores into the current application's pages are only counted. In
+ * kModeEnforce it denies a store by the current application's code into
+ * another application's page; the hooks then deny that store as their own
+ * (HookData kdeny) and the application is stopped cleanly. Stores the
+ * kernel leaves alone reach the hooks as before. Without patch 4 the
+ * registration fails and the engine runs on the hooks alone.
+ *
  * The program running the engine is not a domain. Run it only with virtual
  * memory off.
  */
@@ -68,13 +83,14 @@
 #include <MixedMode.h>
 
 #include "hook.h"
+#include "kcb.h"
 
 enum {
     kMaxDomains = 32,
     kMaxWriters = 512,
     kFallbackRing = 16,
     kOffenseLog = 16,
-    kEngineMagic = 'ENF3',
+    kEngineMagic = 'ENF4',
     /* Gestalt selector whose value is the engine's State, while it runs. */
     kEngineGestalt = 'Enfr'
 };
@@ -157,13 +173,11 @@ typedef struct {
  * again within kSysHotTicks ticks of being protected, and back to 0 when it
  * turns hot after kSysCoolTicks ticks or more.
  *
- * Not usable yet: an atomic update (lwarx/stwcx.) of a variable on a
- * protected page hangs the machine. The NanoKernel handles the stwcx.
- * fault by running the stwcx. again itself (NKTranslation.s FDP_06c0);
- * the reservation is gone by then, so it fails without a fault, the
- * caller's loop retries, and no hook ever sees a fault to open the page.
- * The system heap holds many such variables. Nothing turns this on but
- * SysLog and SysGuard (xlog/), which reproduce the hang. */
+ * Needs the patched NanoKernel (kernel/): with the stock kernel, an atomic
+ * update (lwarx/stwcx.) on a protected page hangs the machine (patch 1),
+ * the CPU plugin stops interrupt handling when its stack is protected
+ * (patch 2), and Multiprocessing Services tasks stop on their first store
+ * (patch 3). Nothing turns this on but SysLog and SysGuard (xlog/). */
 enum {
     kSysMagic = 'SysP',
     kSysMaxPages = 16384, /* 64 MB */
@@ -233,6 +247,7 @@ typedef struct {
     unsigned long off_mode;
     unsigned long off_stopper;
     unsigned long off_sys;
+    unsigned long off_kernel;
 
     /* Control. A control panel sets want_mode and want_sys; engine_poll
        applies them. */
@@ -268,6 +283,19 @@ typedef struct {
     TMTask timer;
     RoutineDescriptor timer_rd;
     Stopper *stopper; /* 0 if the clean stop is not installed */
+
+    /* The kernel's owner check (common/kcb.h), tools/xlog-read.py names
+       these in this order. kcb is 0 when it is not registered, and kcb_err
+       says why: the kernel's error (-4 without patch 4), or an engine
+       error (kEngineNoMemory; kEngineNoArea: no single physical range). */
+    KernelCB *kcb;
+    long kcb_err;
+    unsigned char *owners;      /* the owner table: kcb->entries bytes */
+    char *kcb_raw, *owners_raw; /* their allocations */
+    unsigned long kseen;        /* the last kernel event taken */
+    unsigned long kevents;      /* events taken */
+    unsigned long klost;        /* events overwritten before the timer ran */
+    unsigned long kdenied;      /* denied stores (the hooks record them) */
 } State;
 
 /* Install the hooks, the fallback handler and the timer, read the process

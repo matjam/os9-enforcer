@@ -22,7 +22,7 @@
 enum {
     kHnatNCB = 0x68FFF400,
     kHnatSlot = 0x68FFF44C,   /* NCB.ExceptionHandler */
-    kHnatMagic = 'HNA4'       /* changes with the data layout */
+    kHnatMagic = 'HNA5'       /* changes with the data layout */
 };
 
 /* The block: data (0xC0 bytes), then code (32-byte aligned), then ring. */
