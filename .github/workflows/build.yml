@@ -1,0 +1,59 @@
+# Build the Retro68 toolchain (cached between runs), every program, and
+# dist/ (tools/make-dist.sh), and keep dist/ as the "Enforcer" artifact.
+name: Build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      # Rez and the other host tools link with boost, so the packages are
+      # needed even when the toolchain comes from the cache.
+      - name: Install packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build g++ libgmp-dev \
+            libmpfr-dev libmpc-dev libboost-all-dev bison flex texinfo ruby
+
+      - name: Find the Retro68 commit
+        id: retro68
+        run: echo "commit=$(git rev-parse HEAD:toolchain/Retro68)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore the toolchain
+        id: cache
+        uses: actions/cache/restore@v6
+        with:
+          path: toolchain/build/toolchain
+          key: retro68-ppc-${{ runner.os }}-${{ runner.arch }}-${{ steps.retro68.outputs.commit }}-${{ hashFiles('toolchain/build.sh') }}
+
+      - name: Build the toolchain
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: toolchain/build.sh
+
+      # Saved now, so a failure in a later step does not lose it.
+      - name: Save the toolchain
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: toolchain/build/toolchain
+          key: ${{ steps.cache.outputs.cache-primary-key }}
+
+      - name: Build the programs
+        run: ./build.sh
+
+      - name: Collect Enforcer
+        run: tools/make-dist.sh
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: Enforcer
+          path: dist/

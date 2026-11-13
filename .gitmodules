@@ -1,0 +1,4 @@
+[submodule "toolchain/Retro68"]
+	path = toolchain/Retro68
+	url = https://github.com/autc04/Retro68.git
+	shallow = true

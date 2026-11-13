@@ -1,9 +1,13 @@
-# Only our own sources and scripts are tracked. The toolchain, QEMU and the
-# disk images live in os9-protect.
+# Only our own sources and scripts are tracked. Retro68 is a submodule
+# (toolchain/Retro68); QEMU and the test machine's disks live in
+# os9-protect.
 
-# Build output (./build.sh builds each program in PROGRAM/build).
+# Build output (./build.sh builds each program in PROGRAM/build, and
+# toolchain/build.sh the toolchain in toolchain/build).
 /*/build/
 /*/build-*/
+# tools/make-dist.sh
+/dist/
 
 # Apple's Mac OS ROM file and the kernel taken from it (kernel/extract.sh).
 /kernel/stock/

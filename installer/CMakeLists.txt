@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.15)
 # Retro68's add_application links with the C++ driver.
 project(EnforcerInstaller C CXX)
 
-# Build with the Retro68 PowerPC toolchain from os9-protect: ./build.sh installer
+# Build with the Retro68 PowerPC toolchain: ./build.sh installer
 # Produces "Enforcer Installer.bin". kpatch.h is written by
 # tools/make-kpatch.py; the icons are the control panel's.
 add_application(EnforcerInstaller installer.c rompatch.c lzss.c installer.r
