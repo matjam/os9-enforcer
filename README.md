@@ -214,10 +214,28 @@ git clone https://git.applefritter.com/Macintosh-SW/powermac-rom.git refs/powerm
 git clone --recursive https://github.com/autc04/Retro68.git toolchain/Retro68
 ```
 
+```bash
+git clone https://github.com/elliotnunn/tbxi.git refs/tbxi
+```
+
+```bash
+python3 -m venv refs/tbxi-venv
+```
+
+```bash
+refs/tbxi-venv/bin/pip install ./refs/tbxi
+```
+
 - `refs/NanoKernel` (commit b2b5613): Elliot Nunn's reconstruction of the
   v1 NanoKernel.
-- `refs/powermac-rom` (commit 4de6504): the v2 NanoKernel sources, in
-  `NanoKernel/NK*.s`.
+- `refs/powermac-rom` (commit 4de6504): Elliot Nunn's reconstruction of
+  the v2 NanoKernel (version 2.28, the one in this 9.2.2 install), in
+  `NanoKernel/NK*.s`. It is disassembled source with many routines still
+  unnamed, not Apple's original. Its README points to tbxi instead.
+- `refs/tbxi` (commit 69839ea) and `refs/tbxi-venv`: Elliot Nunn's tool
+  that unpacks a Mac OS ROM file into editable parts (`tbxi dump`) and
+  packs it again (`tbxi build`). pip also installs `macresources` 1.2 from
+  PyPI. os9-enforcer's `kernel/extract.sh` uses it.
 - `toolchain/Retro68` (commit a4a389c41): to build it, run
   `../Retro68/build-toolchain.bash --no-carbon --ninja` from
   `toolchain/build`.
