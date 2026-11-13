@@ -21,8 +21,9 @@ limits.
 1. **Kernel tooling.** Done (2026-11-12): extract the stock kernel, repack
    the ROM file, install it on a test disk, boot it, and compare the kernel
    in memory (see [Working on the kernel](#working-on-the-kernel)).
-2. **Fix `stwcx.` on protected pages.** Done (2026-11-12), patch 1 in
-   `kernel/nanokernel.s`. The kernel runs a faulting store itself. For
+2. **Protect the system heap without breaking the system.** Done
+   (2026-11-12): patches 1 to 3 in `kernel/nanokernel.s` and a fix to the
+   68k hook. Patch 1 fixes `stwcx.` on protected pages. The kernel runs a faulting store itself. For
    `stwcx.` that store failed without a fault, because the caller's
    reservation is gone, and the caller's loop retried forever. Now, when
    the kernel's `stwcx.` fails, it stores the word's current value back
@@ -46,22 +47,44 @@ limits.
    of the plugin's range when a call would remove write access. With it,
    no plugin call failed (0 faults on the SIGP path, 64,250 to the hooks).
 
-   Keyboard and mouse still stop, within 35 seconds. Each run also has
-   three write faults in Multiprocessing Services tasks, and a write fault
-   in a task other than the blue task stops that task:
+   Each run also had three write faults in Multiprocessing Services tasks,
+   and a write fault in a task other than the blue task stops that task:
    - 0xFFCD5EB0, a function prologue saving registers on the task's stack
      (`stfd f31,-8(r1)`): the stack is in a protected system heap page;
    - 0xFFCD646C, ROM MP library glue storing a kernel call's results
      through pointers (`stw r4,0(r7)`, before `li r0,19; sc`);
    - 0x003138AC, code in the system heap.
 
-   The stopped tasks are the likely reason input stops (the guest's
-   keyboard and mouse are USB), not yet shown. The fix is for the kernel
-   to handle write faults in every task the way the hooks do for the blue
-   task, which is step 3's job. Scribble's `s` and `S` tests wait on it.
+   Patch 3 lets those stores through until step 3 gives the kernel page
+   owners. When a task other than the blue task or the CPU plugin stores
+   to a read-only page, the kernel sets the page's PTE to read/write and
+   runs the store again (in `MemRetryDSI`, where the fault of a store the
+   kernel runs for a task arrives). The PLE still says read-only, so the
+   page is protected again when its PTE leaves the HTAB or when
+   `MPSetAreaAccess` protects it again; until then every task can write to
+   it, the blue task included. The kernel counts each one in `task_log`
+   (see [Working on the kernel](#working-on-the-kernel)): three in a
+   typical run, from two tasks, at the PCs above.
+
+   Keyboard and mouse still stopped, within 10 to 20 seconds, and with
+   them every external interrupt. os9-protect's iolog plugin, on the
+   OpenPIC's acknowledge and end-of-interrupt registers, counted 17,163
+   acknowledges and 17,162 ends: the kernel never ended the USB interrupt
+   taken right after the 68k hook's `MPSetAreaAccess` call, and the OpenPIC
+   then held back every interrupt at its priority or below. The kernel
+   tells the 68k emulator about a pending interrupt with bits in the
+   interrupted code's CR. The hook runs with interrupts enabled and put
+   back all of CR from its entry, which cleared those bits, so the emulator
+   never ran the interrupt. The hook now puts back only cr0 and cr1, the
+   fields it changes (`common/h68k.s`).
+
+   With that fix, SysLog ran for 2 minutes with keyboard and mouse working:
+   53,174 write faults handled (11,877 from 68k code), every acknowledge
+   ended, 20 of them taken inside the hook. Scribble's `s` and `S` stores
+   into the system heap were logged as the application's code and allowed.
 3. **Page owners in the kernel.**
    - Write faults in every task go through the owner check, not only the
-     blue task's: today an MP task's write fault stops the task.
+     blue task's (patch 3 allows every store by another task for now).
    - The CPU plugin's pages (from `MPRegisterCpuPlugin`) belong to the
      kernel and are never protected (patch 2 does this for now).
    - A table in RAM with one owner byte per 4 KB page (128 KB for 512 MB),
@@ -137,7 +160,16 @@ What it showed, which the plan depends on:
   emulator takes the fault: the application gets a bus error, or at
   interrupt time the machine hangs.
 - Hooks in the blue task see only its faults. A write fault in a
-  Multiprocessing Services task stops that task without reaching them.
+  Multiprocessing Services task stops that task without reaching them
+  (patch 3 lets those stores through).
+- An exception handler in the 68k emulator's context runs with external
+  interrupts enabled (the kernel disables them for native-context
+  handlers only). The kernel's interrupt handler tells the emulator about
+  a pending interrupt by setting bits in the interrupted code's CR (cr2,
+  mask 0x00E00000 at KDP + 0x674 on the test machine). A handler that puts
+  back all of the CR it saved clears them; the interrupt is then never run
+  or ended, and the OpenPIC stops every interrupt at its priority or below
+  (step 2).
 - The Process Manager, Window Manager and Layer Manager write into other
   applications' memory on every switch, so a rule has to look at the code
   doing the store.
@@ -237,20 +269,38 @@ SCRATCH=1 DISK=disks/os9-kernel.img ../os9-protect/run.sh &
 ```
 
 To check which kernel is running, dump it from guest memory and compare it
-with the one you built (its size is in `build.sh`'s last line; 105,404
-bytes with patches 1 and 2):
+with the one you built (`build.sh` prints its size; 105,940 bytes with
+patches 1 to 3):
 
 ```bash
-../os9-protect/tools/qmp.py raw '{"execute":"pmemsave","arguments":{"val":15794176,"size":105404,"filename":"/tmp/nk-live.bin"}}'
+../os9-protect/tools/qmp.py raw '{"execute":"pmemsave","arguments":{"val":15794176,"size":105940,"filename":"/tmp/nk-live.bin"}}'
 ```
 
 ```bash
 cmp /tmp/nk-live.bin kernel/build/NanoKernel-v02.28.bin
 ```
 
-The repacked stock dump and the kernel with patches 1 and 2 boot to the
+The last 272 bytes are `task_log`, which patch 3 writes, so once a task
+has stored to a protected page `cmp` reports a difference there (from
+byte 105,669, as `cmp` counts).
+
+The repacked stock dump and the kernel with patches 1 to 3 boot to the
 Finder, and the kernel in memory matches the build byte for byte
 (2026-11-12).
+
+Patch 3 records each page it opens in `task_log`; `build.sh` prints its
+physical address (0x00F29CC4 now). It is a count, three zero words, then
+16 entries of four words: the task's PC, the address, the task's ID and
+the page's new PTE (lower word). The latest entry is number (count − 1)
+mod 16. To read it:
+
+```bash
+../os9-protect/tools/qmp.py raw '{"execute":"pmemsave","arguments":{"val":15899844,"size":272,"filename":"/tmp/task-log.bin"}}'
+```
+
+```bash
+xxd -g4 -c16 /tmp/task-log.bin
+```
 
 ### The stock kernel
 
@@ -274,6 +324,7 @@ Finder, and the kernel in memory matches the build byte for byte
 | Routine (source) | Offset |
 |---|---|
 | `IntDSI`, data fault entry (`NKInterrupts.s`) | 0x32C0 |
+| `MemRetryDSI`: fault in a store the kernel runs; read-only page check (patch 3) | 0x35A0; 0x3630 |
 | `HandleDSIDueToIllegalSyncPrimitive` | 0x340C |
 | `IntAlignment` | 0x3460 |
 | Exception return: `lwarx`/`sync`/`stwcx.` clearing the reservation | 0x2C28 |
@@ -283,6 +334,8 @@ Finder, and the kernel in memory matches the build byte for byte
 | `MPSetAreaAccess` (`NKAddressSpaces.s`): `@pageloop` (patch 2) | 0x10B68 |
 | `ExceptionMemRetried`; its choice of path (pcwatch here) | 0x2980; 0x2A14 |
 | `SIGP`: CPU plugin call (`NKInterrupts.s`); `IntReturnFromSIGP` | 0x48E0; 0x4A38 |
+| `IntExternalSystem`: external interrupt entry | 0x4880 |
+| PIH (OpenPIC): acknowledge; end of interrupt; CR bits for the emulator | 0x16068; 0x16028; 0x15524 |
 
 Kernel structures the patches use: the CoherenceGroup pointer is the word
 at EWA − 0x338 (`mfsprg rX,0` gives the EWA); in the CoherenceGroup,
@@ -290,3 +343,7 @@ at EWA − 0x338 (`mfsprg rX,0` gives the EWA); in the CoherenceGroup,
 `CpuPluginSpacePtr` at +0x4C; in an Area, `PageSize` is at +0x68 and
 `AddressSpacePtr` at +0x6C. On the test machine the CoherenceGroup is at
 physical 0x1F7FC1C0, with its signature `CGRP` in its first word.
+`MemRetryDSI` saves a task's r8, r9, r16 (the flags) to r19 and CR at
+EWA − 0xE0 to − 0xC8; the HTAB lock is at KDP − 0xB90 (the KDP pointer
+is the word at EWA − 4). On the test machine the EWA and the KDP are at
+physical 0x1F7FE000.

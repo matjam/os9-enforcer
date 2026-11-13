@@ -30,6 +30,18 @@
 #   all other registers, CR and CTR = the interrupted emulator's, and must
 #   be the same at `blr`, because the trap resumes with live registers
 #
+# CR is the exception: the hook changes cr0 and cr1 and puts back only
+# those two fields. It runs with external interrupts enabled (the kernel
+# clears MSR[EE] for handlers in the native context only), and the kernel's
+# interrupt handler tells the emulator about a pending interrupt by setting
+# bits in the interrupted code's CR (NanoKernel 0x15524, `or r13,r13,r31`,
+# mask at KDP+0x674: 0x00E00000, in cr2, on the test machine). An
+# interrupt taken inside the hook, most often right after its `sc`, sets
+# those bits in the hook's CR. Putting back all of CR from D_CR cleared
+# them: the emulator never ran the interrupt, so the kernel
+# never sent the OpenPIC its end of interrupt, and every interrupt at that
+# priority or below stopped (USB keyboard and mouse first, 2026-11-12).
+#
 # Fault details the kernel saved in the ECB: +0x40 flags (code in the top
 # byte), +0x74 fault address, +0x84 PC of the faulting instruction,
 # +0x8C LR, +0x94/+0x9C r3/r4.
@@ -155,7 +167,7 @@ handle:
 record:
         # Deny rule: is the 68k code doing the store inside the current
         # range? The answer is kept in CR bit APPCODE, which the exit paths
-        # restore from D_CR with the rest of CR.
+        # restore from D_CR with the rest of cr0 and cr1.
         crxor   APPCODE,APPCODE,APPCODE
         addi    6,24,-2                 # the next 68k instruction
         lwz     5,D_CUR_LO(3)
@@ -254,7 +266,7 @@ open:
         lwz     6,D_R6(3)
         lwz     7,D_R7(3)
         lwz     4,D_CR(3)
-        mtcrf   0xFF,4
+        mtcrf   0xC0,4                  # cr0 and cr1 only (see the top)
         li      3,0
         blr                             # ReturnFromException: retry the store
 
@@ -302,7 +314,7 @@ chain_write:
         stw     4,D_COUNT_PASSED(3)
 chain:
         lwz     4,D_CR(3)
-        mtcrf   0xFF,4
+        mtcrf   0xC0,4                  # cr0 and cr1 only (see the top)
         lwz     4,0x54+E(3)
         addi    3,3,-BASE_FROM_ECB
         .globl  h68k_branch
