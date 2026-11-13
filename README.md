@@ -395,8 +395,8 @@ the fault (see step 2 of the plan in os9-enforcer's README).
 
 ## Watching memory and kernel paths
 
-Two more QEMU TCG plugins help debug kernel changes. Both need the local
-QEMU build, and both write their report when QEMU exits (for example after
+Three more QEMU TCG plugins help debug kernel changes. They need the local
+QEMU build, and they write their report when QEMU exits (for example after
 `tools/qmp.py quit`).
 
 `tools/memwatch/` reports which code reads or writes a range of physical
@@ -418,3 +418,22 @@ os9-enforcer's README, "Prototype"):
 tools/pcwatch/build.sh
 SCRATCH=1 DISK=disks/os9-kernel.img PLUGIN=tools/pcwatch/build/libpcwatch.dylib,at=0xF12A14,regs=r9:r10,crmask=0x82208000,out=run/pw.txt ./run.sh &
 ```
+
+`tools/iolog/` keeps a timeline of the latest events (`n=`, default
+4096): each load and store to a physical range, device registers
+included, with its PC and value, and each run of up to 8 marked
+instructions (`mark=`), with up to 4 registers (`regs=`). To see each
+interrupt the kernel acknowledges at the OpenPIC (a read of 0x800600A0
+returns the vector) and ends (a write to 0x800600B0), with where the
+interrupt arrived (r10 at the kernel's external interrupt entry):
+
+```bash
+tools/iolog/build.sh
+SCRATCH=1 DISK=disks/os9-kernel.img PLUGIN=tools/iolog/build/libiolog.dylib,lo=0x800600A0,hi=0x800600C0,mark=0xF14884,regs=r10:r11,n=50000,out=run/io.txt ./run.sh &
+```
+
+The report's totals line counts every event, kept or not; here R and W
+should be equal. To trace the USB controller's registers instead, turn
+on QEMU's trace events while the guest runs:
+`tools/qmp.py hmp 'trace-event usb_ohci_mem_write on'` (and
+`usb_ohci_mem_read`); they print to QEMU's standard error.
