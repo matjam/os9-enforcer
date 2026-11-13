@@ -414,6 +414,17 @@ limits.
      file has another patch and Enforcer Backup holds the stock file, it
      patches the backup, moves the earlier patched file to the Trash and
      puts the new one in its place.
+   - Fixed on the way: since the pools, a stopped application often quits
+     (and its domain is dropped at `ExitToShell`) before the timer takes
+     the denied store from the hook's ring, so the offense named "zone
+     1EC8BF80" instead of the application, and with virtual memory on it
+     was not counted as the application's at all. A dropped domain's slot
+     now keeps its name, partition and code range until it is used again
+     (`Domain.dropped`).
+   - Regression run with virtual memory off, on `disks/os9-vmoff.qcow2`
+     (an overlay on `os9-installer.qcow2`, stock ROM file): a fresh
+     install, then Scribble `n`, `6` and `T` each stopped cleanly and named
+     Scribble, and `Y` and `V` dropped.
 
 Not covered:
 - An overrun inside an application's own memory. It can only damage that

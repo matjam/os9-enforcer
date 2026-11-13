@@ -118,6 +118,23 @@ static int domain_of_zone(State *s, unsigned long addr)
     return -1;
 }
 
+/* As domain_of_zone, or else the domain dropped last whose partition held
+   addr (engine.h, Domain.dropped). For naming only. */
+static int domain_of_zone_any(State *s, unsigned long addr)
+{
+    int found = domain_of_zone(s, addr);
+    if (found >= 0)
+        return found;
+    for (int i = 0; i < kMaxDomains; i++) {
+        Domain *d = &s->domains[i];
+        if (!d->live && d->dropped && d->name[0] && addr >= d->location &&
+            addr - d->location < d->size &&
+            (found < 0 || d->dropped > s->domains[found].dropped))
+            found = i;
+    }
+    return found;
+}
+
 static void set_bits(State *s, unsigned long lo, unsigned long hi, int on)
 {
     for (unsigned long p = (lo - kSpanLo) >> 12; p < (hi - kSpanLo) >> 12; p++) {
@@ -168,6 +185,8 @@ static void own_code(State *s, int i, unsigned long lo, unsigned long hi)
     d->code_state = kCodeOwned;
 }
 
+/* Give back the owner bytes of domain i's code. The range stays in the
+   slot (engine.h, Domain.dropped). */
 static void disown_code(State *s, int i)
 {
     Domain *d = &s->domains[i];
@@ -179,20 +198,7 @@ static void disown_code(State *s, int i)
          p++)
         if (s->owners[p] == code)
             s->owners[p] = kOwnerNone;
-    d->code_lo = d->code_hi = 0;
     d->code_state = kCodeUnknown;
-}
-
-/* The live domain whose native code outside its partition holds pc. */
-static int code_domain(State *s, unsigned long pc)
-{
-    for (int i = 0; i < kMaxDomains; i++) {
-        Domain *d = &s->domains[i];
-        if (d->live && d->code_state == kCodeOwned && pc >= d->code_lo &&
-            pc < d->code_hi)
-            return i;
-    }
-    return -1;
 }
 
 /* Protect pages of application domain i, unless protection is off or the
@@ -304,6 +310,7 @@ static void drop_domain(State *s, int i, int quit)
     d->quit = quit;
     d->live = 0;
     s->c.removed++;
+    d->dropped = s->c.removed;
 }
 
 /* Drop every domain and chunk whose master pointer no longer points at
@@ -350,7 +357,7 @@ static void check_switch(State *s)
 
 static void writer_name(State *s, unsigned long zone, char out[16])
 {
-    int w = domain_of_zone(s, zone);
+    int w = domain_of_zone_any(s, zone);
     if (w >= 0)
         copy_name(out, s->domains[w].name);
     else if (zone >= s->my_lo && zone < s->my_hi)
@@ -814,10 +821,15 @@ static void drain(State *s, int src, volatile HookEvent *ring, unsigned long n,
         }
         int app = (e->pc & kHookAppCode) != 0;
         /* The hooks know only the partition: native code outside it
-           (engine.h, kCodeOwned) is the application's too. */
-        if (!app && src != kSrc68k && domain_of_zone(s, zone) >= 0 &&
-            code_domain(s, e->pc & ~3UL) == domain_of_zone(s, zone))
-            app = 1;
+           (engine.h, kCodeOwned) is the application's too, also when the
+           application has quit since (Domain.dropped). */
+        if (!app && src != kSrc68k) {
+            int w = domain_of_zone_any(s, zone);
+            unsigned long pc = e->pc & ~3UL;
+            const Domain *wd = w >= 0 ? &s->domains[w] : 0;
+            app = wd && (wd->code_state == kCodeOwned || !wd->live) &&
+                  pc >= wd->code_lo && pc < wd->code_hi;
+        }
         int t = domain_at(s, addr);
         if (t < 0 || t == s->sys_dom) {
             s->c.outside++;
@@ -850,7 +862,7 @@ static unsigned long kernel_zone(State *s, unsigned writer, unsigned current)
     unsigned owner = writer >= kOwnerApp ? writer : current;
     if (owner >= kOwnerApp && owner - kOwnerApp < kMaxDomains) {
         Domain *d = &s->domains[owner - kOwnerApp];
-        if (d->live)
+        if (d->live || d->dropped) /* engine.h, Domain.dropped */
             return d->location;
     }
     return lowmem_long(0x2A6); /* SysZone */
@@ -1827,8 +1839,6 @@ static void find_code(State *s, int i)
     }
     unsigned long lo = find_main(s, i, &m);
     if (!lo) {
-        d->code_lo = m.raw_code; /* for xlog-read */
-        d->code_hi = m.raw_toc;
         d->code_state = kCodeFailed + 12;
         return;
     }

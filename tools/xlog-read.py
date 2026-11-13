@@ -61,7 +61,7 @@ COUNTERS = (["own_" + s for s in SOURCES] + ["cross_" + s for s in SOURCES] +
             ["outside", "switches", "timer_runs", "kernel_errors",
              "refreshes", "added", "removed", "dropped", "nwriters",
              "info_errors"] + ["app_code_" + s for s in SOURCES])
-DOMAIN_SIZE, WRITER_SIZE, OFFENSE_SIZE = 80, 64, 56
+DOMAIN_SIZE, WRITER_SIZE, OFFENSE_SIZE = 84, 64, 56
 CODE_STATES = ["not looked for", "in the partition", "owned", "failed"]
 SRC_MASK, APP_CODE = 0xFF, 0x100
 
@@ -264,8 +264,6 @@ def main():
                     "failed at step %d" % (st - 3))
             if st == 2:
                 what += " %08X-%08X" % (w(o + 68), w(o + 72))
-            elif st > 3:
-                what += " (%08X %08X)" % (w(o + 68), w(o + 72))
             print("       native code outside the partition: %s" % what)
     rows = []
     for i in range(min(c["nwriters"], h["max_writers"])):

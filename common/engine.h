@@ -160,6 +160,13 @@ typedef struct {
     unsigned long code_lo, code_hi; /* its native code's pages outside the
                                        partition, owned in the table only */
     unsigned long code_state;     /* kCode* */
+    unsigned long dropped;        /* when dropped: Counters.removed after it.
+                                     A dropped slot keeps its name,
+                                     partition and code range until it is
+                                     used again, for naming a store taken
+                                     after the drop (the application quits
+                                     at a clean stop before the timer takes
+                                     the store from the hook's ring) */
 } Domain;
 
 /* Domain.code_state. With virtual memory on, the Code Fragment Manager can
