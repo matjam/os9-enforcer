@@ -35,6 +35,10 @@ To boot a disk, run from `os9-protect`:
 DISK=disks/os9-vmoff.qcow2 ./run.sh &
 ```
 
+To test with more RAM, set `MEM` (megabytes, default 512; Mac OS 9 uses
+up to 1536). `xlog-read.py` cannot read the engine's state with virtual
+memory on; use the control panel there.
+
 `run.sh` starts QEMU again from the hard disk whenever the guest restarts.
 `SCRATCH=1` discards disk writes, so it also loses an install at the
 installer's restart; to keep one, use an overlay disk instead.
@@ -87,6 +91,7 @@ allowed store changes nothing.
 | `Y` | an MP task into the Finder | dropped by the kernel, Scribble goes on |
 | `V` | a Time Manager task into a background-only application, 5 s later; make the Finder current | dropped by the kernel |
 | `D` | a deferred task into the Finder, Scribble current | skipped by the engine, Scribble goes on |
+| `X` | make the Enforcer Extension call `ExitToShell` without `engine_stop` | engine stops itself, control block unregistered |
 
 `Y`, `V` and `D` flip the word, read it back and restore it, and print
 whether the store landed.
@@ -108,17 +113,22 @@ window: log, deny, log the system heap, deny with the system heap logged.
   remove write access. The plugin (interrupt routing, caches, sleep) lives
   in the system heap and runs in SIGP mode, where a write fault makes the
   kernel abandon the call (`IntReturnFromSIGP`).
-- Patch 3: a store by a task other than the blue task or the CPU plugin to
-  a read-only page with no owner sets the page's PTE writable and runs the
-  store again (in `MemRetryDSI`), and is counted in `task_log`. The PLE
-  stays read-only, so the page is protected again when its PTE leaves the
-  HTAB or `MPSetAreaAccess` runs.
+- With no control block registered, every store faults as in the stock
+  kernel.
+- Patch 3, in pass mode (the engine is off or turning off): a store by a
+  task other than the blue task or the CPU plugin into a page the engine
+  owns sets the page's PTE writable and runs the store again (in
+  `MemRetryDSI`), and is counted in `task_log`; a page with no owner (the
+  ROM image, another program's protection) faults as in the stock kernel.
+  The PLE stays read-only, so the page is protected again when its PTE
+  leaves the HTAB or `MPSetAreaAccess` runs.
 - Patch 4, the owner check: the engine registers a control block (16 KB,
-  physically contiguous) and an owner table (one byte per 4 KB page) with
-  MP call 109, which the stock kernel leaves unused (it returns −4 there,
-  and the engine runs on its hooks alone). The kernel rejects a block
-  whose `CB_VERSION` it does not know. Owner bytes: 0 none, 1 the system
-  heap, 3 + slot for an application's domain.
+  physically contiguous) and an owner table (one byte per 4 KB page, up to
+  128 table pages: 2 GB) with MP call 109, which the stock kernel leaves
+  unused (it returns −4 there). The kernel takes only `CB_VERSION` 2 and
+  returns paramErr for another, so a mismatched extension and kernel
+  protect nothing. Owner bytes: 0 none, 1 the system heap, 3 + slot for an
+  application's domain.
 - On a store to a read-only page that has an owner, in any task, the kernel
   looks up the owner of the code doing the store: the PC, or for the 68k
   emulator the 68k PC (r24 − 2). Code nobody owns is the system's. A store
@@ -139,7 +149,7 @@ window: log, deny, log the system heap, deny with the system heap logged.
   an application from a Time Manager task leaves the Time Manager's
   dispatch unfinished: no timer runs again and the machine hangs.
 - Every allowed store makes the page's PTE writable, runs the store again
-  and records it in the block's ring (496 entries). The engine's timer
+  and records it in the block's ring (488 entries). The engine's timer
   takes the ring every 16 ms and protects the page again.
 
 ### The engine (`common/engine.c`, `common/engine.h`)
@@ -148,6 +158,22 @@ window: log, deny, log the system heap, deny with the system heap logged.
   memory chunks, and with virtual memory on its main code section. The
   engine protects every domain but the current one, and on a switch
   protects the previous application's pages at once.
+- The span is 2 GB (`kSpanHi`): with 1.5 GB of RAM the Process Manager
+  places applications at about 0x5E000000, from the top of RAM down. The
+  owner table covers logical RAM, plus 256 MB with virtual memory on.
+- The partly used first page of a partition, where the heap and often the
+  code start, gets the application's owner byte only, unprotected
+  (`own_first_page`). Without it, code there was the system's.
+- The Enforcer Extension runs only with the owner check registered; with a
+  stock or other-release kernel it stops the engine and publishes
+  `kEnforcerNoKernel` or `kEnforcerOtherKernel` for the control panel.
+- Off mode turns the temporary memory pools off (`PoolStubs.enabled`).
+- Crash cleanup: the program running the engine patches `_ExitToShell`
+  for itself with `NSetTrapAddress` (`self_exit`), so the Process Manager
+  installs it whenever that program is current, and `engine_stop` runs
+  when it quits without stopping the engine. The pool stub's own check
+  (`quit_hook`) is not enough: right after a switch the trap table can
+  hold another routine until the timer's next tick.
 - Write hooks (`common/hnat.s`, `common/h68k.s`) sit in front of the
   Exception Manager's entry in the native context block and the 68k
   emulator's handler. They take write violations on managed pages, record
@@ -247,8 +273,9 @@ Worst first. Keep in step with Limits in `README.md`.
    store needs its instruction length.
 3. A store the kernel allows opens the page for every task until the next
    tick (16 ms).
-4. The partly used first and last pages of a partition have no owner. The
-   last holds the top of the application's A5 world.
+4. The partly used first and last pages of a partition are not protected,
+   and the last has no owner. The last holds the top of the application's
+   A5 world.
 5. With virtual memory on, code in an application's other fragments, and
    all of its code when `find_code` finds no match, is the system's.
 6. An application launched since the last refresh (up to half a second)
@@ -256,13 +283,26 @@ Worst first. Keep in step with Limits in `README.md`.
 7. The control block and the owner table are in the system heap, where any
    code can write them.
 8. The system heap is log only.
-9. Logical memory above 1 GB has no owner: the bitmap and the owner table
-   cover 1 GB.
-10. An application's own patch of `_OSDispatch`, `DisposeHandle` or
-    `ExitToShell`, made before the engine started, goes around the
-    engine's stub while that application is current.
-11. With virtual memory on, a protect can be lost to `setPTEntryGivenPage`
+9. An application's own patch of `_OSDispatch`, `DisposeHandle` or
+   `ExitToShell`, made before the engine started, goes around the
+   engine's stub while that application is current.
+10. With virtual memory on, a protect can be lost to `setPTEntryGivenPage`
     until the engine protects the page again.
+11. `CB_CURRENT` changes on the timer's tick. For up to 16 ms after a
+    switch, a store by the previous application's code into the new
+    current one is denied and the new one stopped. Possible; not observed.
+12. `engine_stop` puts back the Exception Manager's system-wide handler
+    without checking that it is still Enforcer's. A handler installed
+    after Enforcer's is dropped.
+13. A temporary handle in a chunk grows only inside the chunk:
+    `SetHandleSize` can fail where the Process Manager's heap had room.
+14. Crash cleanup is tested with Scribble `X` (a direct `ExitToShell`). A
+    real crash of the extension, or a Force Quit, that does not reach
+    `ExitToShell` through the trap table is not covered or tested.
+
+Compatibility review (2026-11-13) also noted: programs that write-protect
+their own pages lose those faults to the kernel and the hooks; the engine
+leaks about 75 KB of system heap per start.
 
 Later, as an opt-in debug mode for one application: a protected page after
 each large block, to catch an overrun when it happens.
@@ -271,8 +311,12 @@ each large block, to catch an overrun when it happens.
 
 - It accepts a Mac OS ROM file whose ROM image holds NanoKernel 2.28 as
   Apple made it (CRC-32 of its 105,280 bytes, zeros after it), and
-  recognizes one it has patched. With another patch and the stock file in
-  Enforcer Backup, it patches the backup (an update).
+  recognizes one it has patched. A kernel with another release's patch
+  (`kKernelOther`: it holds `lis r17,'EN'; ori r17,r17,'FK'`) and the stock
+  file in Enforcer Backup is an update: it patches the backup. Remove puts
+  the backup back only over an Enforcer-patched file.
+- It replaces and trashes only files with Enforcer's creators (`is_ours`),
+  and moves an older backup to the Trash instead of deleting it.
 - `installer/rompatch.c` checks both Adler-32 checksums and the image's
   CRC-32, decompresses the 4 MB image, finds the kernel through
   ConfigInfo, applies the patch, sets the lane checksums, compresses again,

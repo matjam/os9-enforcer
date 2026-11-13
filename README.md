@@ -46,7 +46,11 @@ To choose what Enforcer does, open the Enforcer control panel:
 - **Enforce** (the default): block writes into other applications' memory
   and stop the application that made them.
 - **Log only**: record the writes and allow them.
-- **Off**.
+- **Off**: memory and temporary memory work as without Enforcer.
+
+If the Mac OS ROM file is not patched (for example after reinstalling Mac
+OS), the extension does not start and the control panel says so. To fix
+it, open Enforcer Installer and click Install.
 
 "Also log writes into the system heap" records applications' writes into
 the system heap. Enforcer never blocks those: applications and extensions
@@ -78,6 +82,8 @@ application run, and the notification says so.
   that is not current, a Multiprocessing Services task, interrupt-time code,
   a deferred task), the kernel or the engine skips the write and the writer
   goes on.
+- **Without the extension,** the patched kernel opens no write-protected
+  page that Apple's kernel would not.
 
 ## Limits
 
@@ -94,16 +100,25 @@ Known holes:
   application is current, stops the application from inside the deferred
   task.
 - A write the kernel allows opens its page to every task for up to 16 ms.
-- The partly used first and last pages of a partition have no owner.
+- The partly used first and last pages of a partition are not protected.
 - With virtual memory on, code in an application's own shared libraries
   and plug-ins counts as the system's.
 - An application launched in the last half second has no owner until its
   first event.
 - Enforcer's own control block and owner table are in the system heap,
   where any code can write them.
-- Memory above 1 GB has no owner.
 - With virtual memory on, a protection can be lost briefly while the
   Virtual Memory Manager updates a page.
+
+Compatibility:
+- An application's temporary memory comes from chunks of its own. A large
+  temporary handle can fail to grow with `SetHandleSize` where Mac OS would
+  have grown it.
+- Programs that write-protect pages themselves (debuggers, garbage
+  collectors) do not see faults on pages Enforcer opens for them.
+- If the Enforcer Extension quits without stopping cleanly in a way that
+  does not go through `ExitToShell`, its timer and handlers are left
+  behind. A quit through `ExitToShell`, as after a crash, is handled.
 
 ## Building
 
