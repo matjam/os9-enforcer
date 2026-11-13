@@ -61,7 +61,9 @@ cp "$rom" "$dest"
 # attributes, so it does no harm.
 want=$(shasum -a 256 "$rom" | cut -d' ' -f1)
 got=$(shasum -a 256 "$dest" | cut -d' ' -f1)
-if [ "$want" != "$got" ]; then
+want_rsrc=$(shasum -a 256 "$rom/..namedfork/rsrc" | cut -d' ' -f1)
+got_rsrc=$(shasum -a 256 "$dest/..namedfork/rsrc" | cut -d' ' -f1)
+if [ "$want" != "$got" ] || [ "$want_rsrc" != "$got_rsrc" ]; then
     echo "install.sh: the installed file does not match $rom" >&2
     exit 1
 fi
@@ -77,4 +79,5 @@ dev=
 
 echo "installed:  $rom"
 echo "            data fork SHA-256 $got"
+echo "            resource fork SHA-256 $got_rsrc"
 echo "disk:       $disk"
