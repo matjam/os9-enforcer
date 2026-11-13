@@ -40,11 +40,30 @@ limits.
    there does not reach the blue task: the kernel abandons the plugin call
    and returns an error (`IntReturnFromSIGP`). 3,733 plugin calls failed
    that way in 40 seconds. The blue task cannot read the plugin's range
-   (it is in the kernel's CoherenceGroup), so SysLog cannot leave it out
-   without help from the kernel. Scribble's `s` and `S` tests wait on this.
+   (it is in the kernel's CoherenceGroup).
+
+   Patch 2 keeps those pages writable: `MPSetAreaAccess` skips the pages
+   of the plugin's range when a call would remove write access. With it,
+   no plugin call failed (0 faults on the SIGP path, 64,250 to the hooks).
+
+   Keyboard and mouse still stop, within 35 seconds. Each run also has
+   three write faults in Multiprocessing Services tasks, and a write fault
+   in a task other than the blue task stops that task:
+   - 0xFFCD5EB0, a function prologue saving registers on the task's stack
+     (`stfd f31,-8(r1)`): the stack is in a protected system heap page;
+   - 0xFFCD646C, ROM MP library glue storing a kernel call's results
+     through pointers (`stw r4,0(r7)`, before `li r0,19; sc`);
+   - 0x003138AC, code in the system heap.
+
+   The stopped tasks are the likely reason input stops (the guest's
+   keyboard and mouse are USB), not yet shown. The fix is for the kernel
+   to handle write faults in every task the way the hooks do for the blue
+   task, which is step 3's job. Scribble's `s` and `S` tests wait on it.
 3. **Page owners in the kernel.**
+   - Write faults in every task go through the owner check, not only the
+     blue task's: today an MP task's write fault stops the task.
    - The CPU plugin's pages (from `MPRegisterCpuPlugin`) belong to the
-     kernel and are never protected.
+     kernel and are never protected (patch 2 does this for now).
    - A table in RAM with one owner byte per 4 KB page (128 KB for 512 MB),
      allocated at boot. Owners: free, system, low memory, one per
      application.
@@ -218,17 +237,18 @@ SCRATCH=1 DISK=disks/os9-kernel.img ../os9-protect/run.sh &
 ```
 
 To check which kernel is running, dump it from guest memory and compare it
-with the one you built (105,312 bytes with patch 1):
+with the one you built (its size is in `build.sh`'s last line; 105,404
+bytes with patches 1 and 2):
 
 ```bash
-../os9-protect/tools/qmp.py raw '{"execute":"pmemsave","arguments":{"val":15794176,"size":105312,"filename":"/tmp/nk-live.bin"}}'
+../os9-protect/tools/qmp.py raw '{"execute":"pmemsave","arguments":{"val":15794176,"size":105404,"filename":"/tmp/nk-live.bin"}}'
 ```
 
 ```bash
 cmp /tmp/nk-live.bin kernel/build/NanoKernel-v02.28.bin
 ```
 
-The repacked stock dump and the kernel with patch 1 both boot to the
+The repacked stock dump and the kernel with patches 1 and 2 boot to the
 Finder, and the kernel in memory matches the build byte for byte
 (2026-11-12).
 
@@ -259,4 +279,14 @@ Finder, and the kernel in memory matches the build byte for byte
 | Exception return: `lwarx`/`sync`/`stwcx.` clearing the reservation | 0x2C28 |
 | `FDP_053c`: emulated `lwarx` (`NKTranslation.s`) | 0x5D3C |
 | `FDP_06b4`/`FDP_06c0`: emulated `stw`/`stwcx.` | 0x5EB4/0x5EC0 |
-| `MPSetAreaAccess`: the access-bits mask (`lisori r16, ~%11101111`) | 0xFC98 |
+| `MPCreateArea`: the area flags check (`lisori r16, ~%11101111`) | 0xFC98 |
+| `MPSetAreaAccess` (`NKAddressSpaces.s`): `@pageloop` (patch 2) | 0x10B68 |
+| `ExceptionMemRetried`; its choice of path (pcwatch here) | 0x2980; 0x2A14 |
+| `SIGP`: CPU plugin call (`NKInterrupts.s`); `IntReturnFromSIGP` | 0x48E0; 0x4A38 |
+
+Kernel structures the patches use: the CoherenceGroup pointer is the word
+at EWA − 0x338 (`mfsprg rX,0` gives the EWA); in the CoherenceGroup,
+`LA_CpuPlugin` is at +0x28, `CpuPluginSize` at +0x30 and
+`CpuPluginSpacePtr` at +0x4C; in an Area, `PageSize` is at +0x68 and
+`AddressSpacePtr` at +0x6C. On the test machine the CoherenceGroup is at
+physical 0x1F7FC1C0, with its signature `CGRP` in its first word.
