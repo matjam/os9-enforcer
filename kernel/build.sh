@@ -30,6 +30,12 @@ mkdir -p "$out"
     -o "$out/nanokernel.o"
 "$bin/powerpc-apple-macos-objcopy" -O binary -j .text "$out/nanokernel.o" \
     "$out/$kernel.bin"
+# The 68k emulator starts at offset 0x50000 from the kernel in the ROM image.
+size=$(wc -c <"$out/$kernel.bin" | tr -d ' ')
+if [ "$size" -gt $((0x50000)) ]; then
+    echo "build.sh: the kernel ($size bytes) runs into the 68k emulator" >&2
+    exit 1
+fi
 "$bin/powerpc-apple-macos-objdump" -D -b binary -m powerpc:common -EB \
     "$out/$kernel.bin" >"$out/$kernel.dis"
 
@@ -46,4 +52,14 @@ rm -rf "$out/dump"
 cp -R "$stock/dump" "$out/dump"
 cp "$out/$kernel.bin" "$out/dump/Parcels.src/MacROM.src/$kernel"
 "$here/pack.sh" "$out/dump" "$out/Mac OS ROM"
-echo "kernel:     $out/$kernel.bin ($(wc -c <"$out/$kernel.bin" | tr -d ' ') bytes)"
+echo "kernel:     $out/$kernel.bin ($size bytes)"
+
+# Where the added code keeps its data, as a kernel offset and a physical
+# address (the test machine's kernel is at physical 0x00F10000).
+"$bin/powerpc-apple-macos-nm" "$out/nanokernel.o" | while read -r addr type name; do
+    case $name in
+    task_log)
+        printf '%-11s offset 0x%X, physical 0x%08X\n' "$name:" \
+            "0x$addr" $((0x$addr + 0xF10000)) ;;
+    esac
+done
