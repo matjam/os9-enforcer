@@ -574,6 +574,25 @@ nothing yet shows that it rebuilds byte for byte. Changes to the kernel are
 best made as patches to the stock binary, checked against
 `NanoKernel-v02.28.dis` at each patch site.
 
+### Room for new code
+
+The 4 MB ROM image places its parts at the offsets in
+`dump/Parcels.src/MacROM.src/Configfile-1`. The kernel starts at 0x310000
+and is 0x19B40 bytes long. It already runs past its `KernelCodeSize` of
+64 KB, over the hardware init slot at 0x320000, which NewWorld does not use.
+
+From the end of the kernel (0x329B40) to the 68k emulator (0x360000) the
+image holds 222,400 zero bytes, more than twice the kernel's size. They are
+also zero in the running machine's copy of the image (physical 0x00C00000
+to 0x01000000 on the test machine, checked 2026-11-12), so nothing uses
+them. To add kernel code, append it to `NanoKernel-v02.28` in a dump, keep
+it below 0x360000, and branch to it from the patch sites. Put writable data,
+such as a table with an entry per page, in RAM the kernel allocates at
+boot, not in the image.
+
+The 16 KB after the exception table (0x30C000 to 0x310000) is not free: the
+ConfigInfo page is at 0x30D000.
+
 ### Booting a ROM file
 
 The test machine boots the Mac OS ROM file in the System Folder of
