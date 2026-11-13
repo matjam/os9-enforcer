@@ -14,6 +14,7 @@
 #include <Timer.h>
 #include <MixedMode.h>
 #include <Traps.h>
+#include <DriverServices.h>
 
 #include "engine.h"
 #include "nk.h"
@@ -846,7 +847,9 @@ static void drain(State *s, int src, volatile HookEvent *ring, unsigned long n,
             record(s, src | (app ? kWriterAppCode : 0), pc, lr, zone, t, addr);
             if (app)
                 record_offense(s, src, pc, zone, t, addr,
-                               hook_denied(s, src, addr));
+                               src == kSrcNative && (e->pc & kHookSkipped)
+                                   ? kOffenseBlocked
+                                   : hook_denied(s, src, addr));
         }
         if (t != s->cur)
             protect(s, t, addr & kPageMask, kPage);
@@ -1061,6 +1064,38 @@ static int stop_native(State *s, ExceptionInfo *e)
     return 1;
 }
 
+/* A denied native store by code running above task level: a deferred task
+   or a secondary interrupt handler that belongs to the current application.
+   Stopping the application there would leave the interrupted code
+   unfinished, as for a Time Manager task (the patched kernel drops those
+   stores itself when the 68k interrupt mask is up, but deferred tasks run
+   with it at 0). Skip the store instead and mark it, in the native hook's
+   ring and in the offense log if the timer has drained it already, as
+   blocked. A skipped stwcx. reports success, so a retry loop ends. */
+static void skip_store(State *s, ExceptionInfo *e, unsigned long pc,
+                       unsigned long addr)
+{
+    if (s->stopper)
+        s->stopper->zone = 0;
+    unsigned long insn = *(const unsigned long *)pc;
+    if ((insn & 0xFC0007FF) == 0x7C00012D) /* stwcx. */
+        e->machineState->CR = (e->machineState->CR & 0x0FFFFFFF) | 0x20000000;
+    e->machineState->PC.lo = pc + 4;
+    volatile HookData *h = s->hnat;
+    volatile HookEvent *ring = h->ring;
+    if (ring) {
+        volatile HookEvent *ev = &ring[(h->ring_idx + kHookRing - 1) % kHookRing];
+        if ((ev->pc & ~3UL) == pc && ev->addr == addr)
+            ev->pc |= kHookSkipped;
+    }
+    unsigned long n = s->n_offenses;
+    if (n) {
+        Offense *o = &s->offenses[(n - 1) % kOffenseLog];
+        if (o->pc == pc && o->addr == addr && o->denied == kOffenseStopped)
+            o->denied = kOffenseBlocked;
+    }
+}
+
 /* The Exception Manager's system-wide handler: writes to managed pages
    that did not come through the native hook. */
 static long handler(ExceptionInfo *e)
@@ -1087,6 +1122,10 @@ static long handler(ExceptionInfo *e)
     if ((app && addr >= s->deny_from) ||
         (s->stopper && s->stopper->zone &&
          s->stopper->zone == current_zone())) {
+        if (CurrentExecutionLevel() != kTaskLevel) {
+            skip_store(s, e, pc, addr);
+            return 0;
+        }
         if (stop_native(s, e))
             return 0;
         return g_prev ? g_prev(e) : -1;

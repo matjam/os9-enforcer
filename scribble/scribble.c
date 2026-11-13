@@ -42,6 +42,12 @@
  *   V  from a Time Manager task 5 seconds later, into the memory of a
  *      background-only application; make the Finder current in those 5
  *      seconds. The result is printed with the next command.
+ *
+ * A store from a deferred task, which runs above task level while this
+ * application is current: Enforcer's fault handler skips it instead of
+ * stopping this application there (README, step 10).
+ *   D  a Time Manager task half a second later installs a deferred task,
+ *      which stores into the Finder's memory.
  */
 
 #include <stdio.h>
@@ -123,6 +129,40 @@ static void tm_flip(TMTask *tm)
 }
 
 enum { kTimerInfo = 0x0000B802 }; /* register-based, A1 = task */
+
+/* The Deferred Task Manager (InterfaceLib), not in the Multiversal
+   Interfaces. */
+typedef struct DeferredTask {
+    struct DeferredTask *qLink;
+    short qType;
+    short dtFlags;
+    UniversalProcPtr dtAddr;
+    long dtParam;
+    long dtReserved;
+} DeferredTask;
+extern pascal OSErr DTInstall(DeferredTask *dt);
+enum {
+    kDTQType = 7,
+    kDTInfo = 0x0000B802 /* register-based, A1 = dtParam */
+};
+
+/* The D test: a Time Manager task installs a deferred task, which does
+   the flip. */
+typedef struct {
+    TMTask tm;
+    DeferredTask dt;
+    FlipTest f;
+} DeferFlip;
+
+static void dt_flip(long param)
+{
+    flip((FlipTest *)param);
+}
+
+static void tm_defer(TMTask *tm)
+{
+    DTInstall(&((DeferFlip *)tm)->dt);
+}
 
 /* store(addr, value), 68k, C calling convention. */
 static const unsigned short code68k[] = {
@@ -398,7 +438,8 @@ int main(void)
                "heap, s/S native/68k store into the system heap, t time "
                "traps, m temporary memory, M 1 MB of it, T store into "
                "another application's, P page 600 MB, Y from an MP task, "
-               "V from a Time Manager task, q quit; then Return\n");
+               "V from a Time Manager task, D from a deferred task, q quit; "
+               "then Return\n");
         int ch = getchar();
         while (ch != '\n' && getchar() != '\n')
             ;
@@ -445,6 +486,30 @@ int main(void)
             tf_armed = 1;
             printf("in 5 seconds, a store into %s at %08lX: make the "
                    "Finder current now\n", name, (unsigned long)t);
+            continue;
+        }
+        case 'D': {
+            static DeferFlip df;
+            memset(&df, 0, sizeof df);
+            df.f.target = target;
+            df.dt.qType = kDTQType;
+            df.dt.dtAddr = NewRoutineDescriptor((ProcPtr)dt_flip, kDTInfo,
+                                                kPowerPCISA);
+            df.dt.dtParam = (long)&df.f;
+            df.tm.tmAddr = (ProcPtr)NewRoutineDescriptor(
+                (ProcPtr)tm_defer, kTimerInfo, kPowerPCISA);
+            InsTime((QElemPtr)&df.tm);
+            PrimeTime((QElemPtr)&df.tm, 500);
+            /* Wait without calling WaitNextEvent, so this application
+               stays current when the deferred task runs. */
+            unsigned long start = TickCount();
+            while (!df.f.done && TickCount() - start < 180)
+                ;
+            RmvTime((QElemPtr)&df.tm);
+            if (df.f.done)
+                flip_report("Deferred task, into the Finder", &df.f);
+            else
+                printf("the deferred task did not run\n");
             continue;
         }
         case 's':

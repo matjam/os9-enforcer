@@ -38,6 +38,13 @@ enum { kHookFrameLen = 0x70 };
    low bits are free): the store's code is the current application's. */
 enum { kHookAppCode = 1 };
 
+/* Set in a native HookEvent.pc by the engine's fault handler: the store was
+   denied, but it came from code running above task level (a deferred task,
+   a secondary interrupt handler), where stopping the application would
+   leave the interrupted code unfinished. The handler skipped the store
+   instead. */
+enum { kHookSkipped = 2 };
+
 /* A store a hook handled. Must match the R_ offsets in h68k.s and hnat.s.
    For h68k, r24 is the next 68k instruction + 2 and sp is the 68k A7; for
    hnat, r24 holds the interrupted r3 and sp is r1. */

@@ -10,6 +10,8 @@ function(hooks_embed target)
     endif()
     add_dependencies(${target} hooks_code)
     target_include_directories(${target} PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${HOOKS_COMMON})
+    # CurrentExecutionLevel, for the engine's fault handler.
+    target_link_libraries(${target} DriverServicesLib)
 endfunction()
 
 function(hooks_generate)

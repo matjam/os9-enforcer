@@ -426,6 +426,29 @@ limits.
      install, then Scribble `n`, `6` and `T` each stopped cleanly and named
      Scribble, and `Y` and `V` dropped.
 
+10. **Stores above task level.** Done (2026-11-13): the engine's fault
+    handler skips a denied native store made above task level instead of
+    stopping the application there (`skip_store` in `common/engine.c`).
+    - Deferred tasks run with the 68k interrupt mask at 0, so the kernel's
+      mask test (step 9) does not tell them from the application's own
+      code. A deferred task's store into another application, made while
+      its application is current, was denied, and the handler then stopped
+      the application from inside the Deferred Task Manager.
+    - Before it stops the application, the handler now calls
+      `CurrentExecutionLevel` (DriverServicesLib). At any level above
+      `kTaskLevel` (a deferred task, a secondary interrupt handler), it
+      moves the PC past the store, clears the stop request, and marks the
+      store as skipped (`kHookSkipped` in the native hook's ring entry, or
+      the offense itself if the timer has taken it already). The engine
+      logs it as a blocked offense, and the extension's notification says
+      the writer was not stopped. A skipped `stwcx.` reports success, so a
+      retry loop ends.
+    - Test on `disks/os9-vmoff.qcow2`: Scribble `D` (a Time Manager task
+      installs a deferred task, which stores into the Finder while Scribble
+      is current). The kernel denied both stores, the handler skipped both,
+      the word read back unchanged, and Scribble went on running. Scribble
+      `n` afterwards still stopped cleanly.
+
 Not covered:
 - An overrun inside an application's own memory. It can only damage that
   application.
@@ -434,11 +457,10 @@ Not covered:
 Known holes, worst first:
 1. A store by another application's code into the current application's
    page is allowed and logged (it can be a callback storing results).
-2. An application's deferred tasks and I/O completion routines can run
-   with the 68k interrupt mask at 0. A store by one of them, while its
-   application is current, is denied and the application stopped from
-   there, which can leave the Deferred Task Manager or the I/O
-   unfinished.
+2. A store by an application's 68k code in a deferred task, while the
+   application is current, is still denied and the application stopped
+   from there: the 68k stop tests only the interrupt mask, and skipping a
+   68k store needs its instruction length (step 10 covers native code).
 3. A store the kernel allows opens the page for every task until the
    engine protects it again on its next tick (16 ms).
 4. The partly used first and last pages of a partition have no owner. The
