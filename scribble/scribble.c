@@ -20,6 +20,10 @@
  *      after Enforcer protects it again (every 16 ms) is a trap. The extra
  *      time divided by the traps is what one trap costs, including putting
  *      the protection back. Needs the Enforcer Extension running.
+ *
+ *   m  allocate 64 KB of temporary memory filled with 'SCRB' and keep it,
+ *      printing its handle: for finding where the Process Manager records
+ *      an application's temporary memory (README, step 4).
  */
 
 #include <stdio.h>
@@ -232,7 +236,7 @@ int main(void)
     for (;;) {
         printf("\nn native store, 6 68k store, b BlockMoveData, o own "
                "heap, s/S native/68k store into the system heap, t time "
-               "traps, q quit; then Return\n");
+               "traps, m temporary memory, q quit; then Return\n");
         int ch = getchar();
         while (ch != '\n' && getchar() != '\n')
             ;
@@ -267,6 +271,22 @@ int main(void)
         case 't':
             bench(loc, size);
             continue;
+        case 'm': {
+            /* For finding how the Process Manager records an
+               application's temporary memory: a 64 KB block, kept, filled
+               with 'SCRB', at a handle printed here. */
+            OSErr err = 0;
+            Handle h = TempNewHandle(0x10000, &err);
+            if (!h) {
+                printf("TempNewHandle failed: %d\n", err);
+                continue;
+            }
+            for (unsigned long i = 0; i < 0x10000 / 4; i++)
+                ((unsigned long *)*h)[i] = 'SCRB';
+            printf("temporary memory: handle %08lX, block %08lX\n",
+                   (unsigned long)h, (unsigned long)*h);
+            continue;
+        }
         case 'q':
             return 0;
         default:

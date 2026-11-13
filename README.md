@@ -148,6 +148,34 @@ limits.
    - Owners are set when pages are handed out and cleared when an
      application quits, by patches to the Memory Manager and the Process
      Manager (from the extension, or in the ROM image).
+
+   What the Process Manager's heap holds (2026-11-12, from memory dumps of
+   the test machine; see [Reading guest memory](#reading-guest-memory)):
+   - Partitions, temporary memory and the Process Manager's own blocks.
+     The master pointers of all of them are in one block near the top of
+     the heap (0x1EECxxxx on the test machine), in the order they were
+     allocated, and relative handles count from 0x1EEC9564, just above
+     them (the zone pointer in the Process Manager's globals).
+   - Block headers are 12 bytes: a tag word (first byte 0xAB for a
+     relocatable block in use, 0x6B for a nonrelocatable one, 0x10 for a
+     free one; second byte the master pointer flags, 0x80 locked; last
+     byte the size correction), the physical size, then the relative
+     handle (relocatable), the zone (nonrelocatable) or the next free
+     block (free). No header names an owner.
+   - Each application's process entry is a block right after its
+     partition (0x5A0 bytes): its process number, type and creator, links
+     to the other entries, and its partition's pointer, handle and size.
+   - System temporary memory is in a handle list (capacity, count, then
+     handles) whose handle is in the Process Manager's globals (0x010BA820
+     on the test machine, next to the zone pointer). The code that writes
+     into the Finder's heap from outside its partition (0x1E75xxxx to
+     0x1E7Exxxx) is in two of its blocks, so by the system's own records
+     it is system code.
+   - Where the Process Manager records an application's own temporary
+     memory is not found yet: a 64 KB `TempNewHandle` by Scribble (test
+     `m`) put its handle in no process entry or handle list found so far.
+     A patch to `TempNewHandle` from the extension is the other way, if
+     PowerPC callers reach it through the trap.
 5. **Attribution.** Judge a store by the code doing it: an application's
    code fragments and code resources in its partition, or system code in
    ROM and the system heap. For 68k code that is the emulated PC (r24).
@@ -241,7 +269,7 @@ What it showed, which the plan depends on:
 | `h68k/` | H68KTest: tests for both write hooks |
 | `wlog/` | WLog: the first write logger |
 | `probe/` | Probe: the first page protection experiment |
-| `tools/` | Host scripts that read the engine's and hooks' state from the guest |
+| `tools/` | Host scripts that read the engine's and hooks' state and the guest's memory |
 
 To build them, run `./build.sh`, or name directories:
 `./build.sh xlog scribble`. Each builds a MacBinary `.bin` in its `build/`
@@ -255,6 +283,33 @@ SCRATCH=1 DISK=disks/os9-novm.qcow2 ../os9-protect/run.sh &
 ```bash
 ../os9-protect/tools/push.sh -n Test xlog/build/SysLog.bin scribble/build/Scribble.bin
 ```
+
+## Reading guest memory
+
+`tools/xlog-read.py` and `tools/hooks-read.py` read logical memory with
+QEMU's memsave, which goes through the hashed page table: a page whose PTE
+is not in it does not read. That covers every page the engine protects
+(protecting a page removes its PTE) and any page not used lately. For
+small structures the engine and hooks touch all the time that is enough.
+
+To read anything else, use `tools/lmem.py`. It takes a physical dump and
+reads it through the map from logical to physical memory, which with
+virtual memory off is a few linear runs: on the test machine (512 MB),
+logical + 0x4000 below 0x00BFC000 and logical + 0x35D000 from 0x00CB6000
+up. Logical and physical addresses differ, so a physical dump read at
+logical addresses gives other memory. For example, to print the Process
+Manager's globals and find where a handle is stored:
+
+```bash
+tools/lmem.py dump 0x010BA800 0x40
+```
+
+```bash
+tools/lmem.py find 0x1EEC9520
+```
+
+The physical dump takes a few seconds. memsave reads that go page by page
+over large ranges pause the guest for minutes.
 
 ## Working on the kernel
 
