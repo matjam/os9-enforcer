@@ -5,7 +5,8 @@ project(XLog C CXX)
 # Build with the Retro68 PowerPC toolchain:
 #   cmake -S xlog -B xlog/build -DCMAKE_TOOLCHAIN_FILE=$PWD/toolchain/build/toolchain/powerpc-apple-macos/cmake/retroppc.toolchain.cmake
 # XLog logs cross-application stores; Guard is the same program built to
-# deny the ones made by an application's own code.
+# deny the ones made by an application's own code. SysLog and SysGuard also
+# watch the system heap (log only).
 include(${CMAKE_CURRENT_SOURCE_DIR}/../common/hooks.cmake)
 set(ENGINE ${CMAKE_CURRENT_SOURCE_DIR}/../common/engine.c)
 add_application(XLog xlog.c ${ENGINE} xlog.r CONSOLE)
@@ -16,3 +17,13 @@ add_application(Guard xlog.c ${ENGINE} xlog.r CONSOLE)
 hooks_embed(Guard)
 target_compile_options(Guard PRIVATE -O2 -Wall)
 target_compile_definitions(Guard PRIVATE XLOG_ENFORCE=1)
+
+add_application(SysLog xlog.c ${ENGINE} xlog.r CONSOLE)
+hooks_embed(SysLog)
+target_compile_options(SysLog PRIVATE -O2 -Wall)
+target_compile_definitions(SysLog PRIVATE XLOG_SYSHEAP=1)
+
+add_application(SysGuard xlog.c ${ENGINE} xlog.r CONSOLE)
+hooks_embed(SysGuard)
+target_compile_options(SysGuard PRIVATE -O2 -Wall)
+target_compile_definitions(SysGuard PRIVATE XLOG_ENFORCE=1 XLOG_SYSHEAP=1)

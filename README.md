@@ -245,7 +245,7 @@ sees them, make the page writable and let the store run again. One covers
   over it, one bit per 4 KB page;
 - a "current" range `[cur_lo, cur_hi)`, the current application's own
   memory: a store there is only counted (`count_self`);
-- a 64-entry ring, in the system heap, recording every other store they
+- a 256-entry ring, in the system heap, recording every other store they
   handle;
 - `passed`, the last write fault they did not handle, which goes on to the
   original handler.
@@ -255,13 +255,24 @@ kernel with r3 = 0, which runs the faulting instruction again. Anything else
 goes to the original handler with every register as it arrived. Both stay
 installed after the installing application quits.
 
+A protected page is read-only for all code, the NanoKernel included (page
+protection bits 11). The kernel also offers read-only for user mode only
+(`kAccessSupRWUserRO`, bits 01), which would let the kernel's own stores
+through, but on 9.2.2 the blue task's stores go through it as well (tested
+under Guard: 171 process switches, no write faults). So page protection
+cannot tell Mac OS code from the kernel, let alone from an application.
+
 Both hooks also apply a deny rule to the stores they record. When the code
 doing the store lies inside the current range, the current application's
 own code is writing outside its memory: the hook sets bit 0 of the ring
-entry's `pc`. With `enforce` set, it also leaves the page protected and
-passes the fault on, which stops the application; it counts these in
-`count_denied` and keeps the last in `denied`. For native code the store's
-code is the faulting PC; for 68k code it is the next 68k instruction.
+entry's `pc`. When the fault address is at or above `deny_from`, it also
+leaves the page protected and passes the fault on, which stops the
+application; it counts these in `count_denied` and keeps the last in
+`denied`. `deny_from` is ~0 (deny nothing) after install. For native code
+the store's code is the faulting PC; for 68k code it is the next 68k
+instruction, except when the store is made by the emulator code that fills
+a 68k-to-native call frame (`frame`, 0x6806E300 on 9.2.2), whose stores
+the hook treats as system stores.
 
 The hooks only see faults in the blue task (Mac OS itself, including its
 interrupt-level code). A write fault in any other NanoKernel task, such as
@@ -441,6 +452,10 @@ Limits:
 - A native denial at interrupt time would call `ExitToShell` at interrupt
   time: the native side cannot tell interrupt time from task level (not
   tested).
+- An atomic update (`lwarx`/`stwcx.`) by system code of a variable in a
+  protected page hangs the machine (see
+  [Watching the system heap](#watching-the-system-heap-syslog-and-sysguard)).
+  Not seen with applications' partitions so far.
 
 `scribble/` (Scribble) tests it. It stores into a word in the middle of the
 Finder's partition the value already there, so an allowed store changes
@@ -449,6 +464,9 @@ nothing:
 - `6`: a store from 68k code in its heap: denied;
 - `b`: `BlockMoveData`, system code: allowed;
 - `o`: a store into its own heap: allowed;
+- `s`, `S`: a store from its native or 68k code into the middle of the
+  system heap, for SysLog and SysGuard (see
+  [Watching the system heap](#watching-the-system-heap-syslog-and-sysguard));
 - `t`: times traps, with the Enforcer Extension running (see
   [Protecting the system heap page by page](#protecting-the-system-heap-page-by-page)).
 
@@ -707,3 +725,45 @@ about 20% of the CPU on this QEMU if every page is protected again at every
 tick, and 1 to 3% in interactive use if the few dozen pages the system
 writes all the time are left open, at the price of those pages. Busy work
 costs more, because more pages get written in each tick.
+
+### Watching the system heap: SysLog and SysGuard
+
+SysLog and SysGuard are XLog and Guard built with `XLOG_SYSHEAP=1`. The
+engine then adds the system heap as one more domain: the whole pages from
+SysZone's header to its end (`bkLim`), followed as the heap grows. It is
+log only: the hooks deny app-code stores only at or above `deny_from`,
+which is the system heap's end in enforce mode. A page that traps on 4
+ticks in a row is left open for a while (1 s, doubling up to 64 s when it
+keeps turning hot). Pages holding the engine's own blocks, pages that are
+not plain read/write, and pages that held the stack pointer of a trapped
+store are never protected. `tools/xlog-read.py` prints the counts.
+
+It does not work yet. On 2026-11-12 SysLog protected 5,253 pages (43 left
+out for the engine's own blocks), the hooks handled 22 traps, and then the
+machine hung:
+- The CPU looped in the ROM's atomic increment at 0xFFD88A3C (`lwarx`,
+  `addi`, `sync`, `stwcx.`, `bne` back) on 0x6F7B8, a protected system heap
+  page, alternating with NanoKernel code.
+- No hook saw a fault, the kernel's exception counts did not move, and the
+  engine's timer stopped.
+- The NanoKernel handles a data fault by running the faulting instruction
+  itself, with the caller's translation (`NKTranslation.s`). For `stwcx.`
+  it runs `stwcx.` (FDP_06c0), but the reservation the caller's `lwarx`
+  took is gone by then, so the store fails without a fault and the caller's
+  loop tries again. A fault inside the kernel's attempt is what reaches a
+  hook, and it never comes.
+
+So a protected page that holds a variable updated with `lwarx`/`stwcx.`
+hangs the machine. The system heap has many: the ROM's atomic routines
+(IncrementAtomic and others) are used by Open Transport, the Time Manager
+and drivers. The same can happen in an application's partition if system
+code updates a variable there atomically while the application is not
+current; it has not been seen in testing.
+
+To reproduce, push SysLog with Scribble and open SysLog (see
+[Guard](#guard)); Scribble's `s` and `S` tests store into the middle of the
+system heap from native and 68k code.
+
+A page protected for user mode only (`kAccessSupRWUserRO`) would leave the
+kernel's own stores alone, but does not stop the blue task's stores either
+(see [Write hooks](#write-hooks)).

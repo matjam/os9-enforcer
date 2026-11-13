@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Print the protection engine's state from the running guest (XLog, Guard
-or the Enforcer Extension): mode, counters, domains, cross-domain writers
-and stores by an application's own code.
+"""Print the protection engine's state from the running guest (XLog, Guard,
+SysLog, SysGuard or the Enforcer Extension): mode, counters, the system
+heap's page watch, domains, cross-domain writers and stores by an
+application's own code.
 
 Usage: tools/xlog-read.py [STATE_ADDR]
 
@@ -23,9 +24,14 @@ OWNER = 0x68FFFBEC
 HEADER = ["magic", "self", "off_counters", "n_counters", "off_domains",
           "n_domains", "domain_size", "off_writers", "max_writers",
           "writer_size", "off_cur", "off_offenses", "max_offenses",
-          "offense_size", "off_mode", "off_stopper"]
+          "offense_size", "off_mode", "off_stopper", "off_sys"]
 STOPPER = ["magic", "old_vector", "zone"] + ["stops_" + s for s in
                                              ["native", "68k", "fallback"]]
+# State from off_sys, then the SysPages header and its SysCounters.
+SYS_STATE = ["sys_dom", "sys_on", "want_sys", "deny_from", "sys"]
+SYS_PAGES = (["magic", "cap", "lo", "n", "tick", "n_hot"] +
+             ["traps", "app_traps", "hot", "hot_full", "cooled", "reheated",
+              "excluded", "not_rw", "stacks", "resweeps", "grown", "shrunk"])
 MODES = ["off", "log only", "enforce"]
 SOURCES = ["native", "68k", "fallback"]
 COUNTERS = (["own_" + s for s in SOURCES] + ["cross_" + s for s in SOURCES] +
@@ -43,15 +49,15 @@ def collect(addr):
         if a is None:
             a = struct.unpack(">I", read(OWNER, 4))[0]
         if not a:
-            return a, None, None, None
+            return a, None, None, None, None
         n = len(HEADER)
         h = dict(zip(HEADER, struct.unpack(">%dI" % n, read(a, 4 * n))))
-        if h["magic"] != struct.unpack(">I", b"ENF2")[0] or h["self"] != a:
-            return a, h, None, None
+        if h["magic"] != struct.unpack(">I", b"ENF3")[0] or h["self"] != a:
+            return a, h, None, None, None
         size = max(h["off_writers"] + h["max_writers"] * h["writer_size"],
                    h["off_offenses"] + 4 +
                    h["max_offenses"] * h["offense_size"],
-                   h["off_stopper"] + 4)
+                   h["off_stopper"] + 4, h["off_sys"] + 4 * len(SYS_STATE))
         d = read(a, size)
         o = h["off_stopper"]
         st = struct.unpack(">I", d[o:o + 4])[0]
@@ -60,7 +66,14 @@ def collect(addr):
             stopper = dict(zip(STOPPER, struct.unpack(
                 ">%dI" % len(STOPPER), read(st, 4 * len(STOPPER)))))
             stopper["addr"] = st
-        return a, h, d, stopper
+        o = h["off_sys"]
+        sys_state = dict(zip(SYS_STATE, struct.unpack(
+            ">%dI" % len(SYS_STATE), d[o:o + 4 * len(SYS_STATE)])))
+        if sys_state["sys"]:
+            sys_state.update(("p_" + k, v) for k, v in zip(SYS_PAGES, struct.unpack(
+                ">%dI" % len(SYS_PAGES),
+                read(sys_state["sys"], 4 * len(SYS_PAGES)))))
+        return a, h, d, stopper, sys_state
     return fn
 
 
@@ -70,11 +83,11 @@ def cstr(b):
 
 def main():
     addr = int(sys.argv[1], 0) if len(sys.argv) > 1 else None
-    addr, h, d, stopper = vdump.paused(collect(addr))
+    addr, h, d, stopper, sy = vdump.paused(collect(addr))
     if not addr:
         sys.exit("no engine is running (no owner in the 68k hook)")
     if d is None:
-        sys.exit("no engine state (ENF2) at %08X" % addr)
+        sys.exit("no engine state (ENF3) at %08X" % addr)
     if (h["n_counters"] != len(COUNTERS) or h["domain_size"] != DOMAIN_SIZE
             or h["writer_size"] != WRITER_SIZE
             or h["offense_size"] != OFFENSE_SIZE):
@@ -105,6 +118,27 @@ def main():
                   stopper["stops_native"], stopper["stops_68k"]))
     else:
         print("clean stop not installed")
+    deny = sy["deny_from"]
+    print("deny from %s" % ("nowhere" if deny == 0xFFFFFFFF else
+                            "%08X" % deny))
+    if sy["sys"]:
+        ticks = sy["p_tick"]
+        print("system heap %s (domain %d%s): %08X-%08X, %d pages of %d; "
+              "%d ticks" % (
+                  "watched" if sy["sys_on"] else "not watched",
+                  struct.unpack(">i", struct.pack(">I", sy["sys_dom"]))[0],
+                  "" if sy["want_sys"] == sy["sys_on"] else ", change requested",
+                  sy["p_lo"], sy["p_lo"] + sy["p_n"] * 4096, sy["p_n"],
+                  sy["p_cap"], ticks))
+        print("  traps %d (%.1f a tick), by app code %d; hot now %d, made "
+              "hot %d, cooled %d, reheated %d, hot list full %d" % (
+                  sy["p_traps"], sy["p_traps"] / ticks if ticks else 0,
+                  sy["p_app_traps"], sy["p_n_hot"], sy["p_hot"],
+                  sy["p_cooled"], sy["p_reheated"], sy["p_hot_full"]))
+        print("  never protected: engine's own %d, not read/write %d, "
+              "stacks %d; resweeps %d, grown %d, shrunk %d" % (
+                  sy["p_excluded"], sy["p_not_rw"], sy["p_stacks"],
+                  sy["p_resweeps"], sy["p_grown"], sy["p_shrunk"]))
     print("domains:")
     for i in range(h["n_domains"]):
         o = h["off_domains"] + i * DOMAIN_SIZE

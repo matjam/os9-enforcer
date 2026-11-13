@@ -21,6 +21,9 @@
 
 enum { kTimerMs = 16, kBusErrorVector = 0x08 };
 
+/* SysPages.flags */
+enum { kPageExcluded = 1, kPageHot = 2, kPageCooled = 4 };
+
 /* The bitmap covers the whole blue area, one bit per page. */
 #define kSpanLo 0UL
 #define kSpanHi 0x40000000UL
@@ -105,20 +108,37 @@ static void set_bits(State *s, unsigned long lo, unsigned long hi, int on)
     }
 }
 
-/* Protect pages of domain i, unless protection is off or the domain is
-   going away. */
+/* Protect pages of application domain i, unless protection is off or the
+   domain is going away. The system heap's pages go through sys_protect_*
+   instead, which leave out its excluded and hot pages. */
 static void protect(State *s, int i, unsigned long lo, unsigned long len)
 {
     Domain *d = &s->domains[i];
-    if (s->mode == kModeOff || !d->live || d->dying)
+    if (s->mode == kModeOff || !d->live || d->dying || i == s->sys_dom)
         return;
     if (nk_protect(s->area, lo, len))
         s->c.kernel_errors++;
 }
 
+static void sys_protect_all(State *s);
+static void sys_runs(State *s, unsigned long from, unsigned long to,
+                     unsigned char skip, int on);
+
 static void protect_domain(State *s, int i)
 {
-    protect(s, i, s->domains[i].lo, s->domains[i].hi - s->domains[i].lo);
+    if (i == s->sys_dom)
+        sys_protect_all(s);
+    else
+        protect(s, i, s->domains[i].lo, s->domains[i].hi - s->domains[i].lo);
+}
+
+static void unprotect_domain(State *s, int i)
+{
+    Domain *d = &s->domains[i];
+    if (i == s->sys_dom)
+        sys_runs(s, 0, s->sys->n, kPageExcluded, 0);
+    else if (nk_unprotect(s->area, d->lo, d->hi - d->lo))
+        s->c.kernel_errors++;
 }
 
 static void protect_others(State *s)
@@ -218,11 +238,373 @@ static void record_offense(State *s, int src, unsigned long pc,
     o->pc = pc;
     o->addr = addr;
     o->source = src;
-    o->denied = s->mode == kModeEnforce && src != kSrcFallback;
+    /* What the hooks did with it: the fallback handler records only the
+       stores it let through. */
+    o->denied = src != kSrcFallback && addr >= s->deny_from;
     writer_name(s, zone, o->writer);
     copy_name(o->target, s->domains[t].name);
     s->c.app_code[src]++;
     s->n_offenses = n;
+}
+
+/* The system heap (see SysPages in engine.h) ---------------------------- */
+
+/* The hooks deny app-code stores at or above deny_from: everything above
+   the system heap in kModeEnforce (the system heap is log only), nothing
+   otherwise. Change it before the system heap's pages are managed and
+   after they no longer are. */
+static void set_deny(State *s, unsigned long mode)
+{
+    unsigned long from = ~0UL;
+    if (mode == kModeEnforce)
+        from = s->sys_dom >= 0 ? s->domains[s->sys_dom].hi : 0;
+    s->deny_from = from;
+    s->h68k->deny_from = from;
+    s->hnat->deny_from = from;
+}
+
+static int sys_live(State *s)
+{
+    if (s->sys_dom < 0)
+        return 0;
+    Domain *d = &s->domains[s->sys_dom];
+    return d->live && !d->dying;
+}
+
+/* addr is in a watched page. */
+static int in_sys(State *s, unsigned long addr)
+{
+    return s->sys_dom >= 0 && addr >= s->sys->lo &&
+           (addr - s->sys->lo) >> 12 < s->sys->n;
+}
+
+static void sys_protect_page(State *s, unsigned long p)
+{
+    SysPages *sp = s->sys;
+    if (s->mode == kModeOff || !sys_live(s) || p >= sp->n ||
+        (sp->flags[p] & (kPageExcluded | kPageHot)))
+        return;
+    if (nk_protect(s->area, sp->lo + p * kPage, kPage))
+        s->c.kernel_errors++;
+}
+
+/* Protect (on) or open the pages in [from, to) that have none of the skip
+   flags, one kernel call per run. */
+static void sys_runs(State *s, unsigned long from, unsigned long to,
+                     unsigned char skip, int on)
+{
+    SysPages *sp = s->sys;
+    unsigned long p = from;
+    while (p < to) {
+        while (p < to && (sp->flags[p] & skip))
+            p++;
+        unsigned long q = p;
+        while (q < to && !(sp->flags[q] & skip))
+            q++;
+        if (q > p) {
+            unsigned long a = sp->lo + p * kPage, len = (q - p) * kPage;
+            if (on ? nk_protect(s->area, a, len) : nk_unprotect(s->area, a, len))
+                s->c.kernel_errors++;
+        }
+        p = q;
+    }
+}
+
+static void sys_protect_all(State *s)
+{
+    if (s->mode == kModeOff || !sys_live(s))
+        return;
+    sys_runs(s, 0, s->sys->n, kPageExcluded | kPageHot, 1);
+}
+
+/* Leave page p open for good: a stack is in it. */
+static void sys_exclude_stack(State *s, unsigned long p)
+{
+    SysPages *sp = s->sys;
+    if (p >= sp->n || (sp->flags[p] & kPageExcluded))
+        return;
+    sp->flags[p] |= kPageExcluded;
+    sp->c.stacks++;
+    if (nk_unprotect(s->area, sp->lo + p * kPage, kPage))
+        s->c.kernel_errors++;
+}
+
+/* Leave page p open for a while. Returns 0 if the hot list is full. */
+static int sys_make_hot(State *s, unsigned long p)
+{
+    SysPages *sp = s->sys;
+    if (sp->n_hot == kSysMaxHot) {
+        sp->c.hot_full++;
+        return 0;
+    }
+    if (sp->flags[p] & kPageCooled) {
+        unsigned short quiet = (unsigned short)sp->tick - sp->cooled_at[p];
+        if (quiet < kSysHotTicks) {
+            if (sp->backoff[p] < kSysMaxBackoff)
+                sp->backoff[p]++;
+            sp->c.reheated++;
+        } else if (quiet >= kSysCoolTicks) {
+            sp->backoff[p] = 0;
+        }
+    }
+    sp->flags[p] |= kPageHot;
+    sp->streak[p] = 0;
+    sp->hot[sp->n_hot].page = p;
+    sp->hot[sp->n_hot].until =
+        sp->tick + ((unsigned long)kSysHotTicks << sp->backoff[p]);
+    sp->n_hot++;
+    sp->c.hot++;
+    return 1;
+}
+
+/* Protect again the hot pages whose time is up. */
+static void sys_expire(State *s)
+{
+    SysPages *sp = s->sys;
+    for (unsigned long i = 0; i < sp->n_hot;) {
+        HotPage *h = &sp->hot[i];
+        if ((long)(sp->tick - h->until) < 0) {
+            i++;
+            continue;
+        }
+        unsigned long p = h->page;
+        *h = sp->hot[--sp->n_hot];
+        sp->flags[p] = (sp->flags[p] & ~kPageHot) | kPageCooled;
+        sp->cooled_at[p] = (unsigned short)sp->tick;
+        sp->c.cooled++;
+        sys_protect_page(s, p);
+    }
+}
+
+/* A store into watched page addr, which the hook opened. */
+static void sys_trapped(State *s, int src, volatile HookEvent *e,
+                        unsigned long addr)
+{
+    SysPages *sp = s->sys;
+    unsigned long p = (addr - sp->lo) >> 12;
+    sp->c.traps++;
+    if (e->pc & kHookAppCode) {
+        unsigned long pc = src == kSrc68k ? hook_next_pc(e->r24)
+                                          : e->pc & ~3UL;
+        unsigned long lr = src == kSrc68k ? 0 : e->lr;
+        sp->c.app_traps++;
+        record(s, src | kWriterAppCode, pc, lr, e->zone, s->sys_dom, addr);
+        record_offense(s, src, pc, e->zone, s->sys_dom, addr);
+    }
+    /* The stack pointer at the store: its page, and the one below, which
+       an exception frame pushed on the stack can reach. */
+    unsigned long stack = e->sp;
+    if (in_sys(s, stack)) {
+        unsigned long q = (stack - sp->lo) >> 12;
+        sys_exclude_stack(s, q);
+        if (q > 0)
+            sys_exclude_stack(s, q - 1);
+    }
+    if (sp->flags[p] & (kPageExcluded | kPageHot))
+        return;
+    unsigned short t = (unsigned short)sp->tick;
+    if (sp->last[p] != t) {
+        int next = sp->last[p] == (unsigned short)(t - 1);
+        sp->streak[p] = next && sp->streak[p] < 255 ? sp->streak[p] + 1 : 1;
+        sp->last[p] = t;
+    }
+    if (sp->streak[p] >= kSysStreak && sys_make_hot(s, p))
+        return;
+    sys_protect_page(s, p);
+}
+
+/* The system heap's end, in whole pages: the zone's bkLim, but below every
+   application's partition and the engine's own, and inside cap pages. */
+static unsigned long sys_heap_hi(State *s, unsigned long lo, unsigned long cap)
+{
+    unsigned long hi = lowmem_long(lowmem_long(0x2A6)) & kPageMask; /* bkLim */
+    if (hi > lo + cap * kPage)
+        hi = lo + cap * kPage;
+    for (int i = 0; i < kMaxDomains; i++) {
+        Domain *d = &s->domains[i];
+        if (i != s->sys_dom && d->live && d->location >= lo &&
+            d->location < hi)
+            hi = d->location & kPageMask;
+    }
+    if (s->my_lo >= lo && s->my_lo < hi)
+        hi = s->my_lo & kPageMask;
+    return hi < lo ? lo : hi;
+}
+
+static SysPages *sys_alloc(unsigned long cap)
+{
+    unsigned long head = (sizeof(SysPages) + 3) & ~3UL;
+    char *b = NewPtrSysClear(head + cap * 7);
+    if (!b)
+        return 0;
+    SysPages *sp = (SysPages *)b;
+    sp->magic = kSysMagic;
+    sp->cap = cap;
+    sp->last = (unsigned short *)(b + head);
+    sp->cooled_at = sp->last + cap;
+    sp->streak = (unsigned char *)(sp->cooled_at + cap);
+    sp->backoff = sp->streak + cap;
+    sp->flags = sp->backoff + cap;
+    return sp;
+}
+
+static void sys_exclude_block(State *s, const volatile void *ptr,
+                              unsigned long size)
+{
+    SysPages *sp = s->sys;
+    unsigned long a = (unsigned long)ptr, end = a + size;
+    if (!a || !size || end <= sp->lo)
+        return;
+    unsigned long from = a < sp->lo ? 0 : (a - sp->lo) >> 12;
+    unsigned long to = (end - sp->lo + kPage - 1) >> 12;
+    if (to > sp->cap)
+        to = sp->cap;
+    for (unsigned long p = from; p < to; p++)
+        if (!(sp->flags[p] & kPageExcluded)) {
+            sp->flags[p] |= kPageExcluded;
+            sp->c.excluded++;
+        }
+}
+
+/* Leave out the pages in [from, to) that are not plain read/write. */
+static void sys_check_access(State *s, unsigned long from, unsigned long to)
+{
+    SysPages *sp = s->sys;
+    for (unsigned long p = from; p < to; p++) {
+        unsigned long bits = 0;
+        if (sp->flags[p] & kPageExcluded)
+            continue;
+        if (nk_get_access(s->area, sp->lo + p * kPage, &bits) ||
+            !nk_access_rw(bits)) {
+            sp->flags[p] |= kPageExcluded;
+            sp->c.not_rw++;
+        }
+    }
+}
+
+/* Set the bitmap bits of the pages in [from, to) that are not excluded. */
+static void sys_set_bits(State *s, unsigned long from, unsigned long to)
+{
+    SysPages *sp = s->sys;
+    for (unsigned long p = from; p < to; p++)
+        if (!(sp->flags[p] & kPageExcluded))
+            set_bits(s, sp->lo + p * kPage, sp->lo + (p + 1) * kPage, 1);
+}
+
+/* Start watching (event loop). Order, for the safety rule: the domain is
+   live and deny_from set, then bits, then n, then protect. */
+static void sys_start(State *s)
+{
+    if (s->sys_dom >= 0)
+        return;
+    int slot = -1;
+    for (int i = 0; i < kMaxDomains && slot < 0; i++)
+        if (!s->domains[i].live)
+            slot = i;
+    if (slot < 0)
+        return;
+    unsigned long lo = (lowmem_long(0x2A6) + kPage - 1) & kPageMask;
+    SysPages *sp = s->sys;
+    if (!sp) {
+        unsigned long cap = (sys_heap_hi(s, lo, kSysMaxPages) - lo) / kPage +
+                            kSysSpare;
+        if (cap > kSysMaxPages)
+            cap = kSysMaxPages;
+        sp = sys_alloc(cap);
+        if (!sp)
+            return;
+        s->sys = sp;
+    } else {
+        /* Watched before: keep the counters, start the pages afresh. */
+        memset(sp->last, 0, sp->cap * 7);
+        sp->n_hot = 0;
+    }
+    sp->lo = lo;
+    sp->n = 0;
+
+    /* The blocks the hooks write while handling a fault (a fault there
+       would be fatal), and those the timer writes. */
+    sys_exclude_block(s, s, sizeof(State));
+    sys_exclude_block(s, s->bitmap, kBitmapBytes);
+    sys_exclude_block(s, sp, GetPtrSize((Ptr)sp));
+    sys_exclude_block(s, s->h68k->ring, kHookRing * sizeof(HookEvent));
+    sys_exclude_block(s, (void *)s->hnat->block,
+                      GetPtrSize((Ptr)s->hnat->block));
+    sys_exclude_block(s, s->stopper, sizeof(Stopper));
+    unsigned long hi = sys_heap_hi(s, lo, sp->cap), n = (hi - lo) / kPage;
+    sys_check_access(s, 0, n);
+
+    Domain *d = &s->domains[slot];
+    memset(d, 0, sizeof *d);
+    d->lo = lo;
+    d->hi = hi;
+    copy_name(d->name, "System heap");
+    d->seen = 1;
+    d->live = 1;
+    s->sys_dom = slot;
+    set_deny(s, s->mode);
+    sys_set_bits(s, 0, n);
+    sp->n = n;
+    s->sys_on = 1;
+    sys_protect_all(s);
+}
+
+/* Stop watching (event loop): dying, open, bits, then dead. */
+static void sys_stop(State *s)
+{
+    if (s->sys_dom < 0)
+        return;
+    SysPages *sp = s->sys;
+    Domain *d = &s->domains[s->sys_dom];
+    d->dying = 1;
+    sys_runs(s, 0, sp->n, kPageExcluded, 0);
+    set_bits(s, sp->lo, sp->lo + sp->n * kPage, 0);
+    sp->n = 0;
+    d->live = 0;
+    s->sys_dom = -1;
+    s->sys_on = 0;
+    set_deny(s, s->mode);
+}
+
+/* Follow the heap as it grows or shrinks (event loop). */
+static void sys_follow(State *s)
+{
+    if (!sys_live(s))
+        return;
+    SysPages *sp = s->sys;
+    Domain *d = &s->domains[s->sys_dom];
+    unsigned long hi = sys_heap_hi(s, sp->lo, sp->cap);
+    unsigned long n = (hi - sp->lo) / kPage, old = sp->n;
+    if (n > old) {
+        sys_check_access(s, old, n);
+        d->hi = hi;
+        set_deny(s, s->mode);
+        sys_set_bits(s, old, n);
+        sp->n = n;
+        if (s->mode != kModeOff)
+            sys_runs(s, old, n, kPageExcluded | kPageHot, 1);
+        sp->c.grown++;
+    } else if (n < old) {
+        /* The timer stops at n before the pages are opened. */
+        sp->n = n;
+        d->hi = hi;
+        sys_runs(s, n, old, kPageExcluded, 0);
+        set_bits(s, sp->lo + n * kPage, sp->lo + old * kPage, 0);
+        for (unsigned long p = n; p < old; p++)
+            sp->flags[p] = 0;
+        set_deny(s, s->mode);
+        sp->c.shrunk++;
+    }
+}
+
+void engine_set_sys(State *s, int on)
+{
+    s->want_sys = on != 0;
+    if (on)
+        sys_start(s);
+    else
+        sys_stop(s);
+    s->want_sys = s->sys_on;
 }
 
 /* Take the stores a ring holds with seq in (seen, handled]. */
@@ -235,6 +617,8 @@ static void drain(State *s, int src, volatile HookEvent *ring, unsigned long n,
     if (handled - seen > n) {
         /* Pages opened by stores no longer in the ring. */
         s->c.lost[src] += handled - seen - n;
+        if (sys_live(s))
+            s->sys->c.resweeps++;
         protect_others(s);
     }
     for (unsigned long i = 0; i < n; i++) {
@@ -242,9 +626,13 @@ static void drain(State *s, int src, volatile HookEvent *ring, unsigned long n,
         if (e->seq - seen - 1 >= handled - seen)
             continue;
         unsigned long addr = e->addr, zone = e->zone;
+        if (in_sys(s, addr)) {
+            sys_trapped(s, src, e, addr);
+            continue;
+        }
         int app = (e->pc & kHookAppCode) != 0;
         int t = domain_at(s, addr);
-        if (t < 0) {
+        if (t < 0 || t == s->sys_dom) {
             s->c.outside++;
             continue;
         }
@@ -380,7 +768,7 @@ static long handler(ExceptionInfo *e)
     int app = pc >= s->hnat->cur_lo && pc < s->hnat->cur_hi;
     /* A store the native hook denied (it is in its ring already): stop
        the application, or let the system do it. */
-    if (app && s->hnat->enforce) {
+    if (app && addr >= s->deny_from) {
         if (stop_native(s, e))
             return 0;
         return g_prev ? g_prev(e) : -1;
@@ -408,7 +796,11 @@ static void timer_proc(TMTask *tm)
     if (s && s->active) {
         s->c.timer_runs++;
         check_switch(s);
+        if (s->sys_dom >= 0)
+            s->sys->tick++;
         drain_all(s);
+        if (sys_live(s))
+            sys_expire(s);
     }
     PrimeTime((QElemPtr)tm, kTimerMs);
 }
@@ -437,7 +829,8 @@ static void refresh_domains(State *s)
     ProcessSerialNumber me, psn = {0, kNoProcess};
     GetCurrentProcess(&me);
     for (int i = 0; i < kMaxDomains; i++)
-        s->domains[i].seen = 0;
+        if (i != s->sys_dom) /* not a process */
+            s->domains[i].seen = 0;
 
     ProcessInfoRec info;
     Str31 name;
@@ -457,6 +850,8 @@ static void refresh_domains(State *s)
         int found = -1, free_slot = -1;
         for (int i = 0; i < kMaxDomains; i++) {
             Domain *d = &s->domains[i];
+            if (i == s->sys_dom)
+                continue;
             if (d->live && same_psn(&d->psn, &psn) &&
                 (!ok || d->location == loc))
                 found = i;
@@ -490,6 +885,9 @@ static void refresh_domains(State *s)
         if (free_slot < 0 || hi <= lo || lo < kSpanLo || hi > kSpanHi ||
             (lo < s->my_hi && hi > s->my_lo))
             continue;
+        if (s->sys_dom >= 0 && lo < s->domains[s->sys_dom].hi &&
+            hi > s->domains[s->sys_dom].lo)
+            continue; /* never: partitions are above the system heap */
 
         Domain *d = &s->domains[free_slot];
         memset(d, 0, sizeof *d);
@@ -508,7 +906,7 @@ static void refresh_domains(State *s)
 
     for (int i = 0; i < kMaxDomains; i++) {
         Domain *d = &s->domains[i];
-        if (!d->live || d->seen)
+        if (!d->live || d->seen || i == s->sys_dom)
             continue;
         d->dying = 1;
         if (s->cur == i) {
@@ -535,18 +933,14 @@ void engine_set_mode(State *s, unsigned long mode)
     if (mode == kModeOff) {
         /* After mode is off, the timer protects nothing, so every page
            opened here stays open. */
-        s->h68k->enforce = 0;
-        s->hnat->enforce = 0;
+        set_deny(s, kModeOff);
         s->mode = kModeOff;
-        for (int i = 0; i < kMaxDomains; i++) {
-            Domain *d = &s->domains[i];
-            if (d->live && nk_unprotect(s->area, d->lo, d->hi - d->lo))
-                s->c.kernel_errors++;
-        }
+        for (int i = 0; i < kMaxDomains; i++)
+            if (s->domains[i].live)
+                unprotect_domain(s, i);
         return;
     }
-    s->h68k->enforce = mode == kModeEnforce;
-    s->hnat->enforce = mode == kModeEnforce;
+    set_deny(s, mode);
     s->mode = mode;
     if (old == kModeOff)
         protect_others(s);
@@ -589,10 +983,12 @@ long engine_start(State **out, unsigned long mode, const char *name)
     s->offense_size = sizeof(Offense);
     s->off_mode = offsetof(State, mode);
     s->off_stopper = offsetof(State, stopper);
+    s->off_sys = offsetof(State, sys_dom);
     s->mode = s->want_mode = kModeOff;
     copy_name(s->name, name);
     s->bitmap = bitmap;
     s->cur = -1;
+    s->sys_dom = -1;
 
     ProcessSerialNumber me;
     ProcessInfoRec info;
@@ -623,6 +1019,15 @@ long engine_start(State **out, unsigned long mode, const char *name)
     }
     s->h68k = h68k_data();
     s->hnat = hnat_data();
+    set_deny(s, kModeOff);
+    /* Where the 68k emulator fills a 68k-to-native call frame (9.2.2): its
+       stores are not the application's although r24 points at its trap
+       (common/hook.h). Only when the code is the one measured. */
+    {
+        volatile unsigned long *fc = lowmem(0x6806E344);
+        if (fc[0] == 0x90650214 && fc[1] == 0x90C50218 && fc[2] == 0x90050210)
+            s->h68k->frame = 0x6806E300;
+    }
     s->seen[kSrc68k] = s->h68k->count_handled;
     s->seen[kSrcNative] = s->hnat->count_handled;
     /* For tools/xlog-read.py. */
@@ -662,6 +1067,9 @@ void engine_poll(State *s)
     refresh_domains(s);
     if (s->want_mode != s->mode)
         engine_set_mode(s, s->want_mode);
+    if (s->want_sys != s->sys_on)
+        engine_set_sys(s, s->want_sys);
+    sys_follow(s);
 }
 
 void engine_stop(State *s)
@@ -670,23 +1078,23 @@ void engine_stop(State *s)
         return;
     /* Stop denying and protecting, stop the tick, take what the rings
        hold, then open everything before the hooks stop managing it. */
-    s->h68k->enforce = 0;
-    s->hnat->enforce = 0;
+    set_deny(s, kModeOff);
     s->mode = kModeOff;
     s->active = 0;
     RmvTime((QElemPtr)&s->timer);
     drain_all(s);
     s->h68k->stop = 0;
     s->hnat->stop = 0;
+    s->h68k->frame = 0;
     stopper_remove(s);
     for (int i = 0; i < kMaxDomains; i++) {
         Domain *d = &s->domains[i];
         if (!d->live)
             continue;
         d->dying = 1;
-        if (nk_unprotect(s->area, d->lo, d->hi - d->lo))
-            s->c.kernel_errors++;
+        unprotect_domain(s, i);
     }
+    s->sys_on = 0;
     g_sys_install(g_prev);
 
     s->hook_self[0] = s->h68k->count_self;

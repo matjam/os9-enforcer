@@ -17,7 +17,11 @@
  * code lies in its partition) is an offense. In kModeEnforce the hooks deny
  * it: the page stays protected and the fault goes on. In kModeLog it is
  * allowed and logged. Stores by system code are always allowed. In
- * kModeOff nothing is protected.
+ * kModeOff nothing is protected. The hooks deny by address (HookData
+ * deny_from): in kModeEnforce, everything above the system heap.
+ *
+ * The system heap can be one more domain (sys_on; see SysPages below): log
+ * only, so offenses there are logged and never denied.
  *
  * Clean stop: a hook that denies a store writes ApplZone into the
  * Stopper's zone, and the engine stops that application with ExitToShell
@@ -70,7 +74,7 @@ enum {
     kMaxWriters = 512,
     kFallbackRing = 16,
     kOffenseLog = 16,
-    kEngineMagic = 'ENF2',
+    kEngineMagic = 'ENF3',
     /* Gestalt selector whose value is the engine's State, while it runs. */
     kEngineGestalt = 'Enfr'
 };
@@ -138,6 +142,73 @@ typedef struct {
     unsigned short code[kStopperCode];
 } Stopper;
 
+/* The system heap, watched page by page while sys_on is set. Its pages run
+ * from the first whole page after SysZone's header to the zone's end
+ * (bkLim), followed as the heap grows and shrinks. A page is never
+ * protected when it holds one of the engine's own blocks (the hooks write
+ * some of them while handling a fault), is not plain read/write, or has
+ * held the stack pointer of a trapped store (so an exception frame pushed
+ * on that stack can never fault).
+ *
+ * Most stores into the system heap are by system code, and each one that
+ * finds its page protected costs a trap. A page that traps on kSysStreak
+ * timer ticks in a row is left open ("hot") for kSysHotTicks << backoff
+ * ticks, then protected again. Its backoff goes up by one when it turns hot
+ * again within kSysHotTicks ticks of being protected, and back to 0 when it
+ * turns hot after kSysCoolTicks ticks or more.
+ *
+ * Not usable yet: an atomic update (lwarx/stwcx.) of a variable on a
+ * protected page hangs the machine. The NanoKernel handles the stwcx.
+ * fault by running the stwcx. again itself (NKTranslation.s FDP_06c0);
+ * the reservation is gone by then, so it fails without a fault, the
+ * caller's loop retries, and no hook ever sees a fault to open the page.
+ * The system heap holds many such variables. Nothing turns this on but
+ * SysLog and SysGuard (xlog/), which reproduce the hang. */
+enum {
+    kSysMagic = 'SysP',
+    kSysMaxPages = 16384, /* 64 MB */
+    kSysSpare = 4096,     /* pages for the heap to grow into */
+    kSysMaxHot = 256,
+    kSysStreak = 4,
+    kSysHotTicks = 64,    /* about a second */
+    kSysMaxBackoff = 6,
+    kSysCoolTicks = 4096
+};
+
+/* tools/xlog-read.py names these in this order. */
+typedef struct {
+    unsigned long traps;     /* stores trapped, all code */
+    unsigned long app_traps; /* of those, by the current application's code */
+    unsigned long hot;       /* pages left open */
+    unsigned long hot_full;  /* not left open: the hot list was full */
+    unsigned long cooled;    /* hot pages protected again */
+    unsigned long reheated;  /* hot again soon after: backoff went up */
+    unsigned long excluded;  /* pages of the engine's own blocks */
+    unsigned long not_rw;    /* pages that are not plain read/write */
+    unsigned long stacks;    /* pages left open for a stack */
+    unsigned long resweeps;  /* whole heap protected again (ring overflow) */
+    unsigned long grown, shrunk;
+} SysCounters;
+
+typedef struct {
+    unsigned long page, until; /* until: a tick */
+} HotPage;
+
+typedef struct {
+    unsigned long magic;
+    unsigned long cap;        /* pages the per-page arrays hold */
+    unsigned long lo;         /* the first page */
+    volatile unsigned long n; /* pages watched: [lo, lo + n * kPage) */
+    unsigned long tick;       /* timer ticks while watching */
+    unsigned long n_hot;
+    SysCounters c;
+    HotPage hot[kSysMaxHot];
+    /* cap entries each, in the same block after this header. */
+    unsigned short *last;      /* the tick of the page's last trap */
+    unsigned short *cooled_at; /* the tick it was last protected again */
+    unsigned char *streak, *backoff, *flags;
+} SysPages;
+
 /* tools/xlog-read.py names these in this order. */
 typedef struct {
     unsigned long self[kSources], foreign[kSources], lost[kSources];
@@ -161,11 +232,17 @@ typedef struct {
     unsigned long off_offenses, max_offenses, offense_size;
     unsigned long off_mode;
     unsigned long off_stopper;
+    unsigned long off_sys;
 
-    /* Control. A control panel sets want_mode; engine_poll applies it. */
+    /* Control. A control panel sets want_mode and want_sys; engine_poll
+       applies them. */
     volatile unsigned long mode, want_mode;
     volatile unsigned long running; /* cleared when the engine stops */
     char name[16];                  /* the program running the engine */
+    long sys_dom;                   /* the system heap's domain, or -1 */
+    volatile unsigned long sys_on, want_sys;
+    unsigned long deny_from;        /* as the hooks' */
+    SysPages *sys;                  /* kept while the engine runs, or 0 */
 
     Counters c;
     long cur; /* domain of the current application, or -1 */
@@ -205,6 +282,10 @@ void engine_poll(State *s);
 /* Change mode now (event loop only). */
 void engine_set_mode(State *s, unsigned long mode);
 
+/* Start or stop watching the system heap now (event loop only). Starting
+   can fail (no free domain or no memory); sys_on says what happened. */
+void engine_set_sys(State *s, int on);
+
 /* Stop protecting, remove the timer and the fallback handler, and remove
    the hooks if this engine installed them. The state stays allocated. */
 void engine_stop(State *s);
@@ -225,13 +306,15 @@ static inline unsigned long engine_clean_stops(const State *s)
     return n;
 }
 
-/* The applications being tracked. Inline, so that readers of the state
-   (the control panel) need not link the engine. */
+/* The applications being tracked (not the system heap, which has no
+   partition). Inline, so that readers of the state (the control panel)
+   need not link the engine. */
 static inline int engine_live_domains(const State *s)
 {
     int n = 0;
     for (int i = 0; i < kMaxDomains; i++)
-        if (s->domains[i].live && !s->domains[i].dying)
+        if (s->domains[i].live && !s->domains[i].dying &&
+            s->domains[i].size)
             n++;
     return n;
 }

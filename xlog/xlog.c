@@ -10,7 +10,12 @@
  * the Window Manager and others, which live outside every partition) are
  * still allowed and logged. XLog marks the stores Guard would deny.
  *
- * Both are console front ends on the protection engine (common/engine.c).
+ * SysLog and SysGuard: XLog and Guard built with XLOG_SYSHEAP=1, which
+ * also watch the system heap page by page (log only, in both). They print
+ * how many traps that costs and log stores into it by an application's own
+ * code.
+ *
+ * All are console front ends on the protection engine (common/engine.c).
  * Run them only in a SCRATCH=1 guest with virtual memory off. To stop,
  * bring the window to the front and press a key.
  */
@@ -28,10 +33,13 @@
 #ifndef XLOG_ENFORCE
 #define XLOG_ENFORCE 0
 #endif
+#ifndef XLOG_SYSHEAP
+#define XLOG_SYSHEAP 0
+#endif
 #if XLOG_ENFORCE
-#define kName "Guard"
+#define kName (XLOG_SYSHEAP ? "SysGuard" : "Guard")
 #else
-#define kName "XLog"
+#define kName (XLOG_SYSHEAP ? "SysLog" : "XLog")
 #endif
 
 enum {
@@ -50,6 +58,16 @@ static void status(State *s)
            c->self[kSrcFallback], c->foreign[kSrcFallback],
            c->lost[kSrcNative], c->lost[kSrc68k], c->nwriters,
            s->n_offenses);
+    SysPages *sp = s->sys;
+    if (sp)
+        printf("system heap %s: %lu pages, traps %lu (app code %lu) in %lu "
+               "ticks, %.1f a tick; hot now %lu, made hot %lu, cooled %lu, "
+               "reheated %lu, full %lu; stacks %lu, resweeps %lu\n",
+               s->sys_on ? "watched" : "not watched", sp->n, sp->c.traps,
+               sp->c.app_traps, sp->tick,
+               sp->tick ? (double)sp->c.traps / sp->tick : 0.0, sp->n_hot,
+               sp->c.hot, sp->c.cooled, sp->c.reheated, sp->c.hot_full,
+               sp->c.stacks, sp->c.resweeps);
 }
 
 static const char *source_name(unsigned long src)
@@ -169,8 +187,18 @@ int main(void)
     printf("state %08lX, my partition %08lX-%08lX; to stop, bring %s to "
            "the front and press a key\n", (unsigned long)s, s->my_lo,
            s->my_hi, kName);
+    if (XLOG_SYSHEAP) {
+        engine_set_sys(s, 1);
+        SysPages *sp = s->sys;
+        if (!s->sys_on)
+            printf("could not watch the system heap\n");
+        else
+            printf("system heap %08lX-%08lX: %lu pages, %lu of the engine's "
+                   "own, %lu not read/write\n", sp->lo, sp->lo + sp->n * 4096,
+                   sp->n, sp->c.excluded, sp->c.not_rw);
+    }
     for (int i = 0; i < kMaxDomains; i++)
-        if (s->domains[i].live)
+        if (s->domains[i].live && s->domains[i].size)
             printf("  %-15s %08lX-%08lX\n", s->domains[i].name,
                    s->domains[i].lo, s->domains[i].hi);
 
@@ -208,6 +236,8 @@ int main(void)
     printf("\n(Press Return)\n");
     getchar();
     DisposePtr((Ptr)s->bitmap);
+    if (s->sys)
+        DisposePtr((Ptr)s->sys);
     DisposePtr((Ptr)s);
     return 0;
 }
