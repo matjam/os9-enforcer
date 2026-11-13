@@ -10,9 +10,13 @@
  *   kEnforcerVMOn      virtual memory is on, so it did not start;
  *   kEnforcerFailed+n  engine_start failed with error -n.
  *
- * The mode (off, log only, enforce) is kept in "Enforcer Preferences" in
- * the Preferences folder. The control panel requests a mode change through
- * the state's want_mode; this program applies it and saves it.
+ * The mode (off, log only, enforce) and whether to watch the system heap
+ * are kept in "Enforcer Preferences" in the Preferences folder. The control
+ * panel requests a change through the state's want_mode and want_sys; this
+ * program applies it and saves it. It watches the system heap (log only)
+ * only when the NanoKernel's owner check is registered (State kcb): with
+ * the stock kernel, protecting the system heap hangs the machine (README,
+ * step 2).
  *
  * When it stops an application, it posts a notification naming the
  * application, the one whose memory it tried to write into, and the
@@ -54,8 +58,9 @@ static void publish(long value)
 
 /* Preferences -------------------------------------------------------- */
 
+/* Version 1 had only magic and mode; sys is then 0. */
 typedef struct {
-    unsigned long magic, mode;
+    unsigned long magic, mode, sys;
 } Prefs;
 
 static OSErr prefs_spec(FSSpec *spec)
@@ -70,27 +75,32 @@ static OSErr prefs_spec(FSSpec *spec)
     return err == fnfErr ? noErr : err;
 }
 
-static unsigned long load_mode(void)
+static Prefs load_prefs(void)
 {
+    static const Prefs defaults = {kEnforcerPrefsMagic, kModeEnforce, 0};
     FSSpec spec;
     int16_t ref;
-    Prefs p;
+    Prefs p = defaults;
     LONGINT n = sizeof p;
     if (prefs_spec(&spec) || FSpOpenDF(&spec, fsRdPerm, &ref))
-        return kModeEnforce;
+        return defaults;
     OSErr err = FSRead(ref, &n, &p);
     FSClose(ref);
-    if (err || n != sizeof p || p.magic != kEnforcerPrefsMagic ||
-        p.mode > kModeEnforce)
-        return kModeEnforce;
-    return p.mode;
+    if (err == eofErr && n == 8)
+        p.sys = 0;
+    else if (err || n != sizeof p)
+        return defaults;
+    if (p.magic != kEnforcerPrefsMagic || p.mode > kModeEnforce)
+        return defaults;
+    p.sys = p.sys != 0;
+    return p;
 }
 
-static void save_mode(unsigned long mode)
+static void save_prefs(unsigned long mode, unsigned long sys)
 {
     FSSpec spec;
     int16_t ref;
-    Prefs p = {kEnforcerPrefsMagic, mode};
+    Prefs p = {kEnforcerPrefsMagic, mode, sys};
     LONGINT n = sizeof p;
     if (prefs_spec(&spec))
         return;
@@ -195,16 +205,20 @@ int main(void)
         return 0;
     }
 
-    unsigned long mode = load_mode();
+    Prefs prefs = load_prefs();
     State *s;
-    long err = engine_start(&s, mode, "Enforcer");
+    long err = engine_start(&s, prefs.mode, "Enforcer");
     if (err) {
         publish(kEnforcerFailed - err);
         return 0;
     }
+    if (prefs.sys && s->kcb)
+        engine_set_sys(s, 1);
+    s->want_sys = prefs.sys;
     publish((long)s);
 
     unsigned long last_poll = TickCount(), shown = 0, stops_shown = 0;
+    unsigned long saved_mode = prefs.mode, saved_sys = prefs.sys;
     EventRecord ev;
     while (!g_quit) {
         if (WaitNextEvent(everyEvent, &ev, kPollTicks, NULL) &&
@@ -212,10 +226,20 @@ int main(void)
             AEProcessAppleEvent(&ev);
         unsigned long now = TickCount();
         if (now - last_poll >= kPollTicks) {
-            unsigned long before = s->mode;
+            /* With the stock kernel, keep the request (for the panel and
+               the preferences) but never watch the system heap. */
+            unsigned long want_sys = s->want_sys;
+            if (!s->kcb)
+                s->want_sys = 0;
             engine_poll(s);
-            if (s->mode != before)
-                save_mode(s->mode);
+            unsigned long sys = s->kcb ? s->sys_on : want_sys;
+            if (!s->kcb)
+                s->want_sys = want_sys;
+            if (s->mode != saved_mode || sys != saved_sys) {
+                saved_mode = s->mode;
+                saved_sys = sys;
+                save_prefs(saved_mode, saved_sys);
+            }
             last_poll = now;
         }
         /* Tell the user about each application stopped since last time.

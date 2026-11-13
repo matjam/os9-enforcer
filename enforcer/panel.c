@@ -9,10 +9,13 @@
  *     mode to off;
  *   - "Stop an application that writes into another's memory": on is
  *     enforce, off is log only;
+ *   - "Also log writes into the system heap": the system heap watch (log
+ *     only), available with the patched NanoKernel;
  *   - the last stores it caught, newest first;
- *   - counters, updated every second.
- * A change sets the state's want_mode; the extension applies it within
- * half a second and saves it in its preferences.
+ *   - counters, updated every second, and whether the NanoKernel's owner
+ *     check is on.
+ * A change sets the state's want_mode or want_sys; the extension applies
+ * it within half a second and saves it in its preferences.
  */
 
 #include <string.h>
@@ -35,15 +38,16 @@ enum { kFileClose = 1, kFileQuit = 3 };
 enum { kRefreshTicks = 30, kShownOffenses = 6 };
 
 /* Window layout, in window coordinates. */
-static const Rect kWindowRect = {60, 100, 360, 540};
+static const Rect kWindowRect = {60, 100, 394, 540};
 static const Rect kStatusRect = {6, 14, 28, 426};
 static const Rect kProtectRect = {34, 14, 52, 426};
 static const Rect kStopRect = {56, 30, 74, 426};
-static const Rect kListRect = {102, 14, 264, 426};
-static const Rect kFooterRect = {270, 14, 296, 426};
+static const Rect kSysRect = {78, 30, 96, 426};
+static const Rect kListRect = {124, 14, 286, 426};
+static const Rect kFooterRect = {292, 14, 330, 426};
 
 static WindowPtr g_win;
-static ControlHandle g_protect, g_stop;
+static ControlHandle g_protect, g_stop, g_sys;
 static Boolean g_quit;
 static Boolean g_stop_pref = true; /* the stop box, while protection is off */
 
@@ -155,17 +159,22 @@ static void sync_controls(const Engine *e)
     if (e->kind != kRunning || FrontWindow() != g_win) {
         HiliteControl(g_protect, 255);
         HiliteControl(g_stop, 255);
+        HiliteControl(g_sys, 255);
         if (e->kind != kRunning) {
             SetControlValue(g_protect, 0);
             SetControlValue(g_stop, 0);
+            SetControlValue(g_sys, 0);
         }
         return;
     }
     unsigned long m = e->s->want_mode;
     SetControlValue(g_protect, m != kModeOff);
     SetControlValue(g_stop, m == kModeOff ? g_stop_pref : m == kModeEnforce);
+    SetControlValue(g_sys, e->s->want_sys != 0);
     HiliteControl(g_protect, 0);
     HiliteControl(g_stop, m == kModeOff ? 255 : 0);
+    /* The system heap watch needs the patched NanoKernel. */
+    HiliteControl(g_sys, m == kModeOff || !e->s->kcb ? 255 : 0);
 }
 
 /* Drawing ------------------------------------------------------------ */
@@ -244,6 +253,24 @@ static void draw_footer(const Engine *e)
     add_num(s, e->s->n_offenses);
     MoveTo(r.left, r.top + 22);
     DrawString(s);
+    s[0] = 0;
+    const KernelCB *k = e->s->kcb;
+    if (k) {
+        add(s, "NanoKernel owner check on: ");
+        add_num(s, k->seq + k->self);
+        add(s, " writes checked, ");
+        add_num(s, k->denied);
+        add(s, " stopped");
+    } else if (e->s->kcb_err == -4) {
+        add(s, "NanoKernel not patched: writes by Multiprocessing tasks "
+               "are not checked");
+    } else {
+        add(s, "NanoKernel owner check off (error ");
+        add_num(s, e->s->kcb_err);
+        add(s, ")");
+    }
+    MoveTo(r.left, r.top + 34);
+    DrawString(s);
 }
 
 static void draw(void)
@@ -290,6 +317,8 @@ static void click_content(Point where)
     } else if (c == g_stop && m != kModeOff) {
         m = m == kModeEnforce ? kModeLog : kModeEnforce;
         g_stop_pref = m == kModeEnforce;
+    } else if (c == g_sys && m != kModeOff && e.s->kcb) {
+        e.s->want_sys = !e.s->want_sys;
     }
     e.s->want_mode = m;
     sync_controls(&e);
@@ -371,6 +400,9 @@ int main(void)
                         pstr(s, "Stop an application that writes into "
                                 "another\xD5s memory"),
                         true, 0, 0, 1, checkBoxProc, 0);
+    g_sys = NewControl(g_win, &kSysRect,
+                       pstr(s, "Also log writes into the system heap"), true,
+                       0, 0, 1, checkBoxProc, 0);
 
     unsigned long last = 0, signature = 0;
     EventRecord ev;
@@ -430,7 +462,8 @@ int main(void)
             unsigned long sig = e.kind ^ e.value;
             if (e.s)
                 sig ^= e.s->mode << 4 ^ e.s->want_mode << 6 ^
-                       e.s->n_offenses << 8 ^ engine_live_domains(e.s) << 20;
+                       e.s->want_sys << 7 ^ e.s->n_offenses << 8 ^
+                       engine_live_domains(e.s) << 20;
             SetPort(g_win);
             if (sig != signature) {
                 signature = sig;

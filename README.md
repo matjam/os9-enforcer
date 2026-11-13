@@ -185,9 +185,32 @@ limits.
    does this for code inside a partition; code an application owns
    outside it (in temporary memory, or loaded into the system heap for
    it) still counts as the system's.
-6. **Extension and control panel.** Carry over from the prototype: start
-   at boot, policy (off, log, stop), a clean stop through `ExitToShell`,
-   and a notification naming both applications.
+6. **Extension and control panel.** Done (2026-11-12): the Enforcer
+   Extension and the Enforcer control panel from the prototype now use the
+   NanoKernel's owner check.
+   - The extension registers the owner check at startup (`kcb_start`) and
+     removes it when it quits. With the stock kernel it runs as before,
+     without the check.
+   - The control panel's third footer line says whether the owner check is
+     on, with the writes checked and stopped, or that the NanoKernel is not
+     patched (MP call 109 returns −4).
+   - New option, "Also log writes into the system heap": log only, and
+     enabled only when the owner check is on. "Enforcer Preferences" keeps
+     it next to the mode; a file from an earlier version reads as off.
+   - Boot test on `disks/os9-kernel-enforcer.img`, a copy of
+     `os9-kernel.img` with both installed: the extension starts at boot
+     and registers the check. Scribble `n` is stopped cleanly, with the
+     notification naming Scribble, the Finder and the address. After a
+     restart the system heap option is still on.
+   - With the system heap option on, Desktop Printer Spooler and ATI Video
+     Accelerator store into the system heap at startup from their own code
+     (20 stores in the first second). `tools/xlog-read.py` lists these as
+     "logged"; they are never denied.
+   - One store at startup was recorded as an offense between two
+     applications (Desktop Printer Spooler into ATI Video Accelerator) but
+     not denied. The engine refreshes the owner table every 30 ticks, so a
+     partition just created can still have a stale owner. Check this when
+     the Process Manager hooks of step 4 set owners at once.
 7. **Installer for users.**
    - Ship a patcher, not a ROM file (Apple's file cannot be
      redistributed). It checks the user's Mac OS ROM file against a

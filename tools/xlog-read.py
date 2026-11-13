@@ -225,11 +225,18 @@ def main():
     for seq in range(max(1, n - h["max_offenses"] + 1), n + 1):
         e = o + 4 + ((seq - 1) % h["max_offenses"]) * OFFENSE_SIZE
         t = w(e + 4) % 86400  # seconds since 1904, local time
+        target = cstr(d[e + 40:e + 56])
+        # The system heap is log only: a store into it is never denied.
+        if w(e + 20):
+            what = "denied"
+        elif target == "System heap":
+            what = "logged"
+        else:
+            what = "would deny"
         print("  #%d %02d:%02d:%02d %s: %s, %s code at %08X, into %s at %08X"
-              % (w(e), t // 3600, t // 60 % 60, t % 60,
-                 "denied" if w(e + 20) else "would deny",
+              % (w(e), t // 3600, t // 60 % 60, t % 60, what,
                  cstr(d[e + 24:e + 40]), SOURCES[w(e + 16) & SRC_MASK],
-                 w(e + 8), cstr(d[e + 40:e + 56]), w(e + 12)))
+                 w(e + 8), target, w(e + 12)))
 
 
 if __name__ == "__main__":
