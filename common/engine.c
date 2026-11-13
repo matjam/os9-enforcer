@@ -194,6 +194,25 @@ static void own_code(State *s, int i, unsigned long lo, unsigned long hi)
     d->code_state = kCodeOwned;
 }
 
+/* The partly used first page of domain i's partition, where the heap
+   starts and code often lies: its owner byte, so the kernel counts code
+   there as the application's, but not protected (the Process Manager's
+   block before the partition shares the page). on 0 gives the byte back. */
+static void own_first_page(State *s, int i, int on)
+{
+    Domain *d = &s->domains[i];
+    if (!s->kcb || i == s->sys_dom || (d->location & (kPage - 1)) == 0)
+        return;
+    unsigned long p = d->location >> 12;
+    unsigned char code = owner_code(s, i);
+    if (p >= s->kcb->entries || (p << 12) >= d->lo)
+        return;
+    if (on && s->owners[p] == kOwnerNone)
+        s->owners[p] = code;
+    else if (!on && s->owners[p] == code)
+        s->owners[p] = kOwnerNone;
+}
+
 /* Give back the owner bytes of domain i's code. The range stays in the
    slot (engine.h, Domain.dropped). */
 static void disown_code(State *s, int i)
@@ -315,6 +334,7 @@ static void drop_domain(State *s, int i, int quit)
     if (nk_unprotect(s->area, d->lo, d->hi - d->lo))
         s->c.kernel_errors++;
     mark(s, d->lo, d->hi, kOwnerNone);
+    own_first_page(s, i, 0);
     disown_code(s, i);
     d->quit = quit;
     d->live = 0;
@@ -1085,6 +1105,7 @@ static void skip_store(State *s, ExceptionInfo *e, unsigned long pc,
 {
     if (s->stopper)
         s->stopper->zone = 0;
+    s->skips++;
     unsigned long insn = *(const unsigned long *)pc;
     if ((insn & 0xFC0007FF) == 0x7C00012D) /* stwcx. */
         e->machineState->CR = (e->machineState->CR & 0x0FFFFFFF) | 0x20000000;
@@ -1247,6 +1268,7 @@ static int add_domain(State *s, int i, const ProcessSerialNumber *psn,
     d->seen = 1;
     d->live = 1;
     mark(s, lo, hi, owner_code(s, i));
+    own_first_page(s, i, 1);
     protect_domain(s, i);
     /* The current application: its zone has not changed, so make the next
        tick look again, or it never becomes current. */

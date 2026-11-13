@@ -268,9 +268,9 @@ static void draw_footer(const Engine *e)
         add(s, "NanoKernel owner check on: ");
         add_num(s, k->seq + k->self);
         add(s, " writes checked, ");
-        add_num(s, k->denied);
+        add_num(s, engine_clean_stops(e->s));
         add(s, " stopped, ");
-        add_num(s, k->skipped);
+        add_num(s, k->skipped + e->s->skips);
         add(s, " blocked");
     } else {
         add(s, "NanoKernel owner check off (error ");

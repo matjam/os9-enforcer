@@ -457,6 +457,9 @@ typedef struct {
     unsigned long pm_zone;      /* the Process Manager's zone, or 0 */
     unsigned long owners_size;  /* the owner table's bytes (whole pages) */
     Chunk chunks[kMaxChunks];
+    /* Denied native stores the fault handler skipped instead of stopping
+       the application: they came from above task level (skip_store). */
+    unsigned long skips;
 } State;
 
 /* Install the hooks, the fallback handler and the timer, read the process
