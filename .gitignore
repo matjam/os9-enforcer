@@ -5,6 +5,9 @@
 /*/build/
 /*/build-*/
 
+# Apple's Mac OS ROM file and the kernel taken from it (kernel/extract.sh).
+/kernel/stock/
+
 __pycache__/
 
 # Binary files, wherever they are.

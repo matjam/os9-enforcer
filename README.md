@@ -24,6 +24,7 @@ find it through the `OS9_PROTECT` environment variable, which defaults to
 | `wlog/` | WLog: the first write logger, on the 68k hook only |
 | `probe/` | Probe: the first page protection experiment |
 | `tools/` | Host scripts that read the engine's and hooks' state from the guest |
+| `kernel/` | `extract.sh`: takes the stock NanoKernel out of the test machine's Mac OS ROM file |
 
 ## Building
 
@@ -528,3 +529,47 @@ Two ways around it:
 To reproduce, push SysLog with Scribble and open SysLog; Scribble's `s` and
 `S` tests store into the middle of the system heap from native and 68k
 code. Use a `SCRATCH=1` guest: it hangs.
+
+## NanoKernel
+
+Work on the kernel starts from the kernel the test machine actually runs,
+not from a rebuild. To take it out of the installed system:
+
+```bash
+kernel/extract.sh
+```
+
+It copies the Mac OS ROM file out of os9-protect's `disks/os9.qcow2`
+(read only), checks its SHA-256 against the known file, unpacks it with
+tbxi, and writes into `kernel/stock/` (ignored by git, since the files are
+Apple's):
+- `Mac OS ROM` and `dump/`, tbxi's unpacked tree, which `tbxi build` can
+  turn back into a ROM file;
+- `NanoKernel-v02.28.bin`, the kernel (105,280 bytes);
+- `NanoKernel-v02.28.dis`, its disassembly, with addresses as offsets in
+  the kernel.
+
+The ROM file is a NewWorld bootinfo file (`MacROM for NewWorld`, dated
+2002-04-17). The kernel is version 2.28, at offset 0x310000 of the 4 MB
+ROM image. On the test machine it runs at physical 0x00F10000: during the
+`stwcx.` hang the CPU's LR was 0x00F15EB4, which is kernel offset 0x5EB4.
+
+The reconstructed source in os9-protect's `refs/powermac-rom/NanoKernel` is
+also version 2.28 and matches the binary instruction for instruction
+wherever it was compared (2026-11-12):
+
+| Routine (source) | Offset | |
+|---|---|---|
+| `IntDSI`, data fault entry (`NKInterrupts.s`) | 0x32C0 | |
+| `HandleDSIDueToIllegalSyncPrimitive` | 0x340C | |
+| `IntAlignment` | 0x3460 | |
+| Exception return: `lwarx`/`sync`/`stwcx.` clearing the reservation | 0x2C28 | |
+| `FDP_053c`: emulated `lwarx` (`NKTranslation.s`) | 0x5D3C | |
+| `FDP_06b4`/`FDP_06c0`: emulated `stw`/`stwcx.` | 0x5EB4/0x5EC0 | the hang |
+| `MPSetAreaAccess`: the access-bits mask (`lisori r16, ~%11101111`) | 0xFC98 | |
+
+So the source can be used to read and name the binary. It has not been
+rebuilt here (it needs Apple's MPW assembler under the `empw` emulator), and
+nothing yet shows that it rebuilds byte for byte. Changes to the kernel are
+best made as patches to the stock binary, checked against
+`NanoKernel-v02.28.dis` at each patch site.
