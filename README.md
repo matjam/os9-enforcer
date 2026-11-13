@@ -392,3 +392,29 @@ Trying it showed a harder limit: a protected page holding a variable that
 Mac OS updates with `lwarx`/`stwcx.` hangs the machine, because the
 NanoKernel retries the faulting `stwcx.` itself and no write hook ever sees
 the fault (see step 2 of the plan in os9-enforcer's README).
+
+## Watching memory and kernel paths
+
+Two more QEMU TCG plugins help debug kernel changes. Both need the local
+QEMU build, and both write their report when QEMU exits (for example after
+`tools/qmp.py quit`).
+
+`tools/memwatch/` reports which code reads or writes a range of physical
+memory: each PC and kind (load or store) once, with a count and the first
+address it touched. To find what touches the space after the NanoKernel:
+
+```bash
+tools/memwatch/build.sh
+SCRATCH=1 DISK=disks/os9-kernel.img PLUGIN=tools/memwatch/build/libmemwatch.dylib,lo=0xF29B40,hi=0xF60000,out=run/mw.txt ./run.sh &
+```
+
+`tools/pcwatch/` counts the register values seen each time the guest runs
+one instruction: up to 8 registers by gdb name, and optionally CR under a
+mask. NanoKernel code runs with translation off, so its address is
+physical. To see which path the kernel takes for each write fault (see
+os9-enforcer's README, "Prototype"):
+
+```bash
+tools/pcwatch/build.sh
+SCRATCH=1 DISK=disks/os9-kernel.img PLUGIN=tools/pcwatch/build/libpcwatch.dylib,at=0xF12A14,regs=r9:r10,crmask=0x82208000,out=run/pw.txt ./run.sh &
+```

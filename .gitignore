@@ -14,7 +14,7 @@
 /qemu/*.tar.*
 /toolchain/
 /refs/
-/tools/storewatch/build/
+/tools/*/build/
 
 __pycache__/
 
