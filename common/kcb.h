@@ -27,7 +27,8 @@
 
 enum {
     kKcbMagic = 'ENFK',
-    kKcbVersion = 3,          /* 2: no applzone; 1: 64 table pages and
+    kKcbVersion = 4,          /* 3: writable by Mac OS, one denied page;
+                                 2: no applzone; 1: 64 table pages and
                                  496 events */
     kKcbSize = 0x4000,
     kKcbRing = 488,
@@ -39,8 +40,14 @@ enum {
 /* KernelCB.mode */
 enum { kKcbPass, kKcbLog, kKcbEnforce };
 
-/* Owner bytes. An application's is kOwnerApp + its domain's slot. */
-enum { kOwnerNone = 0, kOwnerSystem = 1, kOwnerApp = 3 };
+/* Owner bytes. An application's is kOwnerApp + its domain's slot.
+   kOwnerTables marks the control block's and the owner table's pages: the
+   kernel drops every store into them. */
+enum { kOwnerNone = 0, kOwnerSystem = 1, kOwnerTables = 2, kOwnerApp = 3 };
+
+/* MP call 109 operations (r3) on the registered block, which Mac OS
+   cannot write itself. */
+enum { kKcbOpOwners = 1, kKcbOpMode = 2, kKcbOpCurrent = 3 };
 
 /* KEvent.info, low byte. */
 enum {
@@ -78,7 +85,7 @@ typedef struct {
        on its tick. */
     volatile unsigned long current;
     unsigned long entries;              /* pages the owner table covers */
-    volatile unsigned long denied_page; /* the hooks clear it when they deny */
+    volatile unsigned long denied_page; /* the last denied page, any kind */
     volatile unsigned long seq;         /* events recorded */
     unsigned long frame;                /* the emulator's frame code, or 0 */
     volatile unsigned long allowed, logged, denied, bail, self;
@@ -87,7 +94,12 @@ typedef struct {
        kernel reads it at each store to find the current application: the
        owner of the page ApplZone points into. */
     unsigned long applzone;
-    unsigned long reserved[49];
+    /* The last denied native store and 68k store: the page, then the
+       event's number. The hook that takes the fault denies a store to that
+       page once for each number. */
+    volatile unsigned long deny_native[2], deny_68k[2];
+    volatile unsigned long tables; /* stores into the tables, dropped */
+    unsigned long reserved[44];
     unsigned long pages[kKcbTablePages]; /* physical */
     KEvent ring[kKcbRing];              /* event n at (n - 1) % kKcbRing */
 } KernelCB;
@@ -96,6 +108,9 @@ _Static_assert(offsetof(KernelCB, frame) == 0x1C, "CB_FRAME");
 _Static_assert(offsetof(KernelCB, self) == 0x30, "CB_SELF");
 _Static_assert(offsetof(KernelCB, skipped) == 0x34, "CB_SKIPPED");
 _Static_assert(offsetof(KernelCB, applzone) == 0x38, "CB_APPLZONE");
+_Static_assert(offsetof(KernelCB, deny_native) == 0x3C, "CB_DENY_NATIVE");
+_Static_assert(offsetof(KernelCB, deny_68k) == 0x44, "CB_DENY_68K");
+_Static_assert(offsetof(KernelCB, tables) == 0x4C, "CB_TABLES");
 _Static_assert(offsetof(KernelCB, pages) == 0x100, "CB_PAGES");
 _Static_assert(offsetof(KernelCB, ring) == 0x300, "CB_RING");
 _Static_assert(sizeof(KEvent) == 32, "event size");
@@ -145,6 +160,30 @@ static inline long kcb_register(unsigned long phys)
 {
     KRegs k = {0};
     k.r3 = phys;
+    return nk_call(kMPEnforcer, &k);
+}
+
+/* Set the owner byte of count pages from page first to owner, where the
+   byte is replace (or every byte, with replace -1). The kernel leaves out
+   pages past the table's end. */
+static inline long kcb_owners(unsigned long first, unsigned long count,
+                              unsigned owner, long replace)
+{
+    KRegs k = {0};
+    k.r3 = kKcbOpOwners;
+    k.r4 = first;
+    k.r5 = count;
+    k.r6 = owner;
+    k.r7 = (unsigned long)replace;
+    return nk_call(kMPEnforcer, &k);
+}
+
+/* kKcbOpMode or kKcbOpCurrent. */
+static inline long kcb_set(unsigned long op, unsigned long value)
+{
+    KRegs k = {0};
+    k.r3 = op;
+    k.r4 = value;
     return nk_call(kMPEnforcer, &k);
 }
 

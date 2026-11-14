@@ -107,8 +107,9 @@ Known holes:
   and plug-ins counts as the system's.
 - An application launched in the last half second has no owner until its
   first event.
-- Enforcer's own control block and owner table are in the system heap,
-  where any code can write them.
+- A program that calls the patched kernel's Enforcer call on purpose can
+  change Enforcer's owner table or turn the check off. A stray write
+  cannot: the kernel drops writes into Enforcer's own tables.
 - With virtual memory on, a protection can be lost briefly while the
   Virtual Memory Manager updates a page.
 

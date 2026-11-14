@@ -21,8 +21,9 @@
 # or above D_DENY_FROM, the hook then leaves the page protected, stores
 # ApplZone at D_STOP (when set) to name the application to stop, and passes
 # the fault on to the Exception Manager. A recorded store to the page in the
-# word at D_KDENY (the page the kernel's owner check denied, common/kcb.h)
-# is denied in the same way, whatever its address, and the word cleared.
+# pair at D_KDENY (the kernel's last denied native store, common/kcb.h: the
+# page and the event's number) is denied in the same way, whatever its
+# address, once for each number; the hook keeps the last one in D_KSEEN.
 # While ApplZone is outside [cur_lo, cur_hi) (the engine has not seen a
 # switch yet), nothing is the current application's: every store is
 # recorded, and only the kernel's denial denies.
@@ -63,7 +64,8 @@
         .set    D_COUNT_DENIED, 0x8C
         .set    D_DENIED, 0x90          # the last one: pc, addr, r3, zone, sp
         .set    D_STOP, 0xA4            # gets the zone on a denial, or 0
-        .set    D_KDENY, 0xAC           # the kernel's denied page, or 0
+        .set    D_KDENY, 0xAC           # the kernel's last denial: page, number
+        .set    D_KSEEN, 0xB4           # the last kernel denial taken
         .set    RING_N, 256
         .set    APPCODE, 6              # CR bit (cr1.eq): the current app's code
 
@@ -197,14 +199,15 @@ pc_known:
 
 decide:
         lwz     5,D_KDENY(4)            # the kernel's owner check denied
-        cmpwi   5,0                     # this page: deny
-        beq     by_rule
-        lwz     6,0(5)
-        rlwinm  0,7,0,0,19
+        lwz     6,0(5)                  # this page, in an event this hook
+        rlwinm  0,7,0,0,19              # has not taken: deny
         cmpw    6,0
         bne     by_rule
-        li      6,0
-        stw     6,0(5)
+        lwz     6,4(5)
+        lwz     0,D_KSEEN(4)
+        cmpw    6,0
+        beq     by_rule
+        stw     6,D_KSEEN(4)
         b       deny
 by_rule:
         bne     1,open

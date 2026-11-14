@@ -57,6 +57,11 @@
  *      to this application, while the engine still has another process as
  *      current (it sees switches on its tick): the patched kernel finds
  *      out who is current itself, so Enforcer stops this application.
+ *
+ *   K  native and 68k stores of flipped values into a word of Enforcer's
+ *      control block and one of its owner table, each read back: the
+ *      kernel drops all four and counts them, and this application goes
+ *      on.
  */
 
 #include <stdio.h>
@@ -449,7 +454,8 @@ int main(void)
                "traps, m temporary memory, M 1 MB of it, T store into "
                "another application's, P page 600 MB, Y from an MP task, "
                "V from a Time Manager task, D from a deferred task, W "
-               "right after a switch, X make the Enforcer Extension quit "
+               "right after a switch, K into the control block and the "
+               "owner table, X make the Enforcer Extension quit "
                "as in a crash, q quit; then Return\n");
         int ch = getchar();
         while (ch != '\n' && getchar() != '\n')
@@ -523,6 +529,37 @@ int main(void)
             }
             if (tries == 1000)
                 printf("the engine was never behind\n");
+            continue;
+        }
+        case 'K': {
+            State *s = engine_state();
+            if (!s || !s->kcb) {
+                printf("no control block registered\n");
+                continue;
+            }
+            /* Words the kernel never reads: one in the block's reserved
+               space, and the owner table's last, for pages at the top of
+               logical memory that nobody owns. */
+            volatile unsigned long *words[2] = {
+                (volatile unsigned long *)&s->kcb->reserved[0],
+                (volatile unsigned long *)(s->owners + s->owners_size - 4)};
+            const char *names[2] = {"control block", "owner table"};
+            unsigned long before = s->kcb->tables;
+            for (int i = 0; i < 2; i++) {
+                volatile unsigned long *w = words[i];
+                unsigned long old = *w;
+                *w = ~old;
+                unsigned long native = *w;
+                CallUniversalProc(upp, pi, (long)w, (long)~old);
+                unsigned long m68k = *w;
+                *w = old;
+                printf("%s word %08lX: %08lX; after a native store of "
+                       "%08lX: %08lX, after a 68k one: %08lX: %s\n",
+                       names[i], (unsigned long)w, old, ~old, native, m68k,
+                       native == old && m68k == old ? "dropped" : "WRITTEN");
+            }
+            printf("stores dropped into the tables: %lu (6 expected)\n",
+                   s->kcb->tables - before);
             continue;
         }
         case 'X': {

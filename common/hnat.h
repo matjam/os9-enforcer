@@ -22,7 +22,7 @@
 enum {
     kHnatNCB = 0x68FFF400,
     kHnatSlot = 0x68FFF44C,   /* NCB.ExceptionHandler */
-    kHnatMagic = 'HNA6'       /* changes with the data layout or the code */
+    kHnatMagic = 'HNA7'       /* changes with the data layout or the code */
 };
 
 /* The block: data (0xC0 bytes), then code (32-byte aligned), then ring. */
@@ -87,6 +87,7 @@ static inline long hnat_install(unsigned long area)
 
     d->ring = (HookEvent *)(code + ((sizeof hnat_code + 31) & ~31UL));
     d->deny_from = ~0UL;
+    d->kdeny = d->knone;
     d->area = area;
     d->orig = orig;
     d->block = (unsigned long)block;

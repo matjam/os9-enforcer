@@ -97,12 +97,15 @@ typedef struct {
     HookPassed denied;           /* the last store denied */
     volatile unsigned long *stop; /* gets ApplZone on a denial, or 0 */
     unsigned long frame;         /* h68k: the emulator's frame code, or 0 */
-    /* The page the kernel's owner check denied last (common/kcb.h), or 0.
-       A recorded store to that page is denied whatever its address, and
-       the word cleared. */
+    /* The kernel's last denial of this hook's kind of store (common/kcb.h,
+       deny_native or deny_68k): the page, then the event's number. A
+       recorded store to that page is denied whatever its address, once for
+       each number; kseen is the last number taken. Without the kernel's
+       block, kdeny points at knone, which denies nothing. */
     volatile unsigned long *kdeny;
     unsigned long zone;          /* h68k: ApplZone at the fault it handles */
-    unsigned long reserved[3];
+    unsigned long kseen;
+    unsigned long knone[2];
 } HookData;
 
 _Static_assert(sizeof(HookEvent) == 32, "ring entry size");
@@ -120,6 +123,8 @@ _Static_assert(offsetof(HookData, stop) == 0xA4, "D_STOP");
 _Static_assert(offsetof(HookData, frame) == 0xA8, "D_FRAME");
 _Static_assert(offsetof(HookData, kdeny) == 0xAC, "D_KDENY");
 _Static_assert(offsetof(HookData, zone) == 0xB0, "D_ZONE");
+_Static_assert(offsetof(HookData, kseen) == 0xB4, "D_KSEEN");
+_Static_assert(offsetof(HookData, knone) == 0xB8, "D_KNONE");
 _Static_assert(sizeof(HookData) == 0xC0, "data block size");
 
 /* A pointer to a fixed address. The empty asm hides the constant from GCC,

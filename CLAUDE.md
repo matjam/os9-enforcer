@@ -126,6 +126,7 @@ allowed store changes nothing.
 | `V` | a Time Manager task into a background-only application, 5 s later; make the Finder current | dropped by the kernel |
 | `D` | a deferred task into the Finder, Scribble current | skipped by the engine, Scribble goes on |
 | `W` | native code into the Finder right after a switch back, while the engine still has another process current | denied, Scribble stopped cleanly |
+| `K` | native and 68k stores into the control block and the owner table | dropped by the kernel (6 counted in `CB_TABLES`), Scribble goes on |
 | `X` | make the Enforcer Extension call `ExitToShell` without `engine_stop` | engine stops itself, control block unregistered |
 
 `Y`, `V` and `D` flip the word, read it back and restore it, and print
@@ -160,10 +161,21 @@ window: log, deny, log the system heap, deny with the system heap logged.
 - Patch 4, the owner check: the engine registers a control block (16 KB,
   physically contiguous) and an owner table (one byte per 4 KB page, up to
   128 table pages: 2 GB) with MP call 109, which the stock kernel leaves
-  unused (it returns −4 there). The kernel takes only `CB_VERSION` 3 and
+  unused (it returns −4 there). The kernel takes only `CB_VERSION` 4 and
   returns paramErr for another, so a mismatched extension and kernel
-  protect nothing. Owner bytes: 0 none, 1 the system heap, 3 + slot for an
-  application's domain.
+  protect nothing. Owner bytes: 0 none, 1 the system heap, 2 the control
+  block and the owner table, 3 + slot for an application's domain.
+- The control block and the owner table are read-only to Mac OS. The
+  engine gives their pages owner 2 and write-protects them, and the
+  kernel drops every store into a page with owner 2, in any mode, and
+  counts it (`CB_TABLES`). The engine changes them through MP call 109
+  with an operation in r3 instead of a block address: `OP_OWNERS` (a run
+  of owner bytes, optionally only where the byte is a given value),
+  `OP_MODE` and `OP_CURRENT` (`kcb_owners` and `kcb_set` in
+  `common/kcb.h`). `OP_OWNERS` with "any byte" leaves owner 2 alone, so
+  marking a range of the system heap keeps the tables protected. The MP
+  call reaches the arguments past r5 in the caller's context block (r6 at
+  +0x134, r7 at +0x13C).
 - On a store to a read-only page that has an owner, in any task, the kernel
   looks up the owner of the code doing the store: the PC, or for the 68k
   emulator the 68k PC (r24 − 2). Code nobody owns is the system's. A store
@@ -173,7 +185,11 @@ window: log, deny, log the system heap, deny with the system heap logged.
     callback the current application called);
   - by the current application in the blue task, with the 68k interrupt
     mask at 0: denied. The denied store reaches the hooks, which deny it
-    too (`HookData.kdeny` names the page) and stop the application;
+    too and stop the application. The kernel records the last denial of
+    each kind (`CB_DENY_NATIVE`, `CB_DENY_68K`: the page and the event's
+    number); `HookData.kdeny` points the hook at its kind's pair, and the
+    hook denies a store to that page once for each number (`kseen`),
+    since it cannot write the block;
   - any other: dropped. The kernel moves SRR0 past its own emulated store
     and returns to its emulation; memory is not changed and the writer
     goes on (`kEvfSkipped`). `stwcx_probe`'s store is allowed instead, or
@@ -331,8 +347,10 @@ Worst first. Keep in step with Limits in `README.md`.
    all of its code when `find_code` finds no match, is the system's.
 6. An application launched since the last refresh (up to half a second)
    has no domain until its first event or `TempNewHandle`.
-7. The control block and the owner table are in the system heap, where any
-   code can write them.
+7. Any code can make MP call 109 itself: change owner bytes, change the
+   mode or unregister the block. A stray store cannot change the tables
+   (Scribble `K` tests that), but a program that calls the kernel on
+   purpose can.
 8. The system heap is log only.
 9. An application's own patch of `_OSDispatch`, `DisposeHandle` or
    `ExitToShell`, made before the engine started, goes around the
@@ -371,8 +389,8 @@ serialized, and applications run in parallel only outside it.
    and everything that needs the Toolbox (tracking processes, finding
    code, temporary memory, notifications, preferences), stays in the
    extension.
-   - The owner table and the control block are read-only to Mac OS; the
-     engine changes owners through kernel calls.
+   - Done (2026-11-14): the owner table and the control block are
+     read-only to Mac OS; the engine changes owners through kernel calls.
    - Measure what a switch costs, and scope per-application VSIDs in the
      kernel (building and removing page-table entries, address spaces).
      Today `protect_domain` re-protects the previous application's whole
@@ -494,7 +512,7 @@ To check which kernel is running, dump it and compare it with the build
 (`build.sh` prints its size):
 
 ```bash
-../os9-protect/tools/qmp.py raw '{"execute":"pmemsave","arguments":{"val":15794176,"size":106636,"filename":"/tmp/nk-live.bin"}}'
+../os9-protect/tools/qmp.py raw '{"execute":"pmemsave","arguments":{"val":15794176,"size":106884,"filename":"/tmp/nk-live.bin"}}'
 ```
 
 ```bash

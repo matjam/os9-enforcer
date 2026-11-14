@@ -22,9 +22,10 @@
 # emulator gives the application a bus error. A store by the emulator's own
 # code that fills a 68k-to-native call frame (D_FRAME, FRAME_LEN bytes) is
 # not the application's, although r24 then still points at its trap. A
-# recorded store to the page in the word at D_KDENY (the page the kernel's
-# owner check denied, common/kcb.h) is denied in the same way, whatever its
-# address, and the word cleared. While ApplZone is outside [cur_lo, cur_hi)
+# recorded store to the page in the pair at D_KDENY (the kernel's last
+# denied 68k store, common/kcb.h: the page and the event's number) is
+# denied in the same way, whatever its address, once for each number; the
+# hook keeps the last one in D_KSEEN. While ApplZone is outside [cur_lo, cur_hi)
 # (the engine has not seen a switch yet), nothing is the current
 # application's: every store is recorded, and only the kernel's denial
 # denies.
@@ -93,6 +94,7 @@
         .set    D_FRAME, 0xA8           # the emulator's frame code, or 0
         .set    D_KDENY, 0xAC           # the kernel's denied page, or 0
         .set    D_ZONE, 0xB0            # ApplZone at this exception
+        .set    D_KSEEN, 0xB4           # the last kernel denial taken
         .set    FRAME_LEN, 0x70
         .set    RING_N, 256
         .set    APPCODE, 6              # CR bit (cr1.eq): the current app's code
@@ -231,14 +233,15 @@ pc_known:
 
 decide:
         lwz     5,D_KDENY(3)            # the kernel's owner check denied
-        cmpwi   5,0                     # this page: deny
-        beq     by_rule
-        lwz     6,0(5)
-        rlwinm  7,4,0,0,19
+        lwz     6,0(5)                  # this page, in an event this hook
+        rlwinm  7,4,0,0,19              # has not taken: deny
         cmpw    6,7
         bne     by_rule
-        li      6,0
-        stw     6,0(5)
+        lwz     6,4(5)
+        lwz     7,D_KSEEN(3)
+        cmpw    6,7
+        beq     by_rule
+        stw     6,D_KSEEN(3)
         b       deny
 by_rule:
         bne     1,open

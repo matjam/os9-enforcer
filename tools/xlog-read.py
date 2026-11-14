@@ -43,7 +43,8 @@ CHUNK = ["live", "domain", "handle", "block", "lo", "hi", "zone", "handles",
 MAX_CHUNKS = 128
 KCB = ["magic", "version", "mode", "current", "entries", "denied_page",
        "seq", "frame", "allowed", "logged", "denied", "bail", "self",
-       "skipped"]
+       "skipped", "applzone", "deny_native_page", "deny_native_seq",
+       "deny_68k_page", "deny_68k_seq", "tables"]
 KCB_RING, KCB_RING_N, KCB_EVENTS = 0x300, 488, 12
 EVF = [(1, "68k"), (2, "task"), (4, "offense"), (8, "denied"),
        (16, "skipped")]
@@ -148,9 +149,11 @@ def print_kernel(k):
               k["kcb"], ["pass", "log", "enforce"][mode] if mode < 3 else mode,
               k["cb_current"], k["owners"], k["cb_entries"], k["cb_frame"]))
     print("  kernel: allowed %d, offenses allowed %d, denied %d, dropped %d, "
-          "left to the hooks %d, own (current application) %d; events %d" % (
+          "left to the hooks %d, own (current application) %d, into the "
+          "tables (dropped) %d; events %d" % (
               k["cb_allowed"], k["cb_logged"], k["cb_denied"],
-              k["cb_skipped"], k["cb_bail"], k["cb_self"], k["cb_seq"]))
+              k["cb_skipped"], k["cb_bail"], k["cb_self"], k["cb_tables"],
+              k["cb_seq"]))
     print("  engine: taken %d (last %d), lost %d, denied %d" % (
         k["kevents"], k["kseen"], k["klost"], k["kdenied"]))
     if k["events"]:

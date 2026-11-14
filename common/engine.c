@@ -161,17 +161,25 @@ static unsigned char owner_code(State *s, int i)
     return i == s->sys_dom ? kOwnerSystem : kOwnerApp + i;
 }
 
+/* Set the owner bytes of the pages from lo >> 12 up to hi >> 12 to owner,
+   where the byte is replace. With replace -1, every byte but the tables'
+   (kOwnerTables), which the kernel never replaces except on request. */
+static void set_owners(State *s, unsigned long lo, unsigned long hi,
+                       unsigned char owner, long replace)
+{
+    unsigned long first = lo >> 12, end = hi >> 12;
+    if (s->kcb && end > first &&
+        kcb_owners(first, end - first, owner, replace))
+        s->c.kernel_errors++;
+}
+
 /* Manage the pages in [lo, hi) for owner (bitmap bits and owner bytes), or
    stop managing them (owner 0). */
 static void mark(State *s, unsigned long lo, unsigned long hi,
                  unsigned char owner)
 {
     set_bits(s, lo, hi, owner != kOwnerNone);
-    if (!s->kcb)
-        return;
-    unsigned long n = s->kcb->entries;
-    for (unsigned long p = lo >> 12; p < hi >> 12 && p < n; p++)
-        s->owners[p] = owner;
+    set_owners(s, lo, hi, owner, -1);
 }
 
 /* Give application domain i the owner bytes of its code's pages in
@@ -181,14 +189,10 @@ static void own_code(State *s, int i, unsigned long lo, unsigned long hi)
 {
     Domain *d = &s->domains[i];
     unsigned char code = owner_code(s, i);
-    unsigned long n = s->kcb->entries;
     lo &= kPageMask;
     hi = (hi + kPage - 1) & kPageMask;
-    for (unsigned long p = lo >> 12; p < hi >> 12 && p < n; p++) {
-        unsigned long a = p << 12;
-        if ((a < d->lo || a >= d->hi) && s->owners[p] == kOwnerNone)
-            s->owners[p] = code;
-    }
+    set_owners(s, lo, hi < d->lo ? hi : d->lo, code, kOwnerNone);
+    set_owners(s, lo > d->hi ? lo : d->hi, hi, code, kOwnerNone);
     d->code_lo = lo;
     d->code_hi = hi;
     d->code_state = kCodeOwned;
@@ -203,14 +207,14 @@ static void own_first_page(State *s, int i, int on)
     Domain *d = &s->domains[i];
     if (!s->kcb || i == s->sys_dom || (d->location & (kPage - 1)) == 0)
         return;
-    unsigned long p = d->location >> 12;
+    unsigned long a = d->location & kPageMask;
     unsigned char code = owner_code(s, i);
-    if (p >= s->kcb->entries || (p << 12) >= d->lo)
+    if (a >= d->lo)
         return;
-    if (on && s->owners[p] == kOwnerNone)
-        s->owners[p] = code;
-    else if (!on && s->owners[p] == code)
-        s->owners[p] = kOwnerNone;
+    if (on)
+        set_owners(s, a, a + kPage, code, kOwnerNone);
+    else
+        set_owners(s, a, a + kPage, kOwnerNone, code);
 }
 
 /* Give back the owner bytes of domain i's code. The range stays in the
@@ -220,12 +224,7 @@ static void disown_code(State *s, int i)
     Domain *d = &s->domains[i];
     if (d->code_state != kCodeOwned || !s->kcb)
         return;
-    unsigned char code = owner_code(s, i);
-    unsigned long n = s->kcb->entries;
-    for (unsigned long p = d->code_lo >> 12; p < d->code_hi >> 12 && p < n;
-         p++)
-        if (s->owners[p] == code)
-            s->owners[p] = kOwnerNone;
+    set_owners(s, d->code_lo, d->code_hi, kOwnerNone, owner_code(s, i));
     d->code_state = kCodeUnknown;
 }
 
@@ -297,8 +296,9 @@ static void set_current(State *s, int i)
     }
     hook_set_current(s->h68k, lo, hi);
     hook_set_current(s->hnat, lo, hi);
-    if (s->kcb && !s->kcb->applzone) /* else the kernel finds it itself */
-        s->kcb->current = i >= 0 ? owner_code(s, i) : kOwnerNone;
+    if (s->kcb && !s->kcb->applzone && /* else the kernel finds it itself */
+        kcb_set(kKcbOpCurrent, i >= 0 ? owner_code(s, i) : kOwnerNone))
+        s->c.kernel_errors++;
     s->cur = i;
 }
 
@@ -469,10 +469,11 @@ static void set_deny(State *s, unsigned long mode)
     s->hnat->deny_from = from;
     /* The kernel's mode follows: kModeOff has nothing protected, and the
        kernel then only lets other tasks store (patch 3). */
-    if (s->kcb)
-        s->kcb->mode = mode == kModeEnforce ? kKcbEnforce
-                       : mode == kModeLog   ? kKcbLog
-                                            : kKcbPass;
+    if (s->kcb &&
+        kcb_set(kKcbOpMode, mode == kModeEnforce ? kKcbEnforce
+                            : mode == kModeLog   ? kKcbLog
+                                                 : kKcbPass))
+        s->c.kernel_errors++;
 }
 
 static int sys_live(State *s)
@@ -971,7 +972,7 @@ static void kernel_event(State *s, const KEvent *e)
    denied store is only counted: the hook that denies it records it. */
 static void kernel_drain(State *s)
 {
-    KernelCB *k = s->kcb;
+    const KernelCB *k = s->kcb;
     if (!k)
         return;
     unsigned long last = k->seq, seen = s->kseen;
@@ -986,7 +987,7 @@ static void kernel_drain(State *s)
         seen = last - kKcbRing;
     }
     for (unsigned long n = seen + 1; n - seen <= last - seen; n++) {
-        volatile KEvent *v = &k->ring[(n - 1) % kKcbRing];
+        const volatile KEvent *v = &k->ring[(n - 1) % kKcbRing];
         KEvent e;
         e.seq = v->seq;
         e.pc = v->pc;
@@ -2370,8 +2371,18 @@ static void kcb_start(State *s)
     s->owners_size = tsize;
     s->kseen = 0;
     s->kcb = k;
-    s->h68k->kdeny = &k->denied_page;
-    s->hnat->kdeny = &k->denied_page;
+    /* Mac OS cannot write them from here on: the kernel drops every store
+       into a page with owner kOwnerTables. */
+    set_owners(s, (unsigned long)k, (unsigned long)k + kKcbSize, kOwnerTables,
+               -1);
+    set_owners(s, (unsigned long)t, (unsigned long)t + tsize, kOwnerTables, -1);
+    if (nk_protect(s->area, (unsigned long)k, kKcbSize) ||
+        nk_protect(s->area, (unsigned long)t, tsize))
+        s->c.kernel_errors++;
+    s->h68k->kseen = 0;
+    s->hnat->kseen = 0;
+    s->h68k->kdeny = k->deny_68k;
+    s->hnat->kdeny = k->deny_native;
     s->kcb_err = 0;
     return;
 unlock:
@@ -2389,18 +2400,21 @@ fail:
     s->kcb_err = err;
 }
 
-/* Unregister and free the block, with nothing protected. */
+/* Unregister and free the block, with nothing else protected. */
 static void kcb_stop(State *s)
 {
     if (!s->kcb)
         return;
-    s->kcb->mode = kKcbPass;
+    kcb_set(kKcbOpMode, kKcbPass);
     kcb_register(0);
-    s->h68k->kdeny = 0;
-    s->hnat->kdeny = 0;
+    s->h68k->kdeny = s->h68k->knone;
+    s->hnat->kdeny = s->hnat->knone;
+    if (nk_unprotect(s->area, (unsigned long)s->kcb, kKcbSize) ||
+        nk_unprotect(s->area, (unsigned long)s->owners, s->owners_size))
+        s->c.kernel_errors++;
     if (s->vm) {
-        UnlockMemory(s->kcb, kKcbSize);
-        UnlockMemory(s->owners, s->owners_size);
+        UnlockMemory((void *)s->kcb, kKcbSize);
+        UnlockMemory((void *)s->owners, s->owners_size);
         if (s->kcb->applzone)
             UnlockMemory(applzone_ptr(), 4);
     }

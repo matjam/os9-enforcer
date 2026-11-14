@@ -26,7 +26,7 @@ enum {
     kH68kData = 0x68FFFB80,   /* = ECB + 0xA80, see h68k.s */
     kH68kCode = 0x68FFFC40,
     kH68kEnd = 0x68FFFF00,
-    kH68kMagic = 'H689'       /* changes with the data layout or the code */
+    kH68kMagic = 'H68A'       /* changes with the data layout or the code */
 };
 
 _Static_assert(kH68kData + sizeof(HookData) <= kH68kCode, "data overlaps code");
@@ -87,6 +87,7 @@ static inline long h68k_install(unsigned long area)
     d->lo = 0;
     d->hi = 0;
     d->deny_from = ~0UL;
+    d->kdeny = d->knone;
     d->area = area;
     d->orig = orig;
     d->ring = ring;

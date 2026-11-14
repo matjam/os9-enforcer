@@ -65,8 +65,8 @@ kernel:
 # registers with MP call 109, by its physical address. Keep common/kcb.h in
 # step.
         .set    CB_MAGIC, 0x000                 # 'ENFK'
-        .set    CB_VERSION, 0x004               # 3
-        .set    VERSION, 3                      # the layout below
+        .set    CB_VERSION, 0x004               # 4
+        .set    VERSION, 4                      # the layout below
         .set    CB_MODE, 0x008                  # MODE_*
         .set    CB_CURRENT, 0x00C               # the current application's owner
         .set    CB_ENTRIES, 0x010               # pages the owner table covers
@@ -81,6 +81,11 @@ kernel:
         .set    CB_SKIPPED, 0x034               # dropped
         .set    CB_APPLZONE, 0x038              # ApplZone (low memory 0x2AA),
                                                 # physical, or 0
+        .set    CB_DENY_NATIVE, 0x03C           # the last denied native store:
+                                                # its page, then its event
+        .set    CB_DENY_68K, 0x044              # the same for a 68k store
+        .set    CB_TABLES, 0x04C                # stores into the tables,
+                                                # dropped
         .set    CB_PAGES, 0x100                 # owner table pages, physical
                                                 # (128 of them: 2 GB)
         .set    CB_RING, 0x300                  # RING_N events of 32 bytes
@@ -102,9 +107,15 @@ kernel:
         .set    MODE_PASS, 0                    # as without the table
         .set    MODE_LOG, 1
         .set    MODE_ENFORCE, 2
-        .set    OWNER_SYSTEM, 1                 # 0 none, 2 reserved,
+        .set    OWNER_SYSTEM, 1                 # 0 none,
+        .set    OWNER_TABLES, 2                 # the block and its table,
         .set    OWNER_APP, 3                    # 3 and up applications
         .set    MP_ENFORCER, 109                # an unused MP call
+        .set    OP_OWNERS, 1                    # its operations (r3)
+        .set    OP_MODE, 2
+        .set    OP_CURRENT, 3
+        .set    CTX_R6, 0x134                   # ContextBlock.r6 and .r7: an
+        .set    CTX_R7, 0x13C                   # MP call's 4th and 5th arguments
 
 # --- Patch sites, in offset order ------------------------------------------
 
@@ -259,8 +270,16 @@ cpup_keep_writable:
 # marked. A store into the current application's page that is not an
 # offense is only counted (CB_SELF); every other store is recorded in the
 # block's ring, and counted. A denied store goes on to the fault path with
-# its page in CB_DENIED_PAGE, where the blue task's hooks deny it and stop
-# the application.
+# its page and event number in CB_DENY_NATIVE or CB_DENY_68K, where the
+# blue task's hook for that kind of store denies it and stops the
+# application; each hook remembers the last number it took, since it
+# cannot write the block.
+#
+# The control block and the owner table have owner OWNER_TABLES, and the
+# engine protects them: every store into them, by any code in any mode
+# (patch 3's too), is dropped and counted (CB_TABLES). The kernel writes
+# them only with translation off, and the engine changes them through the
+# operations of MP call 109.
 #
 # To drop a store, the kernel sets SRR0 to the next instruction of its own
 # emulation of the store (MemRetryDSI's SRR0 is that instruction, run with
@@ -304,6 +323,8 @@ tw_base:
         bl      owner_of
         cmpwi   8, 0
         beq     fault                           # not the engine's page
+        cmpwi   8, OWNER_TABLES
+        beq     drop_table                      # the engine's own tables
         li      31, 0
         andis.  9, 28, FLAG_BLUE
         bne     fault                           # the blue task: its hooks
@@ -325,6 +346,8 @@ check:  lwz     9, CB_APPLZONE(31)              # who is current: the owner
         bl      owner_of
         mr.     18, 8
         beq     fault                           # not the engine's page
+        cmpwi   18, OWNER_TABLES
+        beq     drop_table                      # the engine's own tables
         li      16, 0                           # the event's flags
         andis.  9, 28, FLAG_BLUE
         bne     3f
@@ -384,6 +407,11 @@ check:  lwz     9, CB_APPLZONE(31)              # who is current: the owner
         bl      count
         b       open
 
+drop_table:                                     # a store into the control
+        li      8, CB_TABLES                    # block or the owner table, by
+        bl      count                           # any code in any mode:
+        b       skip                            # dropped
+
 record: lwz     9, CB_SEQ(31)
         addi    9, 9, 1                         # this event's number
         addi    8, 9, -1
@@ -414,6 +442,14 @@ record: lwz     9, CB_SEQ(31)
         beq     6f
         rlwinm  9, 27, 0, 0, 19
         stw     9, CB_DENIED_PAGE(31)
+        lwz     17, CB_SEQ(31)                  # for the hook that takes the
+        andi.   8, 16, EVF_68K                  # fault: the page and the
+        li      8, CB_DENY_NATIVE               # event's number
+        beq     5f
+        li      8, CB_DENY_68K
+5:      add     8, 8, 31
+        stw     9, 0(8)
+        stw     17, 4(8)
         li      8, CB_DENIED
         bl      count
         b       fault
@@ -421,7 +457,7 @@ record: lwz     9, CB_SEQ(31)
         beq     7f
         li      8, CB_SKIPPED
         bl      count
-        mfsrr0  9                               # past the emulated store
+skip:   mfsrr0  9                               # past the emulated store
         addi    9, 9, 4
         mtsrr0  9
         b       retry
@@ -512,18 +548,19 @@ owner_of:
         blr
 
 # MP call 109 (patch 4): r3 the control block's physical address, page
-# aligned, with CB_MAGIC and CB_VERSION set; or 0 to unregister. Returns
-# 0, or -50 (paramErr) for a block it does not take. The kernel uses the
-# block (16 KB, physically contiguous) and the table pages it names with
-# translation off, so they must stay where they are while registered.
+# aligned, with CB_MAGIC and CB_VERSION set; or 0 to unregister; or an
+# operation (OP_*, below). Returns 0, or -50 (paramErr) for a block it
+# does not take. The kernel uses the block (16 KB, physically contiguous)
+# and the table pages it names with translation off, so they must stay
+# where they are while registered.
 #
-# At entry: r3-r5 the arguments, r6 the ContextBlock, r1 the KDP; r14-r31
-# and LR are free.
+# At entry: r3-r5 the arguments, r6 the ContextBlock (the caller's r6 and
+# r7 at CTX_R6 and CTX_R7), r1 the KDP; r14-r31 and LR are free.
 enf_register:
         cmpwi   3, 0
         beq     2f
         andi.   16, 3, 0xFFF
-        bne     1f                              # not page aligned
+        bne     enf_op                          # not page aligned
         lwz     16, CB_MAGIC(3)
         lis     17, 0x454E                      # 'EN'
         ori     17, 17, 0x464B                  # 'FK'
@@ -538,6 +575,64 @@ enf_register:
 3:      mflr    16
         stw     3, enf_cb - 3b(16)
         li      3, 0
+        b       MPReturn
+
+# The operations on the registered block, whose pages Mac OS cannot write
+# (the engine protects them, with owner OWNER_TABLES):
+#   OP_OWNERS: r4 the first page, r5 the number of pages, r6 the owner
+#     byte to set, r7 the byte it replaces (-1: any but OWNER_TABLES, so
+#     that marking a range of the system heap leaves the tables'
+#     protection alone). Pages past the table's end are left out.
+#   OP_MODE: r4 MODE_*.
+#   OP_CURRENT: r4 the current application's owner (used without
+#     CB_APPLZONE).
+enf_op:
+        bl      1f
+1:      mflr    16
+        lwz     31, enf_cb - 1b(16)
+        cmpwi   31, 0
+        beq     9f                              # no block
+        cmpwi   3, OP_MODE
+        bne     2f
+        cmplwi  4, MODE_ENFORCE
+        bgt     9f
+        stw     4, CB_MODE(31)
+        b       8f
+2:      cmpwi   3, OP_CURRENT
+        bne     3f
+        stw     4, CB_CURRENT(31)
+        b       8f
+3:      cmpwi   3, OP_OWNERS
+        bne     9f
+        lwz     19, CTX_R6(6)                   # the owner byte
+        lwz     20, CTX_R7(6)                   # the byte it replaces, or -1
+        lwz     17, CB_ENTRIES(31)
+        cmplw   4, 17
+        bge     8f                              # past the table
+        subf    17, 4, 17                       # pages left in the table
+        cmplw   5, 17
+        ble     4f
+        mr      5, 17
+4:      cmpwi   5, 0
+        beq     8f
+5:      rlwinm  17, 4, 22, 10, 29               # (page >> 12) * 4
+        addi    17, 17, CB_PAGES
+        lwzx    17, 31, 17                      # that table page, physical
+        rlwinm  18, 4, 0, 20, 31                # page & 0xFFF
+        lbzx    21, 17, 18
+        cmpw    21, 20
+        beq     6f                              # the byte to replace
+        cmpwi   20, -1
+        bne     7f                              # not the byte to replace
+        cmpwi   21, OWNER_TABLES
+        beq     7f                              # any byte but the tables'
+6:      stbx    19, 17, 18
+7:      addi    4, 4, 1
+        addic.  5, 5, -1
+        bne     5b
+8:      li      3, 0
+        b       MPReturn
+9:      li      3, -50
         b       MPReturn
 
         .globl  task_log                        # for build.sh's nm

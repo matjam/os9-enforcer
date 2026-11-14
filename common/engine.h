@@ -59,6 +59,10 @@
  * store first, in every task (common/kcb.h). The engine keeps an owner
  * table next to the bitmap, one byte per page with the same pages set: 1
  * for the system heap, kOwnerApp + slot for an application's domain. The
+ * control block and the owner table are write-protected, with owner
+ * kOwnerTables: the kernel drops every store into them, and the engine
+ * changes owner bytes, the mode and the current application through MP
+ * call 109's operations (kcb_owners, kcb_set). The
  * kernel attributes a store to the owner of its code, allows it by making
  * the page writable (only its PTE: the page is protected again when the
  * engine protects it, or when its PTE leaves the page table) and records it
@@ -440,9 +444,11 @@ typedef struct {
        these in this order. kcb is 0 when it is not registered, and kcb_err
        says why: the kernel's error (-4 without patch 4), or an engine
        error (kEngineNoMemory; kEngineNoArea: no single physical range). */
-    KernelCB *kcb;
+    const KernelCB *kcb;        /* read-only: kcb_set and kcb_owners change it */
     long kcb_err;
-    unsigned char *owners;      /* the owner table: kcb->entries bytes */
+    /* The owner table: kcb->entries bytes, read-only (kcb_owners changes
+       them). */
+    const unsigned char *owners;
     char *kcb_raw, *owners_raw; /* their allocations */
     unsigned long kseen;        /* the last kernel event taken */
     unsigned long kevents;      /* events taken */
