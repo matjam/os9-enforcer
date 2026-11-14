@@ -24,7 +24,10 @@
 # not the application's, although r24 then still points at its trap. A
 # recorded store to the page in the word at D_KDENY (the page the kernel's
 # owner check denied, common/kcb.h) is denied in the same way, whatever its
-# address, and the word cleared.
+# address, and the word cleared. While ApplZone is outside [cur_lo, cur_hi)
+# (the engine has not seen a switch yet), nothing is the current
+# application's: every store is recorded, and only the kernel's denial
+# denies.
 #
 # Entry state, from the kernel (NKInterrupts.s LetBlueHandleOwnException):
 #   r3  = ECB (logical)          free: the original overwrites it first
@@ -89,6 +92,7 @@
         .set    D_STOP, 0xA4            # gets the zone on a denial, or 0
         .set    D_FRAME, 0xA8           # the emulator's frame code, or 0
         .set    D_KDENY, 0xAC           # the kernel's denied page, or 0
+        .set    D_ZONE, 0xB0            # ApplZone at this exception
         .set    FRAME_LEN, 0x70
         .set    RING_N, 256
         .set    APPCODE, 6              # CR bit (cr1.eq): the current app's code
@@ -127,6 +131,10 @@ h68k_start:
         stw     0,D_R0(3)
         stw     6,D_R6(3)
         stw     7,D_R7(3)
+        lhz     5,0x2AA(0)              # ApplZone (2-byte aligned), for
+        lhz     6,0x2AC(0)              # every path below
+        rlwimi  6,5,16,0,15
+        stw     6,D_ZONE(3)
         lwz     4,0x74+E(3)             # fault address
         lwz     5,D_LO(3)
         cmplw   4,5
@@ -150,17 +158,31 @@ h68k_start:
         beq     pass
 
 handle:
-        # The current application's own pages: count only.
+        # The current range moves on the engine's tick, up to 16 ms after a
+        # switch. While ApplZone is outside it, it is the previous
+        # application's: nothing is the current application's, and only
+        # the kernel's denial (D_KDENY) denies. r5 and r7 keep the range
+        # for record.
+        lwz     6,D_ZONE(3)
         lwz     5,D_CUR_LO(3)
+        cmplw   6,5
+        blt     stale
+        lwz     7,D_CUR_HI(3)
+        cmplw   6,7
+        bge     stale
+        # The current application's own pages: count only.
         cmplw   4,5
         blt     record
-        lwz     5,D_CUR_HI(3)
-        cmplw   4,5
+        cmplw   4,7
         bge     record
         lwz     5,D_COUNT_SELF(3)
         addi    5,5,1
         stw     5,D_COUNT_SELF(3)
         b       open
+
+stale:
+        crxor   APPCODE,APPCODE,APPCODE
+        b       app_known
 
 record:
         # Deny rule: is the 68k code doing the store inside the current
@@ -168,11 +190,9 @@ record:
         # restore from D_CR with the rest of cr0 and cr1.
         crxor   APPCODE,APPCODE,APPCODE
         addi    6,24,-2                 # the next 68k instruction
-        lwz     5,D_CUR_LO(3)
-        cmplw   6,5
+        cmplw   6,5                     # r5, r7: the current range
         blt     app_known
-        lwz     5,D_CUR_HI(3)
-        cmplw   6,5
+        cmplw   6,7
         bge     app_known
         lwz     5,0x84+E(3)             # not if the emulator's frame code
         lwz     7,D_FRAME(3)
@@ -203,9 +223,7 @@ pc_known:
         stw     24,R_R24(7)
         lwz     6,0x8C+E(3)
         stw     6,R_LR(7)
-        lhz     6,0x2AA(0)              # ApplZone is 2-byte aligned
-        lhz     5,0x2AC(0)
-        rlwimi  5,6,16,0,15
+        lwz     5,D_ZONE(3)
         stw     5,R_ZONE(7)
         lwz     6,0x9C+E(3)
         stw     6,R_R4(7)
@@ -285,10 +303,8 @@ deny:
         lwz     5,D_STOP(3)             # name the application to stop
         cmpwi   5,0
         beq     1f
-        lhz     6,0x2AA(0)
-        lhz     7,0x2AC(0)
-        rlwimi  7,6,16,0,15
-        stw     7,0(5)
+        lwz     6,D_ZONE(3)
+        stw     6,0(5)
 1:      addi    5,3,D_COUNT_DENIED
         b       note
 
@@ -305,10 +321,8 @@ note:
         stw     4,4+P_PC(5)
         stw     24,4+P_R24(5)
         stw     1,4+P_A7(5)
-        lhz     6,0x2AA(0)
-        lhz     7,0x2AC(0)
-        rlwimi  7,6,16,0,15
-        stw     7,4+P_ZONE(5)
+        lwz     6,D_ZONE(3)
+        stw     6,4+P_ZONE(5)
         lwz     4,0(5)
         addi    4,4,1
         stw     4,0(5)

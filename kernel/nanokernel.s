@@ -65,8 +65,8 @@ kernel:
 # registers with MP call 109, by its physical address. Keep common/kcb.h in
 # step.
         .set    CB_MAGIC, 0x000                 # 'ENFK'
-        .set    CB_VERSION, 0x004               # 2
-        .set    VERSION, 2                      # the layout below
+        .set    CB_VERSION, 0x004               # 3
+        .set    VERSION, 3                      # the layout below
         .set    CB_MODE, 0x008                  # MODE_*
         .set    CB_CURRENT, 0x00C               # the current application's owner
         .set    CB_ENTRIES, 0x010               # pages the owner table covers
@@ -79,6 +79,8 @@ kernel:
         .set    CB_BAIL, 0x02C                  # allowed but left to the hooks,
         .set    CB_SELF, 0x030                  # the current application's own,
         .set    CB_SKIPPED, 0x034               # dropped
+        .set    CB_APPLZONE, 0x038              # ApplZone (low memory 0x2AA),
+                                                # physical, or 0
         .set    CB_PAGES, 0x100                 # owner table pages, physical
                                                 # (128 of them: 2 GB)
         .set    CB_RING, 0x300                  # RING_N events of 32 bytes
@@ -232,7 +234,11 @@ cpup_keep_writable:
 #
 # A store by an application's code into a page that is not its own is an
 # offense. In MODE_ENFORCE, an offense into another application's page is
-# decided by who is current (CB_CURRENT):
+# decided by who is current (CB_CURRENT). The kernel finds that out at each
+# store: the owner of the page ApplZone points into, read through
+# CB_APPLZONE, since the Process Manager sets ApplZone on every switch. (The
+# engine sees a switch only on its next tick.) Without CB_APPLZONE, the
+# engine's value stands.
 # - into the current application's page: allowed and marked. The code can
 #   be another application's that the current one called (a Gestalt
 #   function or a callback in that application's partition), storing its
@@ -303,7 +309,19 @@ tw_base:
         bne     fault                           # the blue task: its hooks
         b       open                            # another task: allowed
 
-check:  mr      8, 27                           # the page's owner
+check:  lwz     9, CB_APPLZONE(31)              # who is current: the owner
+        cmpwi   9, 0                            # of ApplZone's page
+        beq     2f
+        lhz     8, 0(9)                         # ApplZone is 2-byte aligned
+        lhz     9, 2(9)
+        rlwimi  9, 8, 16, 0, 15
+        mr      8, 9
+        bl      owner_of
+        cmplwi  8, OWNER_APP
+        bge     1f
+        li      8, 0                            # not an application's
+1:      stw     8, CB_CURRENT(31)
+2:      mr      8, 27                           # the page's owner
         bl      owner_of
         mr.     18, 8
         beq     fault                           # not the engine's page

@@ -23,6 +23,9 @@
 # the fault on to the Exception Manager. A recorded store to the page in the
 # word at D_KDENY (the page the kernel's owner check denied, common/kcb.h)
 # is denied in the same way, whatever its address, and the word cleared.
+# While ApplZone is outside [cur_lo, cur_hi) (the engine has not seen a
+# switch yet), nothing is the current application's: every store is
+# recorded, and only the kernel's denial denies.
 #
 # Entry state: as for h68k.s, with the NCB in r3 and NCB+0x54 (the
 # Exception Manager's TVector) in r4. Fault details in the NCB: +0x40 flags
@@ -119,16 +122,31 @@ hnat_start:
         beq     not_ours
 
 handle:
+        # The current range moves on the engine's tick, up to 16 ms after a
+        # switch. While ApplZone is outside it, it is the previous
+        # application's: nothing is the current application's, and only
+        # the kernel's denial (D_KDENY) denies.
+        lhz     5,0x2AA(0)              # ApplZone
+        lhz     6,0x2AC(0)
+        rlwimi  6,5,16,0,15
         lwz     5,D_CUR_LO(4)
+        cmplw   6,5
+        blt     stale
+        lwz     0,D_CUR_HI(4)
+        cmplw   6,0
+        bge     stale
         cmplw   7,5
         blt     record
-        lwz     5,D_CUR_HI(4)
-        cmplw   7,5
+        cmplw   7,0
         bge     record
         lwz     5,D_COUNT_SELF(4)
         addi    5,5,1
         stw     5,D_COUNT_SELF(4)
         b       open
+
+stale:
+        crxor   APPCODE,APPCODE,APPCODE
+        b       app_known
 
 record:
         # Deny rule: is the faulting PC inside the current range? The answer

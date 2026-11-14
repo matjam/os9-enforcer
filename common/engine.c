@@ -297,7 +297,7 @@ static void set_current(State *s, int i)
     }
     hook_set_current(s->h68k, lo, hi);
     hook_set_current(s->hnat, lo, hi);
-    if (s->kcb)
+    if (s->kcb && !s->kcb->applzone) /* else the kernel finds it itself */
         s->kcb->current = i >= 0 ? owner_code(s, i) : kOwnerNone;
     s->cur = i;
 }
@@ -826,6 +826,36 @@ void engine_set_sys(State *s, int on)
 }
 
 /* Take the stores a ring holds with seq in (seen, handled]. */
+/* Whether a hook's store came from the code of the application current at
+   the store (the event's zone). The hooks mark it (kHookAppCode) from
+   their current range, which moves on the timer's tick: up to 16 ms after
+   a switch they cannot, and only the kernel's denial stops the writer.
+   The event's zone is always right. The hooks know only the partition:
+   native code outside it (engine.h, kCodeOwned) is the application's too,
+   also when the application has quit since (Domain.dropped). */
+static int event_app_code(State *s, int src, volatile HookEvent *e)
+{
+    if (e->pc & kHookAppCode)
+        return 1;
+    int w = domain_of_zone_any(s, e->zone);
+    if (w < 0)
+        return 0;
+    const Domain *wd = &s->domains[w];
+    unsigned long pc = e->pc & ~3UL;
+    if (src == kSrc68k) {
+        /* The emulator's code that fills a call frame is not the
+           application's, although r24 then points at its trap. */
+        unsigned long frame = s->h68k->frame;
+        if (frame && pc - frame < kHookFrameLen)
+            return 0;
+        pc = hook_next_pc(e->r24);
+    }
+    if (pc >= wd->location && pc - wd->location < wd->size)
+        return 1;
+    return src != kSrc68k && (wd->code_state == kCodeOwned || !wd->live) &&
+           pc >= wd->code_lo && pc < wd->code_hi;
+}
+
 static void drain(State *s, int src, volatile HookEvent *ring, unsigned long n,
                   unsigned long handled)
 {
@@ -848,17 +878,7 @@ static void drain(State *s, int src, volatile HookEvent *ring, unsigned long n,
             sys_trapped(s, src, e, addr);
             continue;
         }
-        int app = (e->pc & kHookAppCode) != 0;
-        /* The hooks know only the partition: native code outside it
-           (engine.h, kCodeOwned) is the application's too, also when the
-           application has quit since (Domain.dropped). */
-        if (!app && src != kSrc68k) {
-            int w = domain_of_zone_any(s, zone);
-            unsigned long pc = e->pc & ~3UL;
-            const Domain *wd = w >= 0 ? &s->domains[w] : 0;
-            app = wd && (wd->code_state == kCodeOwned || !wd->live) &&
-                  pc >= wd->code_lo && pc < wd->code_hi;
-        }
+        int app = event_app_code(s, src, e);
         int t = domain_at(s, addr);
         if (t < 0 || t == s->sys_dom) {
             s->c.outside++;
@@ -1136,8 +1156,13 @@ static long handler(ExceptionInfo *e)
         !hook_bit(s->bitmap, kSpanLo, mi->theAddress))
         return g_prev ? g_prev(e) : -1;
     unsigned long addr = mi->theAddress, pc = e->machineState->PC.lo;
-    int app = pc >= s->hnat->cur_lo && pc < s->hnat->cur_hi;
-    if (!app && s->cur >= 0) {
+    /* The current range moves on the timer's tick: up to 16 ms after a
+       switch it is still the previous application's, and then says
+       nothing about this store. */
+    unsigned long zone = current_zone();
+    int fresh = zone >= s->hnat->cur_lo && zone < s->hnat->cur_hi;
+    int app = fresh && pc >= s->hnat->cur_lo && pc < s->hnat->cur_hi;
+    if (fresh && !app && s->cur >= 0) {
         Domain *cd = &s->domains[s->cur];
         app = cd->code_state == kCodeOwned && pc >= cd->code_lo &&
               pc < cd->code_hi;
@@ -1168,6 +1193,7 @@ static long handler(ExceptionInfo *e)
     ev->pc = pc | (app ? kHookAppCode : 0);
     ev->addr = addr;
     ev->r24 = 0;
+    ev->zone = zone;
     ev->lr = e->machineState->LR.lo;
     ev->zone = current_zone();
     ev->r4 = 0;
@@ -2260,6 +2286,28 @@ void engine_set_mode(State *s, unsigned long mode)
    stops without cleaning up, and register the block. On any failure the
    engine runs on its hooks alone, with the reason in kcb_err. Call with
    no domain marked yet. */
+/* The low-memory global ApplZone, which the Process Manager sets on every
+   switch. */
+static void *applzone_ptr(void)
+{
+    return (void *)hook_ptr(0x2AA);
+}
+
+/* ApplZone's physical address, for the kernel to find the current
+   application at each store it decides, or 0: the kernel then uses
+   KernelCB.current as the engine sets it on its tick. Low memory never
+   moves or pages out, but with virtual memory on GetPhysical translates
+   only locked memory (notLockedErr); kcb_stop unlocks it. */
+static unsigned long applzone_physical(State *s)
+{
+    if (s->vm && LockMemory(applzone_ptr(), 4))
+        return 0;
+    unsigned long p = kcb_physical(applzone_ptr(), 4);
+    if (!p && s->vm)
+        UnlockMemory(applzone_ptr(), 4);
+    return p;
+}
+
 static void kcb_start(State *s)
 {
     /* One byte per page of logical RAM, inside the bitmap's span; a table
@@ -2312,6 +2360,7 @@ static void kcb_start(State *s)
     k->mode = kKcbPass;
     k->entries = entries;
     k->frame = s->h68k->frame;
+    k->applzone = applzone_physical(s);
     err = kcb_register(phys);
     if (err)
         goto unlock;
@@ -2329,6 +2378,8 @@ unlock:
     if (s->vm) {
         UnlockMemory(k, kKcbSize);
         UnlockMemory(t, tsize);
+        if (k->applzone)
+            UnlockMemory(applzone_ptr(), 4);
     }
 fail:
     if (kraw)
@@ -2350,6 +2401,8 @@ static void kcb_stop(State *s)
     if (s->vm) {
         UnlockMemory(s->kcb, kKcbSize);
         UnlockMemory(s->owners, s->owners_size);
+        if (s->kcb->applzone)
+            UnlockMemory(applzone_ptr(), 4);
     }
     s->kcb = 0;
     s->owners = 0;

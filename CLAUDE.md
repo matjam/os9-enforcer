@@ -125,6 +125,7 @@ allowed store changes nothing.
 | `Y` | an MP task into the Finder | dropped by the kernel, Scribble goes on |
 | `V` | a Time Manager task into a background-only application, 5 s later; make the Finder current | dropped by the kernel |
 | `D` | a deferred task into the Finder, Scribble current | skipped by the engine, Scribble goes on |
+| `W` | native code into the Finder right after a switch back, while the engine still has another process current | denied, Scribble stopped cleanly |
 | `X` | make the Enforcer Extension call `ExitToShell` without `engine_stop` | engine stops itself, control block unregistered |
 
 `Y`, `V` and `D` flip the word, read it back and restore it, and print
@@ -159,7 +160,7 @@ window: log, deny, log the system heap, deny with the system heap logged.
 - Patch 4, the owner check: the engine registers a control block (16 KB,
   physically contiguous) and an owner table (one byte per 4 KB page, up to
   128 table pages: 2 GB) with MP call 109, which the stock kernel leaves
-  unused (it returns −4 there). The kernel takes only `CB_VERSION` 2 and
+  unused (it returns −4 there). The kernel takes only `CB_VERSION` 3 and
   returns paramErr for another, so a mismatched extension and kernel
   protect nothing. Owner bytes: 0 none, 1 the system heap, 3 + slot for an
   application's domain.
@@ -194,11 +195,20 @@ window: log, deny, log the system heap, deny with the system heap logged.
   protects the previous application's pages at once.
 - Current is the Process Manager's current process (`ApplZone`), the one
   whose code runs in the blue task between `WaitNextEvent` calls, in the
-  foreground or the background. `check_switch` reads it on each tick.
-  The new current application's pages are not opened at the switch: its
-  first store into each page faults, the kernel allows it, and the page
-  stays open (`kernel_event` protects again only pages outside the
-  current domain) until the application is switched out.
+  foreground or the background.
+  - The kernel reads `ApplZone` at each store it decides, through its
+    physical address in `CB_APPLZONE` (`applzone_physical`; with virtual
+    memory on, `GetPhysical` needs low memory locked), and stores the
+    owner of the page it points into in `CB_CURRENT`.
+  - The engine reads it on each tick (`check_switch`) to protect the
+    previous application's pages and move the hooks' current range. While
+    `ApplZone` is outside that range, the hooks count nothing as the
+    current application's, and the engine decides from each event's
+    zone (`event_app_code`).
+  - The new current application's pages are not opened at the switch:
+    its first store into each page faults, the kernel allows it, and the
+    page stays open (`kernel_event` protects again only pages outside the
+    current domain) until the application is switched out.
 - The span is 2 GB (`kSpanHi`): with 1.5 GB of RAM the Process Manager
   places applications at about 0x5E000000, from the top of RAM down. The
   owner table covers logical RAM, plus 256 MB with virtual memory on.
@@ -329,13 +339,12 @@ Worst first. Keep in step with Limits in `README.md`.
    engine's stub while that application is current.
 10. With virtual memory on, a protect can be lost to `setPTEntryGivenPage`
     until the engine protects the page again.
-11. The engine sees a switch on its timer's tick (`check_switch` reads
-    `ApplZone`), so for up to 16 ms after a switch `CB_CURRENT` still
-    names the previous application:
-    - a store by the previous application's code into the new current one
-      is denied and the new one stopped. Possible; not observed;
-    - a store by the new application's code into the previous one is
-      allowed, and the previous one's open pages take it without a fault.
+11. The engine protects the previous application's pages on its timer's
+    tick, so for up to 16 ms after a switch the pages that application
+    had open take a store by the new application without a fault. (Who
+    is current is right at once: the kernel reads `ApplZone` at each
+    store, and the hooks ignore their current range while `ApplZone` is
+    outside it. Scribble `W` tests that.)
 12. `engine_stop` puts back the Exception Manager's system-wide handler
     without checking that it is still Enforcer's. A handler installed
     after Enforcer's is dropped.
@@ -433,7 +442,7 @@ To check which kernel is running, dump it and compare it with the build
 (`build.sh` prints its size):
 
 ```bash
-../os9-protect/tools/qmp.py raw '{"execute":"pmemsave","arguments":{"val":15794176,"size":106480,"filename":"/tmp/nk-live.bin"}}'
+../os9-protect/tools/qmp.py raw '{"execute":"pmemsave","arguments":{"val":15794176,"size":106636,"filename":"/tmp/nk-live.bin"}}'
 ```
 
 ```bash

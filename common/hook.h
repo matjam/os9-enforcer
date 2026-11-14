@@ -9,6 +9,11 @@
  * its sequence number). Faults it does not handle go on to the original
  * handler and are counted in count_passed, with the last one in passed.
  *
+ * The engine moves [cur_lo, cur_hi) on its tick, up to 16 ms after a
+ * switch. While ApplZone is outside it, the range is the previous
+ * application's: no write is counted as self, and no code is the current
+ * application's, so only the kernel's denial (kdeny) denies.
+ *
  * Deny rule: a recorded store whose code lies inside [cur_lo, cur_hi) is
  * the current application's own code writing outside its memory. The hook
  * sets kHookAppCode in the event's pc. When the fault address is at or
@@ -96,7 +101,8 @@ typedef struct {
        A recorded store to that page is denied whatever its address, and
        the word cleared. */
     volatile unsigned long *kdeny;
-    unsigned long reserved[4];
+    unsigned long zone;          /* h68k: ApplZone at the fault it handles */
+    unsigned long reserved[3];
 } HookData;
 
 _Static_assert(sizeof(HookEvent) == 32, "ring entry size");
@@ -113,6 +119,7 @@ _Static_assert(offsetof(HookData, denied) == 0x90, "D_DENIED");
 _Static_assert(offsetof(HookData, stop) == 0xA4, "D_STOP");
 _Static_assert(offsetof(HookData, frame) == 0xA8, "D_FRAME");
 _Static_assert(offsetof(HookData, kdeny) == 0xAC, "D_KDENY");
+_Static_assert(offsetof(HookData, zone) == 0xB0, "D_ZONE");
 _Static_assert(sizeof(HookData) == 0xC0, "data block size");
 
 /* A pointer to a fixed address. The empty asm hides the constant from GCC,

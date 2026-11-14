@@ -27,7 +27,8 @@
 
 enum {
     kKcbMagic = 'ENFK',
-    kKcbVersion = 2,          /* 1: 64 table pages and 496 events */
+    kKcbVersion = 3,          /* 2: no applzone; 1: 64 table pages and
+                                 496 events */
     kKcbSize = 0x4000,
     kKcbRing = 488,
     kKcbTablePages = 128,     /* 128 pages of 4096 entries: 2 GB */
@@ -72,14 +73,21 @@ static inline unsigned kev_flags(unsigned long info) { return info & 0xFF; }
 typedef struct {
     unsigned long magic, version;
     volatile unsigned long mode;
-    volatile unsigned long current;     /* owner byte of the current app, or 0 */
+    /* Owner byte of the current application, or 0. With applzone set, the
+       kernel writes it at each store it decides; without, the engine does
+       on its tick. */
+    volatile unsigned long current;
     unsigned long entries;              /* pages the owner table covers */
     volatile unsigned long denied_page; /* the hooks clear it when they deny */
     volatile unsigned long seq;         /* events recorded */
     unsigned long frame;                /* the emulator's frame code, or 0 */
     volatile unsigned long allowed, logged, denied, bail, self;
     volatile unsigned long skipped; /* 0 with a kernel that never skips */
-    unsigned long reserved[50];
+    /* The physical address of ApplZone (low memory 0x2AA), or 0. The
+       kernel reads it at each store to find the current application: the
+       owner of the page ApplZone points into. */
+    unsigned long applzone;
+    unsigned long reserved[49];
     unsigned long pages[kKcbTablePages]; /* physical */
     KEvent ring[kKcbRing];              /* event n at (n - 1) % kKcbRing */
 } KernelCB;
@@ -87,6 +95,7 @@ typedef struct {
 _Static_assert(offsetof(KernelCB, frame) == 0x1C, "CB_FRAME");
 _Static_assert(offsetof(KernelCB, self) == 0x30, "CB_SELF");
 _Static_assert(offsetof(KernelCB, skipped) == 0x34, "CB_SKIPPED");
+_Static_assert(offsetof(KernelCB, applzone) == 0x38, "CB_APPLZONE");
 _Static_assert(offsetof(KernelCB, pages) == 0x100, "CB_PAGES");
 _Static_assert(offsetof(KernelCB, ring) == 0x300, "CB_RING");
 _Static_assert(sizeof(KEvent) == 32, "event size");

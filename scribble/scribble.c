@@ -52,6 +52,11 @@
  *   X  send the Enforcer Extension the Apple event that makes it call
  *      ExitToShell without stopping the engine, as a crash ends it. The
  *      engine must stop itself; the Mac must keep running.
+ *
+ *   W  a native store into the Finder's memory right after a switch back
+ *      to this application, while the engine still has another process as
+ *      current (it sees switches on its tick): the patched kernel finds
+ *      out who is current itself, so Enforcer stops this application.
  */
 
 #include <stdio.h>
@@ -443,9 +448,9 @@ int main(void)
                "heap, s/S native/68k store into the system heap, t time "
                "traps, m temporary memory, M 1 MB of it, T store into "
                "another application's, P page 600 MB, Y from an MP task, "
-               "V from a Time Manager task, D from a deferred task, X make "
-               "the Enforcer Extension quit as in a crash, q quit; then "
-               "Return\n");
+               "V from a Time Manager task, D from a deferred task, W "
+               "right after a switch, X make the Enforcer Extension quit "
+               "as in a crash, q quit; then Return\n");
         int ch = getchar();
         while (ch != '\n' && getchar() != '\n')
             ;
@@ -492,6 +497,32 @@ int main(void)
             tf_armed = 1;
             printf("in 5 seconds, a store into %s at %08lX: make the "
                    "Finder current now\n", name, (unsigned long)t);
+            continue;
+        }
+        case 'W': {
+            State *s = engine_state();
+            if (!s) {
+                printf("Enforcer is not running\n");
+                continue;
+            }
+            unsigned long mine = (unsigned long)ApplicationZone();
+            int tries = 0;
+            while (tries < 1000) {
+                tries++;
+                EventRecord ev;
+                WaitNextEvent(0, &ev, 1, NULL); /* let others run */
+                unsigned long behind = s->cur_zone;
+                if (behind != mine) {
+                    unsigned long w = *target;
+                    *target = w;
+                    printf("stored %08lX to %08lX after a switch, try %d; "
+                           "the engine had zone %08lX current\n", w,
+                           (unsigned long)target, tries, behind);
+                    break;
+                }
+            }
+            if (tries == 1000)
+                printf("the engine was never behind\n");
             continue;
         }
         case 'X': {
