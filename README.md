@@ -185,3 +185,8 @@ kernel work.
 | `probe/` | Probe: the first page protection experiment |
 | `toolchain/` | Retro68 (a submodule) and the scripts that build and find its toolchain |
 | `tools/` | Host scripts: read the engine's state and the guest's memory, build helpers |
+
+## License
+
+Enforcer is under the MIT License; see `LICENSE`. Retro68, in
+`toolchain/Retro68`, has its own licenses.
