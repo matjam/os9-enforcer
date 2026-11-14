@@ -373,8 +373,21 @@ serialized, and applications run in parallel only outside it.
    extension.
    - The owner table and the control block are read-only to Mac OS; the
      engine changes owners through kernel calls.
-   - The kernel protects the previous application's pages at the switch,
-     not the engine on its tick.
+   - Measure what a switch costs, and scope per-application VSIDs in the
+     kernel (building and removing page-table entries, address spaces).
+     Today `protect_domain` re-protects the previous application's whole
+     partition at each switch, and `MPSetAreaAccess` walks it page by
+     page: the cost grows with the partition, and forced yields add
+     switches.
+   - Per-application VSIDs. Each application gets its own segment IDs for
+     the segments that hold application memory; the kernel builds a
+     page-table entry writable when the owner table gives the page to
+     that space's application, read-only otherwise. A switch loads the
+     segment registers: no per-page work, no first-write faults on the
+     application's own pages, nothing left open after a switch, and an
+     allowed store opens the page in one space only. Needs a hook at the
+     Process Manager's switch, and probably the kernel built from the
+     reconstructed source.
 2. Preemption at safe points, native code. On its tick the kernel checks
    whether the current application has run past its time slice with
    only its own code on the stack (no Toolbox call in progress), and if
@@ -394,9 +407,8 @@ serialized, and applications run in parallel only outside it.
 4. Research, after measuring how long applications stay inside Toolbox
    calls: an explicit lock, our own context switch, applications as
    scheduled tasks. The user has a plan for I/O waits, to discuss first.
-5. Optional: per-application VSIDs (the kernel built from the
-   reconstructed source), and owner bytes for third-party extensions so
-   writes by them are named and can be limited.
+5. Optional: owner bytes for third-party extensions, so writes by them
+   are named and can be limited.
 
 Real hardware testing matters more with each kernel change, a
 dual-processor G4 above all.
