@@ -119,6 +119,8 @@ allowed store changes nothing.
 | `o` | into its own heap | allowed |
 | `s`, `S` | native, 68k into the system heap | logged, allowed |
 | `t` | time 2 s of trapped writes | prints the cost of one trap |
+| `L` | keep 64 MB of temporary memory, every page written | in a chunk of Scribble's |
+| `R` | after `L`: time one write into each of its pages right after a switch back, then again | prints the cost of the faults |
 | `m`, `M` | 64 KB kept, 1 MB freed, of temporary memory | in Scribble's own chunks |
 | `T` | native code into the Finder's temporary memory | denied, Scribble stopped |
 | `P` | write and read back 600 MB of temporary memory | pages out other applications (VM on) |
@@ -396,7 +398,10 @@ serialized, and applications run in parallel only outside it.
      Today `protect_domain` re-protects the previous application's whole
      partition at each switch, and `MPSetAreaAccess` walks it page by
      page: the cost grows with the partition, and forced yields add
-     switches.
+     switches. Measured (2026-11-14, see "Switch cost" below): the cost
+     follows the pages an application writes between switches, about
+     13 µs a page in QEMU, so a 64 MB working set costs about a quarter
+     of a second at every switch.
    - Per-application VSIDs. Each application gets its own segment IDs for
      the segments that hold application memory; the kernel builds a
      page-table entry writable when the owner table gives the page to
@@ -430,6 +435,37 @@ serialized, and applications run in parallel only outside it.
 
 Real hardware testing matters more with each kernel change, a
 dual-processor G4 above all.
+
+### Switch cost
+
+Measured on 2026-11-14 in QEMU (TCG, so a real Mac's numbers differ, but
+the shape holds). The engine times `protect_domain` at each switch
+(`Counters.switch_tb`, `switch_tb_max`, `switch_pages`; `xlog-read.py`
+prints a `switch:` line); Scribble `t`, `L` and `R` time the faults.
+
+| | VM off | VM on |
+|---|---|---|
+| Switches a second, idle (background-only applications' null events) | 2.5 | 4.5 |
+| Re-protecting at a switch, small applications only | 65 µs, 236 pages | 71 µs, 256 pages |
+| Re-protecting, a page not written since the last switch | 0.08 µs | 0.08 µs |
+| Re-protecting, a page written since the last switch | about 3-5 µs | about 3 µs |
+| Longest switch, after Scribble wrote 64 MB | 78 ms | 48 ms |
+| A write fault the kernel allows (`t`, with the engine's re-protect) | 16 µs | 45 µs |
+| First write into each of 16,384 own pages after a switch back (`R`) | 171 ms (10 µs a page) | 182 ms (11 µs a page) |
+| The same writes with no fault | 2.7 ms | 2.7 ms |
+| First writes into own pages a switch, idle | 1.7 | 2.6 |
+
+What it means:
+- Idle with small applications the cost is about 0.1% of the time.
+- The cost follows the pages an application writes between switches:
+  each costs a fault after the switch in and a PTE change and `tlbie`
+  at the switch out, about 13 µs together. An application that writes
+  64 MB between `WaitNextEvent` calls pays about a quarter of a second
+  at every switch. Preemption with 10-20 ms slices is not possible on
+  this design.
+- Per-application VSIDs remove both parts: a switch loads segment
+  registers, the application's own page-table entries stay valid in its
+  space, and nothing is re-protected.
 
 ## Installer (`installer/`)
 

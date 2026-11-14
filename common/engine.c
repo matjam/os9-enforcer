@@ -365,6 +365,43 @@ static void sweep(State *s)
     }
 }
 
+static unsigned long timebase(void)
+{
+    unsigned long t;
+    __asm__ volatile("mftb %0" : "=r"(t));
+    return t;
+}
+
+/* In InterfaceLib, not in the Multiversal Interfaces. */
+typedef struct {
+    unsigned long hi, lo;
+} MicroTime;
+extern pascal void Microseconds(MicroTime *t);
+
+/* Timebase ticks in a millisecond, over a 10 ms spin. Task level only. */
+static unsigned long timebase_per_ms(void)
+{
+    MicroTime a, b;
+    Microseconds(&a);
+    unsigned long t0 = timebase();
+    do
+        Microseconds(&b);
+    while (b.lo - a.lo < 10000);
+    return (timebase() - t0) / ((b.lo - a.lo) / 1000);
+}
+
+/* The whole pages of domain i: its partition and its chunks. */
+static unsigned long domain_pages(State *s, int i)
+{
+    unsigned long n = (s->domains[i].hi - s->domains[i].lo) >> 12;
+    for (int j = 0; j < kMaxChunks; j++) {
+        Chunk *c = &s->chunks[j];
+        if (c->live && c->domain == i)
+            n += (c->hi - c->lo) >> 12;
+    }
+    return n;
+}
+
 /* On a process switch, protect the previous application's domain. */
 static void check_switch(State *s)
 {
@@ -380,8 +417,16 @@ static void check_switch(State *s)
     int old = s->cur;
     set_current(s, d);
     s->c.switches++;
-    if (old >= 0)
+    if (old >= 0) {
+        unsigned long t = timebase();
         protect_domain(s, old);
+        t = timebase() - t;
+        s->c.switch_tb += t;
+        if (t > s->c.switch_tb_max)
+            s->c.switch_tb_max = t;
+        if (old != s->sys_dom)
+            s->c.switch_pages += domain_pages(s, old);
+    }
 }
 
 static void writer_name(State *s, unsigned long zone, char out[16])
@@ -2525,6 +2570,7 @@ long engine_start(State **out, unsigned long mode, const char *name)
                 (vm & gestaltVMPresent);
     }
     kcb_start(s);
+    s->c.tb_per_ms = timebase_per_ms();
     {
         /* The Process Manager's zone, from a handle of its own. */
         OSErr e = noErr;

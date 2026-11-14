@@ -26,6 +26,11 @@
  *      (README, step 4);
  *   M  allocate 1 MB of temporary memory and dispose of it: its chunk is
  *      freed;
+ *   L  allocate 64 MB of temporary memory, write every page and keep it:
+ *      for measuring what a switch costs with a large application;
+ *   R  after a switch out and back, time one write into each page of L's
+ *      block (each one faults: the engine protected them at the switch),
+ *      then the same writes again;
  *   T  a native store into another application's temporary memory chunk
  *      (the Finder's if it has one): Enforcer denies it;
  *   P  write and read back up to 600 MB of temporary memory, then dispose
@@ -217,8 +222,16 @@ static volatile HookData *hnat_data_ptr(void)
 
 /* The native hook's count of exceptions it has seen (HookData.count_all),
    or 0 if it is not installed. */
+static State *engine_state(void);
+
+/* Write faults taken so far: by the kernel's owner check when its block is
+   registered (it decides first, and the hooks then see none), else by the
+   native hook. */
 static unsigned long hnat_count(void)
 {
+    State *s = engine_state();
+    if (s && s->kcb)
+        return s->kcb->allowed + s->kcb->logged + s->kcb->self;
     volatile HookData *d = hnat_data_ptr();
     return d ? d->count_all : 0;
 }
@@ -447,11 +460,13 @@ int main(void)
     volatile unsigned long *sys = sys_target();
     printf("system heap target %08lX\n", (unsigned long)sys);
     static TimerFlip tf;
+    Handle big = 0; /* L's block */
     int tf_armed = 0;
     for (;;) {
         printf("\nn native store, 6 68k store, b BlockMoveData, o own "
                "heap, s/S native/68k store into the system heap, t time "
-               "traps, m temporary memory, M 1 MB of it, T store into "
+               "traps, m temporary memory, M 1 MB of it, L keep 64 MB of "
+               "it, R time writing it after a switch, T store into "
                "another application's, P page 600 MB, Y from an MP task, "
                "V from a Time Manager task, D from a deferred task, W "
                "right after a switch, K into the control block and the "
@@ -648,6 +663,55 @@ int main(void)
         case 't':
             bench(loc, size);
             continue;
+        case 'L': {
+            /* 64 MB more temporary memory, every page written, kept: the
+               engine then re-protects that many more pages each time this
+               application is switched out. */
+            OSErr err = 0;
+            Handle h = TempNewHandle(64UL << 20, &err);
+            if (!h) {
+                printf("TempNewHandle of 64 MB failed: %d\n", err);
+                continue;
+            }
+            HLock(h);
+            for (unsigned long o = 0; o < (64UL << 20); o += 4096)
+                (*h)[o] = 1;
+            printf("64 MB of temporary memory at %08lX, kept%s\n",
+                   (unsigned long)*h, in_chunk(h) ? ", in a chunk" : "");
+            big = h;
+            continue;
+        }
+        case 'R': {
+            /* After a switch out and back, the engine has protected every
+               page again: time one write into each page of L's block
+               (each faults), then the same writes again (none do). */
+            State *s = engine_state();
+            if (!s || !big) {
+                printf("needs Enforcer running and L first\n");
+                continue;
+            }
+            unsigned long n = s->c.switches, mine =
+                (unsigned long)ApplicationZone();
+            EventRecord ev;
+            int tries = 0;
+            while ((s->c.switches == n || s->cur_zone != mine) &&
+                   tries++ < 1000)
+                WaitNextEvent(0, &ev, 1, NULL);
+            volatile char *p = (volatile char *)*big;
+            unsigned long pages = (64UL << 20) / 4096;
+            unsigned long long t0 = micros();
+            for (unsigned long i = 0; i < pages; i++)
+                p[i * 4096] = 2;
+            unsigned long long t1 = micros();
+            for (unsigned long i = 0; i < pages; i++)
+                p[i * 4096] = 3;
+            unsigned long long t2 = micros();
+            printf("%lu pages after a switch: first writes %lu us, again "
+                   "%lu us: %.1f us a page in faults\n", pages,
+                   (unsigned long)(t1 - t0), (unsigned long)(t2 - t1),
+                   (double)((t1 - t0) - (t2 - t1)) / pages);
+            continue;
+        }
         case 'm': {
             /* For finding how the Process Manager records an
                application's temporary memory: a 64 KB block, kept, filled

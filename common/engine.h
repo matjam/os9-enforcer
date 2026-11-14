@@ -388,6 +388,10 @@ typedef struct {
     unsigned long dropped, nwriters;
     unsigned long info_errors; /* GetProcessInformation failures */
     unsigned long app_code[kSources]; /* offenses, by where caught */
+    /* What protecting the previous application's pages at a switch costs:
+       the pages, and the time in timebase ticks (tb_per_ms of them a
+       millisecond). */
+    unsigned long switch_pages, switch_tb, switch_tb_max, tb_per_ms;
 } Counters;
 
 /* In the system heap, so it outlives a program that stops without

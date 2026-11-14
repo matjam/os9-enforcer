@@ -61,7 +61,8 @@ COUNTERS = (["own_" + s for s in SOURCES] + ["cross_" + s for s in SOURCES] +
             ["lost_" + s for s in SOURCES] +
             ["outside", "switches", "timer_runs", "kernel_errors",
              "refreshes", "added", "removed", "dropped", "nwriters",
-             "info_errors"] + ["app_code_" + s for s in SOURCES])
+             "info_errors"] + ["app_code_" + s for s in SOURCES] +
+            ["switch_pages", "switch_tb", "switch_tb_max", "tb_per_ms"])
 DOMAIN_SIZE, WRITER_SIZE, OFFENSE_SIZE = 84, 64, 56
 CODE_STATES = ["not looked for", "in the partition", "owned", "failed"]
 SRC_MASK, APP_CODE = 0xFF, 0x100
@@ -222,6 +223,14 @@ def main():
                               w(o + 16), w(o + 20)))
     c = {n: w(h["off_counters"] + 4 * i) for i, n in enumerate(COUNTERS)}
     print(", ".join("%s %d" % (n, c[n]) for n in COUNTERS))
+    if c["switches"] and c["tb_per_ms"]:
+        us = 1000.0 / c["tb_per_ms"]
+        print("switch: %.0f us and %.0f pages protected a switch, %.2f us a "
+              "page, longest %.0f us" % (
+                  c["switch_tb"] * us / c["switches"],
+                  c["switch_pages"] / c["switches"],
+                  c["switch_tb"] * us / max(c["switch_pages"], 1),
+                  c["switch_tb_max"] * us))
     if stopper:
         print("clean stop at %08X (stub %08X, bus error vector was %08X): "
               "zone %08X, stops native %d, 68k %d" % (
