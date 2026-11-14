@@ -40,12 +40,20 @@ The submodule is pinned to the commit os9-protect's toolchain was built
 from (a4a389c41). To move it, check out the new commit in
 `toolchain/Retro68`, commit the submodule, and rebuild both toolchains.
 
-The two toolchains do not build byte-identical programs. The extension
-and the control panel come out the same, but in the installer newlib's
-`dtoa` read-only data is 64 bytes longer with the `toolchain/build.sh`
-toolchain, which moves the data after it. The installer built that way
-was checked in the guest: it reads the Mac OS ROM file and recognizes the
-installed kernel.
+Toolchains built on different hosts do not build byte-identical
+programs; our own code comes out the same, the C library linked in does
+not:
+- `toolchain/build.sh` on macOS: the extension and the control panel
+  match os9-protect's build. In the installer, newlib's `dtoa` read-only
+  data is 64 bytes longer, which moves the data after it.
+- GitHub Actions (Linux): the resource forks match. Code differs only in
+  newlib's stdio and `_exit` at the end of each code section.
+Both builds were installed in the guest: the installer recognized the
+installed kernel, and the CI-built extension registered its control block
+and stopped Scribble's `n` store.
+
+The first CI run took 24 minutes to build the toolchain; the cached
+toolchain is 354 MB.
 
 `tools/make-dist.sh` puts the three programs users install, and an HFS
 image holding them, in `dist/`. `.github/workflows/build.yml` builds the
