@@ -9,7 +9,8 @@ learned on the way.
 - The test machine (QEMU), its disks and the tools that drive the guest
   are in `os9-protect`, next to this repository. Scripts here find it
   through `OS9_PROTECT` (default `../os9-protect`).
-- Commit each working step to `main`. There is no remote.
+- Commit each working step to `main`. The remote, `origin`, is the
+  private GitHub repository matjam/os9-enforcer.
 - Commit only our own sources, scripts and patches. Apple's files stay out
   of git: `kernel/stock/` and `kernel/build/` are ignored, and the
   installer carries only the bytes that differ from the stock kernel
