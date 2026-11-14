@@ -192,6 +192,13 @@ window: log, deny, log the system heap, deny with the system heap logged.
   memory chunks, and with virtual memory on its main code section. The
   engine protects every domain but the current one, and on a switch
   protects the previous application's pages at once.
+- Current is the Process Manager's current process (`ApplZone`), the one
+  whose code runs in the blue task between `WaitNextEvent` calls, in the
+  foreground or the background. `check_switch` reads it on each tick.
+  The new current application's pages are not opened at the switch: its
+  first store into each page faults, the kernel allows it, and the page
+  stays open (`kernel_event` protects again only pages outside the
+  current domain) until the application is switched out.
 - The span is 2 GB (`kSpanHi`): with 1.5 GB of RAM the Process Manager
   places applications at about 0x5E000000, from the top of RAM down. The
   owner table covers logical RAM, plus 256 MB with virtual memory on.
@@ -322,9 +329,13 @@ Worst first. Keep in step with Limits in `README.md`.
    engine's stub while that application is current.
 10. With virtual memory on, a protect can be lost to `setPTEntryGivenPage`
     until the engine protects the page again.
-11. `CB_CURRENT` changes on the timer's tick. For up to 16 ms after a
-    switch, a store by the previous application's code into the new
-    current one is denied and the new one stopped. Possible; not observed.
+11. The engine sees a switch on its timer's tick (`check_switch` reads
+    `ApplZone`), so for up to 16 ms after a switch `CB_CURRENT` still
+    names the previous application:
+    - a store by the previous application's code into the new current one
+      is denied and the new one stopped. Possible; not observed;
+    - a store by the new application's code into the previous one is
+      allowed, and the previous one's open pages take it without a fault.
 12. `engine_stop` puts back the Exception Manager's system-wide handler
     without checking that it is still Enforcer's. A handler installed
     after Enforcer's is dropped.

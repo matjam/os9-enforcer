@@ -100,6 +100,8 @@ Known holes:
   application is current, stops the application from inside the deferred
   task.
 - A write the kernel allows opens its page to every task for up to 16 ms.
+- For up to 16 ms after an application switch, a write by the new
+  application into the previous one's memory is allowed.
 - The partly used first and last pages of a partition are not protected.
 - With virtual memory on, code in an application's own shared libraries
   and plug-ins counts as the system's.
