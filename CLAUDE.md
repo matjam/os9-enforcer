@@ -361,6 +361,46 @@ leaks about 75 KB of system heap per start.
 Later, as an opt-in debug mode for one application: a protected page after
 each large block, to catch an overrun when it happens.
 
+## Roadmap
+
+Agreed on 2026-11-14. The aim is protection between applications first,
+then preemption, without making the Toolbox reentrant: it stays
+serialized, and applications run in parallel only outside it.
+
+1. Kernel hardening. The kernel takes Enforcer's mechanism; the policy,
+   and everything that needs the Toolbox (tracking processes, finding
+   code, temporary memory, notifications, preferences), stays in the
+   extension.
+   - The owner table and the control block are read-only to Mac OS; the
+     engine changes owners through kernel calls.
+   - The kernel protects the previous application's pages at the switch,
+     not the engine on its tick.
+2. Preemption at safe points, native code. On its tick the kernel checks
+   whether the current application has run past its time slice with
+   only its own code on the stack (no Toolbox call in progress), and if
+   so resumes it in a stub that calls `WaitNextEvent` with an empty mask
+   and then continues where it was. The Process Manager does the switch
+   and still picks who runs next.
+   - Toolbox calls that run their own event loop (`ModalDialog`) count
+     as safe, from an allow-list checked in the guest.
+   - Hang recovery: a clean quit at a safe point for an application that
+     stops yielding.
+   - A control panel setting, a per-application exclusion list, and a
+     Scribble command that loops without yielding.
+   - 68k code later, if the emulator's state allows it.
+3. Import interposition for native applications: wrappers on imports
+   from system libraries. Exact "on behalf of" attribution for Toolbox
+   writes, pointer checks, and the basis for an explicit Toolbox lock.
+4. Research, after measuring how long applications stay inside Toolbox
+   calls: an explicit lock, our own context switch, applications as
+   scheduled tasks. The user has a plan for I/O waits, to discuss first.
+5. Optional: per-application VSIDs (the kernel built from the
+   reconstructed source), and owner bytes for third-party extensions so
+   writes by them are named and can be limited.
+
+Real hardware testing matters more with each kernel change, a
+dual-processor G4 above all.
+
 ## Installer (`installer/`)
 
 - It accepts a Mac OS ROM file whose ROM image holds NanoKernel 2.28 as
