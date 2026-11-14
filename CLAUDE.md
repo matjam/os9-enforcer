@@ -393,8 +393,10 @@ serialized, and applications run in parallel only outside it.
    extension.
    - Done (2026-11-14): the owner table and the control block are
      read-only to Mac OS; the engine changes owners through kernel calls.
-   - Measure what a switch costs, and scope per-application VSIDs in the
-     kernel (building and removing page-table entries, address spaces).
+   - Done (2026-11-14, see "Switch cost" and "Per-application VSIDs:
+     what the kernel has" below): measure what a switch costs, and scope
+     per-application VSIDs in the kernel (building and removing
+     page-table entries, address spaces).
      Today `protect_domain` re-protects the previous application's whole
      partition at each switch, and `MPSetAreaAccess` walks it page by
      page: the cost grows with the partition, and forced yields add
@@ -466,6 +468,95 @@ What it means:
 - Per-application VSIDs remove both parts: a switch loads segment
   registers, the application's own page-table entries stay valid in its
   space, and nothing is re-protected.
+
+### Per-application VSIDs: what the kernel has
+
+Read on 2026-11-14 in the reconstructed source
+(`../os9-protect/refs/powermac-rom/NanoKernel/`, version 0x0228; three
+files are not UTF-8, so use `LC_ALL=C grep -a`) and checked against
+`kernel/stock/NanoKernel-v02.28.dis`. Offsets are kernel offsets.
+
+- **Address spaces exist.** `AddressSpace` ('SPAC', 0xC0 bytes) holds 16
+  segment register values at +0x30, its own BATs at +0x80 and its own
+  list of areas; +0x78 and +0x7C are unused. MP call 70 creates one
+  (`NKCreateAddressSpaceSub`, 0xF824): SR n = 0x20000000 | n << 20 |
+  counter, the counter one more per space (20 bits, never reused).
+  Spaces are never deleted (call 71 fails on the sentinel area every
+  space has), so keep a fixed pool.
+- **The blue task runs in the system space**, read in the guest: SRs
+  0x20000000, 0x20100000 … 0x20F00000 (VSID = segment << 20, user key 1,
+  supervisor key 0). The current space is `EWA.PA_CurAddressSpace`
+  (EWA − 0x1C; the EWA's physical address is in SPRG0).
+- **Switching.** `SchSwitchSpace` (0x13F78) loads SR0-15 from a space,
+  stores the current space and reloads the BATs that differ; no TLB
+  flush. The scheduler calls it only when a task's space differs from
+  the current one (0x14678). Call 119 sets a task's space, but only for
+  a stopped task; nothing changes a running task's space, and the blue
+  task never stops. The CPU plugin's SIGP path already switches the
+  CPU's space without changing the task's, so a kernel-side switch fits.
+- **Page tables are global.** Segment maps, PMDTs, the HTAB and the page
+  list entries (PLEs) for logical RAM (`FlatPageList`) are shared; only
+  the area lists are per space. Two spaces can share every PLE and
+  differ only in VSID, if area lookups (`FindAreaAbove`, 0x103EC) go to
+  one area list.
+- **PTE fill.** `PagingFunc1` (0x4C20) builds a PTE from the PLE: PP
+  comes only from PLE bits 0x2 and 0x4 (0x4D74-0x4DB0), so today
+  protection reaches the HTAB only through `MPSetAreaAccess` rewriting
+  PLEs. The hash uses the VSID from `mfsrin`.
+- **One PTE per page.** A PLE records exactly one HTAB slot (bit 0x800
+  and bits 0-19). On a miss whose PLE already says "in the HTAB",
+  `PagingFunc1` returns without building anything (0x4D88, 0x4FAC), so a
+  miss under a second VSID would loop forever. Eviction (`NKPaging.s`
+  395-417) panics unless the victim's PLE points at that slot, and
+  rebuilds the victim's address from VSID bits 0-3 (so VSID bits 0-3
+  must stay the segment number). R and C bits are merged into the PLE
+  on invalidation, and with VM on the pager trusts them.
+- **Segment granularity.** A VSID covers 256 MB. The RAM segments hold
+  low memory, the system heap, the Process Manager's heap and every
+  partition together, so per-application spaces get their own PTEs for
+  every RAM page, not only for application pages. Leave segments 6 and
+  up (kernel, emulator, I/O, ROM) on the system VSIDs.
+
+The smallest design that fits:
+1. An operation of call 109 that creates an application space: copy the
+   system space's SRs and BATs, give the RAM segments fresh VSIDs, store
+   the application's owner byte and the system space in +0x78/+0x7C.
+2. Area lookups for an application space go to the system space's list
+   (one patch at the entry of `FindAreaAbove`), and the area calls that
+   use the current space (create, alias, current space) use the system
+   space too.
+3. A switch operation: set the blue task's `AddressSpacePtr`, move the
+   task counts, call `SchSwitchSpace`.
+4. At PTE fill, PP 11 (read-only for every key: the kernel retries
+   stores in supervisor mode when the PLE allows it) when the page's
+   owner is an application other than the current space's.
+5. Keep one PTE per page: at 0x4D88 and 0x4FAC, when the recorded PTE
+   has another VSID, invalidate and delete it and build one for this
+   VSID. Every other site that trusts the PLE's one slot (the MP area
+   calls, the VM calls, eviction, R/C merging, our `open` path) then
+   stays right. The cost: the first access to a page after a switch,
+   reads too, is one HTAB miss handled in the kernel, which is cheaper
+   than today's protection fault plus re-protect; measure it.
+6. `MemRetryDSI` and `task_write` treat a page whose PTE is read-only by
+   owner as write-protected even when its PLE is writable.
+
+The switch hook. The Process Manager sets `ApplZone` on every switch. A
+QEMU watch on its physical address (`memwatch`, `lo=0x42AA,hi=0x42AE`)
+found these writers in a VM-off guest:
+- one native store, `stw r3, 0x2AA(0)`, ran 419 times in a few minutes
+  of switching: the switch (a `stw r29` to 0x2AA 0x1C bytes before it
+  ran 14 times). Its code fragment (136 KB of
+  code, no exports, imports such as `InitZone`, `MaxApplZone`,
+  `LMGetFinderName`, `PPCInit`, `WakeUpProcess`) is very likely the
+  Process Manager's. It loads at a different address each boot (0x0116F2A8
+  in one, 0x014CC638 in another, the same offset 0x10E08 into the code
+  section);
+- four more stores in the same fragment (launch, quit), a pair in another
+  native fragment, and about 100 stores by 68k code.
+To switch spaces at the right moment, patch the switch's store (found by
+the fragment's code bytes) with a branch to a stub that stores
+`ApplZone` and makes the switch call. The rarer writers can be caught
+lazily: the kernel already reads `ApplZone` at each store it decides.
 
 ## Installer (`installer/`)
 
