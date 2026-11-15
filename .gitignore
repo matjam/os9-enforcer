@@ -1,7 +1,7 @@
-# Only our own sources, scripts and patches are tracked. Retro68 is a
-# submodule (toolchain/Retro68); QEMU is fetched and built by qemu/build.sh;
-# the reference sources are cloned (CLAUDE.md, "Reference sources"); Apple's
-# software (the install image, the disk images) stays local.
+# Only our own sources, scripts and patches are tracked. Third-party sources
+# are submodules: Retro68 (toolchain/Retro68), QEMU (qemu/src, which
+# qemu/build.sh patches) and the reference sources (refs/). Apple's software
+# (the install image, the disk images) stays local.
 
 # Build output (./build.sh builds each program in PROGRAM/build,
 # toolchain/build.sh the toolchain in toolchain/build, qemu/build.sh QEMU in
@@ -20,13 +20,8 @@
 /disks/
 /media/
 /run/
-# qemu/build.sh downloads the release tarball and unpacks and patches it in
-# qemu/src.
-/qemu/src/
-/qemu/src.part/
-/qemu/*.tar.*
-# Reference sources and tbxi's Python environment.
-/refs/
+# tbxi's Python environment (CLAUDE.md, "Reference sources").
+/refs/tbxi-venv/
 
 __pycache__/
 

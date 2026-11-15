@@ -11,12 +11,12 @@
 # so they move whenever the image's compressed size changes. Mac OS then
 # loads garbage as code ("unimplemented trap" during startup). The type,
 # creator and Finder flags come from the stock file, kernel/stock/Mac OS
-# ROM (run kernel/extract.sh first). tbxi comes from os9-protect
-# (OS9_PROTECT, default ../os9-protect).
+# ROM (run kernel/extract.sh first). tbxi is refs/tbxi-venv (see "Reference
+# sources" in CLAUDE.md).
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
-os9=$(cd "${OS9_PROTECT:-$here/../../os9-protect}" && pwd)
-tbxi=$os9/refs/tbxi-venv/bin/tbxi
+root=$(cd "$here/.." && pwd)
+tbxi=$root/refs/tbxi-venv/bin/tbxi
 stock="$here/stock/Mac OS ROM"
 dump=${1:-$here/stock/dump}
 out=${2:-$here/build/Mac OS ROM}
@@ -34,7 +34,7 @@ trap 'rm -rf "$tmp"' EXIT
 
 # tbxi writes the resource fork as Rez text (rom.rdump); macresources, which
 # tbxi installs, turns it into a resource fork.
-"$os9/refs/tbxi-venv/bin/python" -I -c '
+"$root/refs/tbxi-venv/bin/python" -I -c '
 import sys, macresources
 res = macresources.parse_rez_code(open(sys.argv[1], "rb").read())
 open(sys.argv[2], "wb").write(macresources.make_file(res))

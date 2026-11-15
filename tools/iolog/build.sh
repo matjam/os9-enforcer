@@ -1,14 +1,14 @@
 #!/bin/sh
 # Build the iolog QEMU plugin: tools/iolog/build/libiolog.dylib.
 #
-# It needs the plugin header from the QEMU sources (qemu/build.sh src, or a
-# full qemu/build.sh) and glib from Homebrew, and runs only with the local
-# QEMU build (qemu/build/qemu-system-ppc), which has plugins enabled.
+# It needs glib from Homebrew and the QEMU that qemu/build.sh installs (in
+# /opt/qemu-os9, or $QEMU_PREFIX), which has plugins enabled: the plugin is
+# built with that QEMU's plugin header and runs only in it.
 
 set -eu
 cd "$(dirname "$0")"
 
-header=../../qemu/src/include/plugins
+header=${QEMU_PREFIX:-/opt/qemu-os9}/include
 if [ ! -f "$header/qemu-plugin.h" ]; then
   echo "no $header/qemu-plugin.h: run qemu/build.sh first" >&2
   exit 1

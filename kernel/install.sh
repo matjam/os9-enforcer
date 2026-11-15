@@ -5,8 +5,7 @@
 # Usage: kernel/install.sh [ROM [DISK]]
 #   ROM   the Mac OS ROM file (default "kernel/build/Mac OS ROM", from
 #         kernel/pack.sh), with its resource fork and Finder info;
-#   DISK  a raw disk image (default disks/os9-kernel.img in os9-protect,
-#         OS9_PROTECT, default ../os9-protect).
+#   DISK  a raw disk image (default disks/os9-kernel.img).
 #
 # A running Mac OS 9 keeps its Mac OS ROM file open, and the file is name
 # locked, so the Finder cannot replace it. This script attaches the image
@@ -14,9 +13,9 @@
 # folders macOS adds to a volume it mounts, and detaches the image.
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
-os9=$(cd "${OS9_PROTECT:-$here/../../os9-protect}" && pwd)
+root=$(cd "$here/.." && pwd)
 rom=${1:-$here/build/Mac OS ROM}
-disk=${2:-$os9/disks/os9-kernel.img}
+disk=${2:-$root/disks/os9-kernel.img}
 
 for f in "$rom" "$disk"; do
     if [ ! -e "$f" ]; then

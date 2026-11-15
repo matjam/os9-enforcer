@@ -28,11 +28,15 @@ jobs:
         id: retro68
         run: echo "commit=$(git rev-parse HEAD:toolchain/Retro68)" >> "$GITHUB_OUTPUT"
 
+      # toolchain/build.sh installs into /opt/retro68, as on a Mac.
+      - name: Make /opt/retro68
+        run: sudo mkdir -p /opt/retro68 && sudo chown "$(id -un)" /opt/retro68
+
       - name: Restore the toolchain
         id: cache
         uses: actions/cache/restore@v6
         with:
-          path: toolchain/build/toolchain
+          path: /opt/retro68
           key: retro68-ppc-${{ runner.os }}-${{ runner.arch }}-${{ steps.retro68.outputs.commit }}-${{ hashFiles('toolchain/build.sh') }}
 
       - name: Build the toolchain
@@ -44,7 +48,7 @@ jobs:
         if: steps.cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
         with:
-          path: toolchain/build/toolchain
+          path: /opt/retro68
           key: ${{ steps.cache.outputs.cache-primary-key }}
 
       - name: Build the programs

@@ -1,13 +1,13 @@
 #!/bin/sh
 # Boot a scratch VM, run WLog, have the Finder draw over it, then stop WLog.
 # Usage: wlog/scenario.sh [WLog.bin]
-# Runs in the test machine's folder (OS9_PROTECT, default ../os9-protect):
-# screenshots go to its run/ws-*.png. Leaves the VM running.
+# Runs in the repository's top folder: screenshots go to run/ws-*.png.
+# Leaves the VM running.
 set -u
 here=$(cd "$(dirname "$0")/.." && pwd)
 wlog=${1:-$here/wlog/build/WLog.bin}
 case $wlog in /*) ;; *) wlog=$PWD/$wlog ;; esac
-cd "${OS9_PROTECT:-$here/../os9-protect}" || exit 1
+cd "$here" || exit 1
 q=tools/qmp.py
 w() { s=$(date +%s); until [ $(( $(date +%s) - s )) -ge "$1" ]; do :; done; }
 

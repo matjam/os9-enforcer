@@ -2,3 +2,17 @@
 	path = toolchain/Retro68
 	url = https://github.com/autc04/Retro68.git
 	shallow = true
+[submodule "qemu/src"]
+	path = qemu/src
+	url = https://github.com/qemu/qemu.git
+	shallow = true
+	ignore = dirty
+[submodule "refs/NanoKernel"]
+	path = refs/NanoKernel
+	url = https://github.com/elliotnunn/NanoKernel.git
+[submodule "refs/powermac-rom"]
+	path = refs/powermac-rom
+	url = https://git.applefritter.com/Macintosh-SW/powermac-rom.git
+[submodule "refs/tbxi"]
+	path = refs/tbxi
+	url = https://github.com/elliotnunn/tbxi.git

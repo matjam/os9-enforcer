@@ -9,7 +9,7 @@
 # after the stock kernel (STOCK_END). The kernel must end by offset
 # 0x50000, where the 68k emulator starts in the ROM image; build.sh checks
 # that (an .if here cannot, once data follows the code). Names in comments
-# are from os9-protect's refs/powermac-rom/NanoKernel and
+# are from refs/powermac-rom/NanoKernel and
 # Internal/NKOpaque.a.
 
         .set    STOCK_END, 0x19B40

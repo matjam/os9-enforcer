@@ -6,10 +6,10 @@
 #
 # Usage: kernel/extract.sh
 #
-# Needs, in os9-protect (OS9_PROTECT, default ../os9-protect):
+# Needs, in this repository:
 #   disks/os9.qcow2            the installed system (read only);
-#   refs/tbxi-venv/bin/tbxi    tbxi (see "Reference sources" in its README);
-#   the Retro68 toolchain      for powerpc-apple-macos-objdump.
+#   refs/tbxi-venv/bin/tbxi    tbxi (see "Reference sources" in CLAUDE.md);
+# and the Retro68 toolchain (toolchain/find.sh) for powerpc-apple-macos-objdump.
 # The disk is converted to a raw image in a temporary folder (about 330 MB
 # on disk, 8 GB sparse), attached read only with hdiutil, and detached
 # again.
@@ -21,12 +21,14 @@ known=1cddc81677f7cfff75cc6a341452e62e83cc26bdadb3b9a81118689a5499e085
 kernel=NanoKernel-v02.28
 
 here=$(cd "$(dirname "$0")" && pwd)
-os9=$(cd "${OS9_PROTECT:-$here/../../os9-protect}" && pwd)
-tbxi=$os9/refs/tbxi-venv/bin/tbxi
-objdump=$os9/toolchain/build/toolchain/bin/powerpc-apple-macos-objdump
+root=$(cd "$here/.." && pwd)
+ROOT=$root
+. "$root/toolchain/find.sh"
+tbxi=$root/refs/tbxi-venv/bin/tbxi
+objdump=$RETRO68/bin/powerpc-apple-macos-objdump
 out=$here/stock
 
-for f in "$os9/disks/os9.qcow2" "$tbxi" "$objdump"; do
+for f in "$root/disks/os9.qcow2" "$tbxi" "$objdump"; do
     if [ ! -e "$f" ]; then
         echo "extract.sh: missing $f" >&2
         exit 1
@@ -44,7 +46,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-qemu-img convert -O raw "$os9/disks/os9.qcow2" "$tmp/os9.raw"
+qemu-img convert -O raw "$root/disks/os9.qcow2" "$tmp/os9.raw"
 hdiutil attach -readonly -nomount -imagekey diskimage-class=CRawDiskImage \
     "$tmp/os9.raw" >"$tmp/attach"
 dev=$(awk '$2 == "Apple_partition_scheme" {print $1}' "$tmp/attach")

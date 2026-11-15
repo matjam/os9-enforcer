@@ -24,8 +24,7 @@ import sys
 import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-QMP = os.path.join(os.environ.get("OS9_PROTECT", os.path.join(
-    HERE, "..", "..", "os9-protect")), "tools", "qmp.py")
+QMP = os.path.join(HERE, "qmp.py")
 RAM = 0x20000000
 
 # (logical start, logical end, physical - logical)

@@ -6,8 +6,8 @@
 #   ./run.sh           boot from the hard disk
 #   ./run.sh debug     boot from the hard disk, paused, gdb stub on localhost:1234
 #
-# Set PLUGIN=library[,args] to load a QEMU TCG plugin (needs the local
-# build, qemu/build), for example tools/storewatch.
+# Set PLUGIN=library[,args] to load a QEMU TCG plugin (needs the QEMU that
+# qemu/build.sh installs), for example tools/storewatch.
 # Set HEADLESS=1 to run without a window, SCRATCH=1 to discard disk writes,
 # CD=image to start with a disc in the CD drive (it is empty otherwise),
 # DISK=image to boot another hard disk image (default disks/os9.qcow2; for
@@ -32,12 +32,16 @@ CDROM=media/macos-922-uni.iso
 QMP=run/qmp.sock
 EVENTS=run/events.sock
 
-# Prefer the local build (qemu/build), which adds integer scaling to the
-# Cocoa window; fall back to Homebrew's QEMU.
+# Prefer the QEMU that qemu/build.sh installs (in /opt/qemu-os9, or
+# $QEMU_PREFIX), which adds integer scaling to the Cocoa window; fall back
+# to Homebrew's QEMU.
 QEMU=qemu-system-ppc
+QEMU_IMG=qemu-img
 zoom="zoom-to-fit=on"
-if [ -x qemu/build/qemu-system-ppc ]; then
-  QEMU=qemu/build/qemu-system-ppc
+qemu_prefix=${QEMU_PREFIX:-/opt/qemu-os9}
+if [ -x "$qemu_prefix/bin/qemu-system-ppc" ]; then
+  QEMU=$qemu_prefix/bin/qemu-system-ppc
+  QEMU_IMG=$qemu_prefix/bin/qemu-img
   zoom="zoom-integer=on"
 fi
 
@@ -51,7 +55,7 @@ case "$DISK" in
 esac
 
 if [ ! -f "$DISK" ]; then
-  qemu-img create -f "$fmt" "$DISK" 8G
+  "$QEMU_IMG" create -f "$fmt" "$DISK" 8G
 fi
 
 mode=${1:-run}

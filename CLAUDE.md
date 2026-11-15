@@ -6,9 +6,12 @@ learned on the way.
 
 ## Conventions
 
-- The test machine (QEMU), its disks and the tools that drive the guest
-  are in `os9-protect`, next to this repository. Scripts here find it
-  through `OS9_PROTECT` (default `../os9-protect`).
+- Everything Enforcer needs is in this repository: the test machine
+  (`run.sh`, `disks/`, the tools that drive the guest), the third-party
+  sources as submodules (Retro68, QEMU, the reference sources), and the
+  scripts that build them. Retro68 and the patched QEMU install outside
+  it, in `/opt/retro68` and `/opt/qemu-os9`, and Aura (`../aura`) uses the
+  same installs and copies its base disks from `disks/`.
 - Commit each working step to `main`. The remote, `origin`, is the
   private GitHub repository matjam/os9-enforcer.
 - Commit only our own sources, scripts and patches. Apple's files stay out
@@ -19,6 +22,44 @@ learned on the way.
 - When a hole is fixed or found, update both the Known holes list here and
   the Limits section of `README.md`.
 
+## Setup
+
+To set up a new clone on macOS, install the packages:
+
+```bash
+brew install boost cmake ninja gmp mpfr libmpc bison texinfo hfsutils glib pixman libslirp pkg-config
+```
+
+Make the two install folders yours (once per machine):
+
+```bash
+sudo mkdir -p /opt/retro68 /opt/qemu-os9 && sudo chown "$USER" /opt/retro68 /opt/qemu-os9
+```
+
+Build and install the toolchain, then QEMU, then make tbxi's Python
+environment. Each script fetches its submodule when it is missing:
+
+```bash
+toolchain/build.sh
+```
+
+```bash
+qemu/build.sh
+```
+
+```bash
+tools/tbxi-setup.sh
+```
+
+To fetch the kernel reference sources, run:
+
+```bash
+git submodule update --init refs/NanoKernel refs/powermac-rom
+```
+
+The disk images and the Mac OS 9.2.2 install image are not in git. To make
+the disks, see "Disks" below.
+
 ## Build
 
 To build every program, run `./build.sh`. To build some, name their
@@ -28,24 +69,36 @@ in its `build/` folder. The `enforcer/` build also needs Python 3.
 `common/hooks.cmake` (`hooks_embed`) assembles the write hooks into each
 engine program and links DriverServicesLib.
 
-The toolchain is Retro68's PowerPC toolchain (GCC 16, Multiversal
-Interfaces). `toolchain/find.sh` picks one for `build.sh`,
-`kernel/build.sh` and `tools/make-dist.sh`, in this order:
-1. `RETRO68`, if set;
-2. `toolchain/build/toolchain`, built by `toolchain/build.sh` from the
-   `toolchain/Retro68` submodule;
-3. os9-protect's.
+### Toolchain
 
-The submodule is pinned to the commit os9-protect's toolchain was built
-from (a4a389c41). To move it, check out the new commit in
-`toolchain/Retro68`, commit the submodule, and rebuild both toolchains.
+The toolchain is Retro68's PowerPC toolchain (GCC 16), with the
+open-source Multiversal Interfaces: Apple's Universal Interfaces are not
+installed, so Open Transport, Navigation Services and other post-System 7
+APIs have no headers. `toolchain/build.sh` builds it from the
+`toolchain/Retro68` submodule in `toolchain/build` and installs it in
+`/opt/retro68` (or `$RETRO68`), PowerPC only. `toolchain/find.sh` gives
+`build.sh`, `kernel/build.sh`, `kernel/extract.sh` and
+`tools/make-dist.sh` `$RETRO68`, or `/opt/retro68`.
+
+The install records the Retro68 commit it was built from in
+`/opt/retro68/REVISION`. `toolchain/build.sh` does nothing when it is the
+submodule's commit, and `find.sh` warns when it is not the commit this
+repository pins (Aura shares the install). The submodule is pinned to
+a4a389c41. To move it, check out the new commit in `toolchain/Retro68`,
+commit the submodule, empty `/opt/retro68`, and run `toolchain/build.sh`.
+
+To build a CMake project with it, configure it with
+`-DCMAKE_TOOLCHAIN_FILE=/opt/retro68/powerpc-apple-macos/cmake/retroppc.toolchain.cmake`.
+A Retro68 project must declare both C and CXX (`project(Name C CXX)`),
+because `add_application` links with the C++ driver.
 
 Toolchains built on different hosts do not build byte-identical
 programs; our own code comes out the same, the C library linked in does
 not:
-- `toolchain/build.sh` on macOS: the extension and the control panel
-  match os9-protect's build. In the installer, newlib's `dtoa` read-only
-  data is 64 bytes longer, which moves the data after it.
+- `toolchain/build.sh` on macOS, against a toolchain built by hand from
+  the same commit: the extension and the control panel match. In the
+  installer, newlib's `dtoa` read-only data is 64 bytes longer, which
+  moves the data after it.
 - GitHub Actions (Linux): the resource forks match. Code differs only in
   newlib's stdio and `_exit` at the end of each code section.
 Both builds were installed in the guest: the installer recognized the
@@ -58,12 +111,66 @@ toolchain is 354 MB.
 `tools/make-dist.sh` puts the three programs users install, and an HFS
 image holding them, in `dist/`. `.github/workflows/build.yml` builds the
 toolchain, every program and `dist/` on each push, and keeps `dist/` as
-the artifact "Enforcer". It caches the toolchain under the submodule
-commit and the hash of `toolchain/build.sh`; either change rebuilds it.
+the artifact "Enforcer". It caches the toolchain (`/opt/retro68`) under
+the submodule commit and the hash of `toolchain/build.sh`; either change
+rebuilds it.
+
+### QEMU
+
+`qemu/build.sh` builds QEMU from the `qemu/src` submodule (QEMU's git, at
+the v11.1.3 tag, fetched shallow) with each `qemu/patches/*.patch`
+applied to its checkout, a detached HEAD (`.gitmodules` ignores the
+changes there). It configures `qemu/build` (`--prefix=/opt/qemu-os9
+--target-list=ppc-softmmu --enable-cocoa --enable-plugins --disable-docs
+--disable-werror`), builds it at `nice -n 19`, and installs it in
+`/opt/qemu-os9` (or `$QEMU_PREFIX`). Running it again skips patches
+already applied and rebuilds only what changed.
+
+`run.sh` uses `/opt/qemu-os9/bin/qemu-system-ppc` when it exists,
+otherwise Homebrew's `qemu-system-ppc`. The patch,
+`0001-cocoa-zoom-integer.patch`, adds the Cocoa `zoom-integer=on|off`
+option. To change it, run `qemu/build.sh src` (fetch and patch only), edit
+the files in `qemu/src`, then regenerate it:
+
+```bash
+git -C qemu/src diff > qemu/patches/0001-cocoa-zoom-integer.patch
+```
+
+To move to another QEMU release, check out its tag in `qemu/src`, commit
+the submodule, check that the patches apply, remove `qemu/build`, and run
+`qemu/build.sh`.
+
+### Reference sources
+
+The submodules under `refs/` are for reading; nothing builds from them
+but tbxi.
+- `refs/NanoKernel` (b2b5613): Elliot Nunn's reconstruction of the v1
+  NanoKernel.
+- `refs/powermac-rom` (4de6504): Elliot Nunn's reconstruction of the v2
+  NanoKernel (version 2.28, the one in this 9.2.2 install), in
+  `NanoKernel/NK*.s`. It is disassembled source with many routines still
+  unnamed, not Apple's original.
+- `refs/tbxi` (69839ea): Elliot Nunn's tool that unpacks a Mac OS ROM file
+  into editable parts (`tbxi dump`) and packs it again (`tbxi build`).
+  `tools/tbxi-setup.sh` installs it in `refs/tbxi-venv`, with
+  `macresources` from PyPI; `kernel/extract.sh`, `kernel/pack.sh` and
+  `tools/rompatch-test.sh` use it.
+
+tbxi's setup leaves out its C compressor when it fails to build, and then
+packs a ROM file in pure Python, which takes minutes instead of a second.
+With a pyenv Python the link fails (the linker cannot read the SDK's
+library stubs), so `tbxi-setup.sh` compiles it with Xcode's clang when it
+is missing. tbxi's BinHex output (`tbxi build -o NAME.hqx`) runs for
+minutes without finishing even then; `kernel/pack.sh` builds the data fork
+only and copies the resource fork from the stock file.
 
 ## Test machine
 
-To boot a disk, run from `os9-protect`:
+QEMU's `mac99` machine (PowerPC G4, 512 MB) running Mac OS 9.2.2. It
+boots the real Mac OS ROM file and NanoKernel from the guest's System
+Folder, so a modified kernel is tested by replacing that file.
+
+To boot a disk, run:
 
 ```bash
 DISK=disks/os9-vmoff.qcow2 ./run.sh &
@@ -73,29 +180,102 @@ To test with more RAM, set `MEM` (megabytes, default 512; Mac OS 9 uses
 up to 1536). `xlog-read.py` cannot read the engine's state with virtual
 memory on; use the control panel there.
 
-`run.sh` starts QEMU again from the hard disk whenever the guest restarts.
+`DISK` defaults to `disks/os9.qcow2`; a name ending in `.qcow2` opens as
+qcow2, any other as raw, relative to the repository's top folder.
+
+`run.sh` starts QEMU again from the hard disk whenever the guest restarts:
+QEMU's mac99 firmware hangs on a black screen after a guest restart, so
+QEMU exits on a restart instead, and the window closes and reopens.
 `SCRATCH=1` discards disk writes, so it also loses an install at the
 installer's restart; to keep one, use an overlay disk instead.
+`HEADLESS=1` runs without a window, and `CD=IMAGE` starts with a disc in
+the CD drive (it is empty otherwise). To debug the guest with gdb, run
+`./run.sh debug`: QEMU starts paused with a gdb stub on `localhost:1234`.
 
-| Disk (in `os9-protect/disks/`) | What it is |
+To use the mouse in the guest, click inside the window; QEMU captures the
+pointer. To release it, press Ctrl+Option+G. The window snaps to
+whole-number zoom levels and starts at the largest that fits the screen;
+View > Integer Scaling turns this off. To change the guest's resolution,
+use the Monitors control panel.
+
+The guest has a Sun GEM network card (the G4's built-in Ethernet) on
+QEMU's user-mode network. TCP/IP is set to Ethernet with DHCP and gets
+10.0.2.15; the guest reaches the internet through the host, and the host
+itself at 10.0.2.2.
+
+### Disks
+
+| Disk (in `disks/`) | What it is |
 |---|---|
 | `os9.qcow2` | The base install of Mac OS 9.2.2 |
 | `os9-novm.qcow2` | Overlay on `os9.qcow2`, virtual memory off |
+| `os9-enforcer.qcow2` | Overlay on `os9-novm.qcow2`, an early Enforcer install (the store measurements below) |
 | `os9-installer.qcow2` | Overlay on `os9-novm.qcow2`, stock ROM file, for installer tests |
 | `os9-pool.qcow2` | Overlay on `os9-installer.qcow2`, virtual memory on (990 MB, 512 MB of RAM) |
 | `os9-vmoff.qcow2` | Overlay on `os9-installer.qcow2`, virtual memory off |
 | `os9-kernel.img` | Raw image for kernel builds (`kernel/install.sh`) |
 | `os9-kernel-enforcer.img` | Copy of `os9-kernel.img` with the extension and panel |
 
-To copy files into the running guest, use `push.sh`. It builds an HFS
-image and inserts it as the CD:
+`media/macos-922-uni.iso` links to the universal Mac OS 9.2.2 install
+image. To install Mac OS 9.2.2 on a fresh disk, run `./run.sh install`.
+In the guest, open Utilities > Drive Setup, initialize the 8 GB disk as
+Mac OS Extended, run Install Mac OS 9.2.2 onto it, and shut the guest
+down when the installer finishes.
+
+An overlay records only its own changes, so changing the image under it
+corrupts the overlay. To make an overlay again, create it on its base
+(the base's name is relative to the overlay's folder), then boot it and
+set it up; for `os9-novm.qcow2`, turn Virtual Memory off in the Memory
+control panel and restart:
 
 ```bash
-../os9-protect/tools/push.sh -n Test enforcer/build/"Enforcer Extension.bin" scribble/build/Scribble.bin
+/opt/qemu-os9/bin/qemu-img create -f qcow2 -b os9.qcow2 -F qcow2 disks/os9-novm.qcow2
 ```
 
-To drive the guest, use `../os9-protect/tools/qmp.py` (`screenshot FILE`,
-`click X Y`, `dclick X Y`, `type TEXT`, `key NAME`, `hmp CMD`, `raw JSON`).
+`os9-kernel.img` is raw so that macOS can attach it and write the ROM file
+into its System Folder while the machine is off; it takes about 330 MB on
+disk (8 GB sparse). To make it again, with the stock Mac OS ROM file:
+
+```bash
+/opt/qemu-os9/bin/qemu-img convert -O raw disks/os9-novm.qcow2 disks/os9-kernel.img
+```
+
+`os9.qcow2` holds the snapshot `clean-install`: Mac OS 9.2.2 straight
+after the installer, before its first boot and the Setup Assistant. To
+save, return to or list snapshots while the machine is off, use
+`qemu-img snapshot -c NAME`, `-a NAME` or `-l` on the image. Returning
+`os9.qcow2` to a snapshot changes the image under every overlay.
+
+### Driving the guest
+
+To copy files into the running guest, use `tools/push.sh [-n "Volume
+Name"] FILE...`. It builds an HFS image with the files and inserts it as
+the CD. `.bin` files are decoded as MacBinary, `.hqx` as BinHex, `.txt` as
+text with Mac line endings, and anything else is copied as raw data:
+
+```bash
+tools/push.sh -n Test enforcer/build/"Enforcer Extension.bin" scribble/build/Scribble.bin
+```
+
+Mac OS locks the CD tray while a disc is mounted, so `push.sh` first
+ejects a disc it pushed earlier from inside the guest: it clicks the
+desktop near the bottom left corner, types the disc's name and presses
+Command-E. If a file on that disc is open, the eject fails and `push.sh`
+says so.
+
+To drive the guest, use `tools/qmp.py`: `screenshot FILE`, `pos`,
+`click X Y`, `dclick X Y`, `drag X1 Y1 X2 Y2`, `key NAME [MS]`,
+`type TEXT`, `hmp CMD`, `raw JSON`, `quit`. The guest mouse is a relative
+USB mouse that Mac OS accelerates, so `move` (and the commands built on
+it) reads the cursor position from low memory (`RawMouse`, 0x82C), moves
+by the distance left, and repeats until it matches; a move takes about
+two seconds. Aim `dclick` at a solid part of an icon: the Finder
+hit-tests the icon's mask. To switch applications, use `key cmd-tab`.
+
+To save ranges of logical memory from one consistent moment, use
+`tools/vdump.py ADDR LENGTH OUT.bin ...`. It pauses the guest and saves
+only while the CPU uses the blue task's translation (see "Reading guest
+memory").
 
 To install or update Enforcer in the guest, push Enforcer Installer, the
 Enforcer Extension and Enforcer (the control panel) together, open the
@@ -717,7 +897,7 @@ Mac, where a fault is a few µs.
 ### Per-application VSIDs: what the kernel has
 
 Read on 2026-11-14 in the reconstructed source
-(`../os9-protect/refs/powermac-rom/NanoKernel/`, version 0x0228; three
+(`refs/powermac-rom/NanoKernel/`, version 0x0228; three
 files are not UTF-8, so use `LC_ALL=C grep -a`) and checked against
 `kernel/stock/NanoKernel-v02.28.dis`. Offsets are kernel offsets.
 
@@ -909,7 +1089,7 @@ To check which kernel is running, dump it and compare it with the build
 (`build.sh` prints its size):
 
 ```bash
-../os9-protect/tools/qmp.py raw '{"execute":"pmemsave","arguments":{"val":15794176,"size":109248,"filename":"/tmp/nk-live.bin"}}'
+tools/qmp.py raw '{"execute":"pmemsave","arguments":{"val":15794176,"size":109248,"filename":"/tmp/nk-live.bin"}}'
 ```
 
 ```bash
@@ -936,7 +1116,7 @@ address, the task's ID, the page's new PTE); the latest is number
 - Free space: from the kernel's end (0x329B40) to the 68k emulator
   (0x360000), 222,400 zero bytes. Put new code there and writable data in
   RAM allocated at boot. ConfigInfo is at 0x30D000.
-- os9-protect's `refs/powermac-rom/NanoKernel` reconstructs version 2.28;
+- `refs/powermac-rom/NanoKernel` reconstructs version 2.28;
   use it to read and name the binary, and check each patch site against
   the disassembly.
 
@@ -968,10 +1148,133 @@ at EWA − 0x338 (`mfsprg rX,0` gives the EWA); in the CoherenceGroup,
 flags) to r19 and CR at EWA − 0xE0 to − 0xC8; the HTAB lock is at
 KDP − 0xB90 (the KDP pointer is the word at EWA − 4).
 
-To see which path a write violation takes, use os9-protect's pcwatch
-plugin at physical 0x00F12A14 (`ExceptionMemRetried`'s choice):
+To see which path a write violation takes, use the pcwatch plugin (see
+"QEMU plugins") at physical 0x00F12A14 (`ExceptionMemRetried`'s choice):
 `regs=r9:r10,crmask=0x82208000` records the cause, the faulting PC and the
 path (0x80200000 blue task, 0x00008000 CPU plugin, 0 another task).
+
+## QEMU plugins
+
+Four QEMU TCG plugins in `tools/` watch the guest. Each builds with its
+`build.sh` against the plugin header of the QEMU in `/opt/qemu-os9` and
+runs only in that QEMU; `run.sh` loads one with `PLUGIN=LIBRARY,ARGS`.
+memwatch, pcwatch and iolog write their report when QEMU exits (for
+example after `tools/qmp.py quit`).
+
+`tools/memwatch/` reports which code reads or writes a range of physical
+memory: each PC and kind (load or store) once, with a count and the first
+address it touched. To find what touches the space after the NanoKernel:
+
+```bash
+SCRATCH=1 DISK=disks/os9-kernel.img PLUGIN=tools/memwatch/build/libmemwatch.dylib,lo=0xF29B40,hi=0xF60000,out=run/mw.txt ./run.sh &
+```
+
+`tools/pcwatch/` counts the register values seen each time the guest runs
+one instruction: up to 8 registers by gdb name, and optionally CR under a
+mask. NanoKernel code runs with translation off, so its address is
+physical:
+
+```bash
+SCRATCH=1 DISK=disks/os9-kernel.img PLUGIN=tools/pcwatch/build/libpcwatch.dylib,at=0xF12A14,regs=r9:r10,crmask=0x82208000,out=run/pw.txt ./run.sh &
+```
+
+`tools/iolog/` keeps a timeline of the latest events (`n=`, default
+4096): each load and store to a physical range, device registers
+included, with its PC and value, and each run of up to 8 marked
+instructions (`mark=`), with up to 4 registers (`regs=`). To see each
+interrupt the kernel acknowledges at the OpenPIC (a read of 0x800600A0
+returns the vector) and ends (a write to 0x800600B0), with where the
+interrupt arrived (r10 at the kernel's external interrupt entry):
+
+```bash
+SCRATCH=1 DISK=disks/os9-kernel.img PLUGIN=tools/iolog/build/libiolog.dylib,lo=0x800600A0,hi=0x800600C0,mark=0xF14884,regs=r10:r11,n=50000,out=run/io.txt ./run.sh &
+```
+
+The report's totals line counts every event, kept or not; here R and W
+should be equal. To trace the USB controller's registers instead, turn on
+QEMU's trace events while the guest runs: `tools/qmp.py hmp 'trace-event
+usb_ohci_mem_write on'` (and `usb_ohci_mem_read`); they print to QEMU's
+standard error.
+
+### Store measurement (storewatch)
+
+`tools/storewatch/` counts every store the guest makes into low memory
+(below 0x2800) and the system heap (0x2800 to SysZone's end). For each
+store it records the code that made it: the native PC, or for 68k code
+the 68k instruction after the store (as Enforcer's 68k hook does). It
+marks a store "app" when that code lies in the current application's
+partition, which it reads from the running engine's 68k hook data. To
+measure an idle and a busy phase:
+
+```bash
+SCRATCH=1 DISK=disks/os9-enforcer.qcow2 PLUGIN=tools/storewatch/build/libstorewatch.dylib,out=run/sw ./run.sh &
+```
+
+```bash
+tools/storewatch/scenario.sh run/sw && tools/storewatch/report.py run/sw-use
+```
+
+The plugin runs on every store, so the guest slows down in proportion to
+how many stores it makes: about 16 million instructions a second at the
+desktop. To measure something else, create `run/sw.reset` to clear the
+counts and `run/sw.dump` to write them (see `storewatch.c`).
+
+Results on 9.2.2 (2026-11-12, Enforcer running; the busy phase opens a
+window, uses the Calculator and Stickies, and switches applications):
+
+| | Idle | Busy |
+|---|---|---|
+| Instructions | 334 million | 1,610 million |
+| Low memory stores per million instructions | 682 | 752 |
+| System heap stores per million instructions | 5,614 | 3,758 |
+| Low memory stores by app code | 0 | 16 |
+| System heap stores by app code | 0 | 0 |
+| Stores into the 68k vectors (0000-00FF) | 0 | 0 |
+
+- System code writes low memory all the time: `MemErr` and `TheZone` on
+  every Memory Manager call, the current port, `ResErr`, `CrsrVis`, the
+  File Manager and VBL queues.
+- The only low memory global written by app code was `ResReadOnly`
+  (0A5C), by a 68k application.
+- The emulator saves state into a 544-byte frame, from a table near
+  0x46000, when 68k code calls native code (most traps), from one
+  instruction, 6806E34C. r24 still points at the application's trap
+  instruction then, so the 68k-PC test counted the emulator's store as the
+  application's. The plugin and Enforcer's 68k hook count stores by that
+  emulator code (6806E300-6806E370) as system stores.
+- Nothing wrote the 68k exception vectors, where a write through a NULL
+  pointer with a small offset lands.
+
+Trapping every store into low memory or the system heap is too slow, and
+low memory's first page holds both the vectors and the most written
+globals. Applications' own code almost never writes either area.
+
+The plugin's `epoch=` option replays page-by-page protection on every
+system heap page from 0x2000 up (protect each page, open it at the first
+store, protect it again at each interval) and counts the traps:
+
+```bash
+SCRATCH=1 DISK=disks/os9-enforcer.qcow2 PLUGIN=tools/storewatch/build/libstorewatch.dylib,out=run/pm,epoch=ticks:250000:1000000:4000000:16000000 ./run.sh &
+```
+
+`ticks` protects again at each tick of the guest's clock (1/60 s); the
+numbers are intervals of a fixed count of instructions, for busy work.
+Results (2026-11-12, the same phases, 5,300 system heap pages; "open for
+good" leaves the pages with the most traps unprotected; 70 µs a trap):
+
+| Open for good | Traps per tick, idle / busy | CPU | Pages protected |
+|---|---|---|---|
+| none | 51 / 45 | about 20% | 99.4% |
+| 64 pages | 1.6 / 6.3 | 0.7% / 2.6% | 98.7% |
+| 128 pages | 0.1 / 2.3 | 0.1% / 1.0% | 97.5% |
+| 256 pages | 0 / 0.8 | 0.3% | 95.2% |
+
+With 16 million instructions an interval (busy CPU), the busy phase takes
+124 traps an interval with no pages open for good (about 54% CPU) and 22
+with 256 (10%). The pages with the most traps are the emulator's call
+frames (0x44000 to 0x46000) and a few dozen others, written in nearly
+every tick. A protected page holding a variable that Mac OS updates with
+`lwarx`/`stwcx.` hung the machine before kernel patch 1.
 
 ## Icons
 

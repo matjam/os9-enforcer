@@ -5,12 +5,11 @@
 #
 # Usage: tools/rompatch-test.sh
 #
-# Needs a C compiler, and tbxi's Python environment from os9-protect
-# (OS9_PROTECT, default ../os9-protect) for reading resource forks.
+# Needs a C compiler, and tbxi's Python environment (refs/tbxi-venv; see
+# "Reference sources" in CLAUDE.md) for reading resource forks.
 set -eu
 here=$(cd "$(dirname "$0")/.." && pwd)
-os9=$(cd "${OS9_PROTECT:-$here/../os9-protect}" && pwd)
-python=$os9/refs/tbxi-venv/bin/python
+python=$here/refs/tbxi-venv/bin/python
 stock="$here/kernel/stock/Mac OS ROM"
 built="$here/kernel/build/Mac OS ROM"
 tmp=$(mktemp -d)
@@ -42,8 +41,8 @@ fi
 # The two data forks, unpacked by tbxi, must match. (cat copies only the
 # data fork. The raw Parcels file holds the padding, so it is left out.)
 cat "$built" >"$tmp/built"
-"$os9/refs/tbxi-venv/bin/tbxi" dump "$tmp/out" -o "$tmp/dump-out" >/dev/null 2>&1
-"$os9/refs/tbxi-venv/bin/tbxi" dump "$tmp/built" -o "$tmp/dump-built" >/dev/null 2>&1
+"$here/refs/tbxi-venv/bin/tbxi" dump "$tmp/out" -o "$tmp/dump-out" >/dev/null 2>&1
+"$here/refs/tbxi-venv/bin/tbxi" dump "$tmp/built" -o "$tmp/dump-built" >/dev/null 2>&1
 if diff -r -x Parcels "$tmp/dump-out" "$tmp/dump-built" >/dev/null; then
     echo "tbxi dump: the same as the tbxi-built file's"
 else

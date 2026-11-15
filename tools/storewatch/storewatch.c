@@ -25,7 +25,7 @@
  *   - native code: the PC of the store instruction;
  *   - 68k code: a store made by the 68k emulator (code at 0x68000000 to
  *     0x68FFE000) is counted against the 68k instruction after it (r24 - 2;
- *     see os9-enforcer's common/h68k.s).
+ *     see common/h68k.s).
  * A store is "app" when that code lies inside the current application's
  * partition, which the plugin reads from the running engine's 68k hook data
  * (cur_lo and cur_hi, 0x68FFFBF0). That is the same test as Enforcer's deny
@@ -79,7 +79,7 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 #define SYS_ZONE  0x2A6u
 #define APPL_ZONE 0x2AAu
 #define TICKS     0x16Au      /* 60ths of a second since startup */
-#define H68K_DATA 0x68FFFB80u /* os9-enforcer common/h68k.h kH68kData */
+#define H68K_DATA 0x68FFFB80u /* common/h68k.h kH68kData */
 #define D_CUR_LO  0x70u
 #define EMU_LO    0x68000000u /* the 68k emulator's code */
 #define EMU_HI    0x68FFE000u

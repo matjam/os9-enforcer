@@ -6,8 +6,8 @@
 # Usage: kernel/build.sh
 #
 # Needs kernel/stock/ (run kernel/extract.sh first), the Retro68 toolchain
-# (see toolchain/find.sh) and, for kernel/pack.sh, tbxi in os9-protect
-# (OS9_PROTECT, default ../os9-protect). Writes into kernel/build/:
+# (see toolchain/find.sh) and, for kernel/pack.sh, tbxi (refs/tbxi-venv; see
+# "Reference sources" in CLAUDE.md). Writes into kernel/build/:
 # NanoKernel-v02.28.bin and .dis (the patched kernel and its disassembly),
 # dump/ (the stock dump with that kernel) and "Mac OS ROM".
 set -eu

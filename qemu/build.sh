@@ -1,30 +1,33 @@
 #!/bin/sh
-# Build the patched QEMU that run.sh prefers (qemu/build/qemu-system-ppc).
+# Build the patched QEMU that run.sh prefers and install it in
+# /opt/qemu-os9, or in $QEMU_PREFIX when that is set.
 #
 # Usage:
-#   qemu/build.sh        fetch, patch, configure and build
+#   qemu/build.sh        fetch, patch, configure, build and install
 #   qemu/build.sh src    fetch and patch only (qemu/src), for editing patches
 #
 # Steps:
-#   1. Download the QEMU release tarball to qemu/qemu-VERSION.tar.xz, unless
-#      it is already there, and check its SHA-256.
-#   2. If qemu/src does not exist, unpack the tarball into it and make it a
-#      git repository whose one commit is the unmodified release.
-#   3. Apply each qemu/patches/*.patch in name order. A patch that is already
-#      applied is skipped, so the script can be run again on an existing tree.
-#   4. Configure qemu/build if it has not been configured, then build it.
+#   1. Fetch the submodule qemu/src (QEMU's git, at the release tag the
+#      superproject pins) if it is missing.
+#   2. Apply each qemu/patches/*.patch in name order to its checkout (a
+#      detached HEAD; .gitmodules ignores the changes). A patch that is
+#      already applied is skipped, so the script can be run again.
+#   3. Configure qemu/build for the install folder if it has not been
+#      configured, build it, and install it. Configuring fetches QEMU's
+#      meson subprojects into qemu/src. To change the install folder,
+#      remove qemu/build first.
+#
+# The install folder must be writable. To make /opt/qemu-os9, run once:
+#   sudo mkdir -p /opt/qemu-os9 && sudo chown "$USER" /opt/qemu-os9
 #
 # To change a patch, edit the files in qemu/src, then regenerate it (while
 # there is only one patch):
 #   git -C qemu/src diff > qemu/patches/0001-cocoa-zoom-integer.patch
+# To go back to the unpatched release: git -C qemu/src checkout -- .
 
 set -eu
 cd "$(dirname "$0")"
-
-VERSION=11.1.3
-URL=https://download.qemu.org/qemu-$VERSION.tar.xz
-SHA256=5a8289c7940dc77d3873c81a6c29ba3afe1446fc9d36e77fa1658cdbecb84b22
-TARBALL=qemu-$VERSION.tar.xz
+prefix=${QEMU_PREFIX:-/opt/qemu-os9}
 
 stage=${1:-all}
 case "$stage" in
@@ -32,27 +35,8 @@ case "$stage" in
   *) echo "usage: $0 [src]" >&2; exit 2 ;;
 esac
 
-if [ ! -f "$TARBALL" ]; then
-  echo "Downloading $URL"
-  curl -fL -o "$TARBALL.part" "$URL"
-  mv "$TARBALL.part" "$TARBALL"
-fi
-actual=$(shasum -a 256 "$TARBALL" | cut -d' ' -f1)
-if [ "$actual" != "$SHA256" ]; then
-  echo "$TARBALL: SHA-256 is $actual, expected $SHA256" >&2
-  exit 1
-fi
-
-if [ ! -d src ]; then
-  echo "Unpacking $TARBALL into qemu/src"
-  rm -rf src.part
-  mkdir src.part
-  tar -xJf "$TARBALL" -C src.part --strip-components=1
-  git -C src.part init -q
-  git -C src.part add -A
-  git -C src.part -c user.name=qemu/build.sh -c user.email=none \
-    commit -q -m "QEMU $VERSION release tarball"
-  mv src.part src
+if [ ! -f src/configure ]; then
+  git -C .. submodule update --init --depth 1 qemu/src
 fi
 
 for p in patches/*.patch; do
@@ -73,8 +57,20 @@ done
 
 if [ ! -f build/build.ninja ]; then
   mkdir -p build
-  (cd build && nice -n 19 ../src/configure --target-list=ppc-softmmu \
-    --enable-cocoa --disable-docs --disable-werror)
+  (cd build && nice -n 19 ../src/configure --prefix="$prefix" \
+    --target-list=ppc-softmmu --enable-cocoa --enable-plugins \
+    --disable-docs --disable-werror)
 fi
 nice -n 19 make -C build -j"$(sysctl -n hw.ncpu)"
-echo "Built qemu/build/qemu-system-ppc"
+
+mkdir -p "$prefix" 2>/dev/null || true
+if [ ! -w "$prefix" ]; then
+  echo "Built qemu/build, but $prefix is not a folder you can write." >&2
+  echo "To make it, run:" >&2
+  echo "  sudo mkdir -p $prefix && sudo chown \"\$USER\" $prefix" >&2
+  echo "then run qemu/build.sh again to install." >&2
+  exit 1
+fi
+make -C build install >/dev/null
+git -C src describe --tags --always >"$prefix/REVISION"
+echo "Installed $prefix/bin/qemu-system-ppc"
