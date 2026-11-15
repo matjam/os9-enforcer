@@ -1102,12 +1102,38 @@ Traced so far (2026-11-15, a VM-off dump; addresses of that boot):
   of native applications do go through the trap table (the overflow stubs
   see Scribble's).
 
-Next for 3: disassemble the 68k dispatcher's selector 16 from a dump
-(`capstone`, as for the ROM's `SIZE` library), find the partition's
-allocation and every use of its handle (size, lock, the zone set up in
-it, disposal at quit), and decide between a handle the engine makes for
-a sparse area and a hook at the allocation. 68k code in RAM can be
-patched with `BlockMove`, which flushes the emulator's code cache.
+- Correction: low memory 0x103C is the trap table's entry for
+  `_OSDispatch` (0xE00 + 4 × 0x8F), not a 68k dispatcher. After the
+  patches chained on it, the trap's routine is a selector-dispatched
+  routine descriptor in the fragment's data (0x010CD3F8, 129 records of
+  20 bytes: procInfo, ISA, flags, transition vector, selector), and every
+  selector is native code in the fragment. Selector 16 is 0x011679A0, a
+  wrapper around 0x0116ADAC, which makes the process; 0x3A
+  (`GetProcessInformation`) is 0x011682A0 and 0x1D (`TempNewHandle`)
+  0x0117C568. The whole Process Manager is native on 9.2.2.
+
+The engine's side of sparse memory (design, 2026-11-15):
+- The range: above logical RAM, in segments the VSIDs cover (0x30000000
+  to 0x50000000 on a 512 MB machine; none when RAM fills segments 0-5).
+  The area's page tables cost about 1.5 pages a megabyte, fed to the
+  kernel's free list from system heap pages for good. The owner table has
+  to cover the range (one byte a page).
+- The pool is a balloon: the engine takes temporary memory, locks it and
+  gives its pages to the kernel's pool, keeping most of the free memory
+  there and leaving a reserve in the Process Manager's heap. It gives
+  pages back (`OP_POOL_GET`, then frees the block when all its pages are
+  back) when Mac OS needs memory: at a `TempNewHandle` or a launch that
+  would fail, and when the reserve falls. Mac OS's count of free memory
+  then stays honest: pool pages are used temporary memory.
+- A touch with the pool empty cannot be served at the fault: that point
+  can be inside the Memory Manager or at interrupt time, where nothing
+  can be allocated. With the balloon holding the free memory, an empty
+  pool means the machine is out of memory. The application is then
+  stopped as for an offense; commit accounting at the Memory Manager
+  traps (design point 3) is what would turn that into `memFullErr`
+  before it happens.
+- Pages come back to the pool from freed heap blocks (`OP_SPARSE_FREE`),
+  design point 2.
 
 ### Switch cost
 

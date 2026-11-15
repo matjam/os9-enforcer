@@ -171,6 +171,7 @@ kernel:
         .set    OP_POOL_GET, 14
         .set    OP_SPARSE_FREE, 15
         .set    OP_SPARSE_INFO, 16
+        .set    OP_POOL_TAKE, 17
         .set    VSID_APP, 0xFFF00               # application VSIDs: segment
                                                 # << 20 | VSID_APP + owner
         .set    CTX_MSR, 0x0A4                  # ContextBlock: MSR,
@@ -1187,6 +1188,8 @@ enf_op:
         beq     eo_sparse_free
         cmpwi   3, OP_SPARSE_INFO
         beq     eo_sparse_info
+        cmpwi   3, OP_POOL_TAKE
+        beq     eo_pool_take
 eo_bad: li      3, -50
         b       MPReturn
 eo_ok:  li      3, 0
@@ -1415,6 +1418,41 @@ eo_pool_get:                                    # returns a page, or 0
         addi    17, 17, -1
         stw     17, pool_count - 1b(16)
 2:      li      9, 0
+        stw     9, KDP_HTABLock(1)
+        b       MPReturn
+
+# r4, r5 a range of physical addresses: take the pool's pages in it out of
+# the pool, or with r6 not 0 only count them. Returns how many, so that
+# the caller can free a block when all of its pages are in the pool.
+eo_pool_take:
+        lwz     20, CTX_R6(6)
+        addi    8, 1, KDP_HTABLock
+        bl      AcquireLock
+        bl      1f
+1:      mflr    16
+        addi    17, 16, pool_head - 1b          # the link to the page
+        li      3, 0
+2:      lwz     18, 0(17)
+        cmpwi   18, 0
+        beq     4f
+        cmplw   18, 4
+        blt     3f
+        cmplw   18, 5
+        bge     3f
+        addi    3, 3, 1
+        cmpwi   20, 0
+        bne     3f                              # only counting
+        lwz     19, 0(18)                       # unlink it
+        stw     19, 0(17)
+        b       2b
+3:      mr      17, 18                          # on: its link is its first
+        b       2b                              # word
+4:      cmpwi   20, 0
+        bne     5f
+        lwz     19, pool_count - 1b(16)
+        subf    19, 3, 19
+        stw     19, pool_count - 1b(16)
+5:      li      9, 0
         stw     9, KDP_HTABLock(1)
         b       MPReturn
 

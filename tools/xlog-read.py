@@ -44,7 +44,10 @@ MAX_CHUNKS = 128
 SPACES = ["skips", "spaces", "vsid_mask", "spaces_on", "pm_site", "pm_stub",
           "pm_mapped", "pm_tried", "pm_tries", "yield", "preempt_on",
           "slice_ms", "size_site", "size_stub", "size_mapped", "size_cap",
-          "size_raised", "size_from", "size_to", "mem_on", "want_mem"]
+          "size_raised", "size_from", "size_to", "mem_on", "want_mem",
+          "sparse_want_lo", "sparse_want_hi", "sparse_lo", "sparse_hi",
+          "sparse_area", "sparse_used", "sparse_chunks", "sparse_short",
+          "pool_grown", "pool_shrunk"]
 # The yield stub's data (common/hyield.h).
 YIELD = (["magic", "entry", "vecbr", "check", "wne", "entered", "yielded",
           "lost", "starting", "not_task", "in_call", "other_stack",
@@ -197,6 +200,16 @@ def print_kernel(k):
               if k["size_site"] else "not installed",
               k["size_cap"] >> 10, k["size_raised"], k["size_from"] >> 10,
               k["size_to"] >> 10))
+    if k["sparse_area"]:
+        print("  sparse memory: %08X-%08X (area %08X), pieces in use %08X; "
+              "chunks made %d, requests refused %d; pool blocks added %d, "
+              "freed %d" % (
+                  k["sparse_lo"], k["sparse_hi"], k["sparse_area"],
+                  k["sparse_used"], k["sparse_chunks"], k["sparse_short"],
+                  k["pool_grown"], k["pool_shrunk"]))
+    else:
+        print("  sparse memory: none (planned %08X-%08X)" % (
+            k["sparse_want_lo"], k["sparse_want_hi"]))
     if k["yield"]:
         print("  preemption: %s, slice %d ms (kernel %d ticks), stub %08X; "
               "redirects %d (pending %08X); stub entries %d, WaitNextEvent "

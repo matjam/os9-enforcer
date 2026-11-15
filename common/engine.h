@@ -218,6 +218,26 @@ typedef struct {
     unsigned long keep;    /* the domain's first chunk: kept when empty */
 } Chunk;
 
+/* Sparse memory (State.sparse_lo): the range is handed out in pieces of
+   kSparseUnit addresses, which cost memory only where touched. The pool
+   keeps kPoolHeadroom pages beyond what an allocation the engine sees
+   will need; a touch the engine did not see (a block the ROM allocated
+   for itself, the stack) comes out of the headroom. A touch with the pool
+   empty cannot be served: it faults as in the stock kernel. */
+enum {
+    kSparseUnit = 0x1000000, /* 16 MB */
+    kSparseUnits = 32,       /* 512 MB of addresses */
+    kSparseMost = 8,         /* units in one chunk */
+    kPoolBlock = 0x100000,   /* a pool block's pages: 1 MB */
+    kPoolBlocks = 512,
+    kPoolHeadroom = 1024     /* pages: 4 MB */
+};
+
+typedef struct {
+    Handle h;            /* 0: free */
+    unsigned long phys;  /* of its first whole page */
+} PoolBlock;
+
 /* The 68k stubs, in a system heap block of their own that is never freed:
    an application's own patch of one of the traps can still lead to a
    stub, and a disabled stub passes every call on.
@@ -240,7 +260,8 @@ enum {
     kPoolGne = 27,
     kPoolClient = 9,
     kPoolAlloc = 32,
-    kPoolDp = 40
+    kPoolDp = 40,
+    kPoolSel = 7
 };
 
 /* Overflow: when NewHandle or NewPtr fails in the current application's
@@ -298,6 +319,11 @@ typedef struct {
        Computer counts the memory an application has outside its
        partition. */
     RoutineDescriptor rd_info;
+    /* An _OSDispatch call that takes only its selector (BeginSystemMode
+       0x40, EndSystemMode 0x41), as 68k code called through rd_sel: long
+       sel(long selector). */
+    unsigned short selcall[kPoolSel];
+    RoutineDescriptor rd_sel;
     unsigned short nh[kPoolAlloc], np[kPoolAlloc], dp[kPoolDp];
 } PoolStubs;
 
@@ -559,6 +585,19 @@ typedef struct {
        the default, and protection is on. A control panel sets want_mem;
        engine_poll applies it. */
     volatile unsigned long mem_on, want_mem;
+    /* Sparse memory (kernel patch 7; virtual memory off only): the range
+       above logical RAM whose pages get memory when touched, its area, and
+       which kSparseUnit pieces of it are in use (bit n: piece n).
+       sparse_want_lo and sparse_want_hi are the range the owner table was
+       sized for. The kernel's pool gets its pages from pool_blocks:
+       temporary memory made in system mode (so it outlives the program
+       running the engine), locked, one physical range each. */
+    unsigned long sparse_want_lo, sparse_want_hi;
+    unsigned long sparse_lo, sparse_hi, sparse_area, sparse_used;
+    unsigned long sparse_chunks; /* chunks made in the range */
+    unsigned long sparse_short;  /* requests refused: no memory for the pool */
+    unsigned long pool_grown, pool_shrunk; /* blocks added and freed */
+    PoolBlock pool_blocks[kPoolBlocks];
 } State;
 
 enum { kSizeFactor = 4, kSizeShare = 4, kSizeShareReal = 8 };

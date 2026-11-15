@@ -1177,7 +1177,7 @@ int main(void)
             pi0.processInfoLength = sizeof pi0;
             pi1 = pi0;
             GetProcessInformation(&me, &pi0);
-            int got = 0, over = 0, bad = 0, dirty = 0;
+            int got = 0, over = 0, bad = 0, dirty = 0, mmbad = 0;
             for (int i = 0; i < kN; i++) {
                 int ptr = i >= 24, clear = i & 1;
                 unsigned long *b;
@@ -1198,8 +1198,16 @@ int main(void)
                 if (z > 16 && long_at(z - 16) == kChunkSig &&
                     long_at(z - 12) == z)
                     over++;
-                if (!ptr)
+                /* The Memory Manager must take a block outside logical RAM
+                   (a sparse chunk) as any other: lock, state, size. */
+                if (!ptr) {
                     HLock(hs[i]);
+                    if (MemError() || !(HGetState(hs[i]) & 0x80) ||
+                        GetHandleSize(hs[i]) != kBlock)
+                        mmbad++;
+                } else if (GetPtrSize(ps[i]) != kBlock) {
+                    mmbad++;
+                }
                 for (unsigned long k = 0; k < kBlock / 4; k++) {
                     if (clear && b[k])
                         dirty++;
@@ -1250,7 +1258,10 @@ int main(void)
                    (unsigned long)pi1.processFreeMem >> 10);
             int counted = pi1.processSize - pi0.processSize >=
                           (unsigned long)over * kBlock;
+            printf("Memory Manager lock, state or size wrong for %d blocks; "
+                   "top of memory (0x1E10) %08lX\n", mmbad, long_at(0x1E10));
             printf("%s\n", got == kN && over > 0 && !bad && !dirty && home &&
+                               !mmbad &&
                                counted && chunks2 <= chunks0 + 1
                                ? "PASS" : "FAIL");
             continue;
@@ -1276,6 +1287,14 @@ int main(void)
             }
             if (!Gestalt(gestaltVMAttr, &vm) && (vm & 1)) {
                 printf("SKIP: virtual memory is on\n");
+                continue;
+            }
+            /* The kernel has one sparse range, and the engine uses it. */
+            State *es = engine_state();
+            if (es && es->sparse_area) {
+                printf("SKIP: Enforcer has the sparse range (%08lX-%08lX, "
+                       "pool %ld pages); O tests it\n", es->sparse_lo,
+                       es->sparse_hi, kcb_set(kKcbOpSparseInfo, 0));
                 continue;
             }
             Ptr feed = NewPtrSysClear((kFeed + 1) * 4096L);

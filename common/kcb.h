@@ -83,8 +83,11 @@ enum {
     kKcbOpPoolGet = 14,    /* returns a physical page from the pool, or 0 */
     kKcbOpSparseFree = 15, /* r4 an address, r5 pages: back into the pool;
                               returns how many it took */
-    kKcbOpSparseInfo = 16  /* r4 0: pages in the pool; 1: pages given; 2:
+    kKcbOpSparseInfo = 16, /* r4 0: pages in the pool; 1: pages given; 2:
                               faults with the pool empty */
+    kKcbOpPoolTake = 17    /* r4, r5 a physical range: its pages out of the
+                              pool, or with r6 not 0 only counted; returns
+                              how many */
 };
 
 /* KEvent.info, low byte. */

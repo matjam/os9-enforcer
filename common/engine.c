@@ -418,12 +418,17 @@ static void set_current(State *s, int i)
 /* Stop managing a chunk's pages, before its memory is freed. Safety rule
    (engine.h): not live first, so that nothing protects it again, then
    open its pages, then clear their bits and owners. */
+static void sparse_release(State *s, unsigned long addr, unsigned long units);
+
 static void drop_chunk(State *s, Chunk *c)
 {
+    int sparse = c->handle == (Handle)&c->block; /* chunk_is_sparse */
     c->live = 0;
-    if (nk_unprotect(s->area, c->lo, c->hi - c->lo))
+    if (!sparse && nk_unprotect(s->area, c->lo, c->hi - c->lo))
         s->c.kernel_errors++;
     mark(s, c->lo, c->hi, kOwnerNone);
+    if (sparse) /* its pages back to the pool */
+        sparse_release(s, c->lo, (c->hi - c->lo) / kSparseUnit);
 }
 
 /* Stop managing application domain i and its chunks: its process is gone,
@@ -1622,6 +1627,231 @@ static void put32(unsigned char *p, unsigned long v)
     p[3] = v;
 }
 
+/* Sparse memory (engine.h) ---------------------------------------------- */
+
+static long sparse_info(unsigned long which)
+{
+    return kcb_set(kKcbOpSparseInfo, which);
+}
+
+/* Temporary memory that outlives this program: made in system mode, the
+   Process Manager keeps it on its system list. */
+static Handle sys_temp(State *s, unsigned long size)
+{
+    PoolStubs *p = s->pool;
+    OSErr err = noErr;
+    CallUniversalProc((UniversalProcPtr)&p->rd_sel, kPoolClientInfo, 0x40L);
+    p->inside = 1;
+    Handle h = TempNewHandle(size, &err);
+    p->inside = 0;
+    CallUniversalProc((UniversalProcPtr)&p->rd_sel, kPoolClientInfo, 0x41L);
+    return h;
+}
+
+/* Give the kernel's pool one more block of pages. Task level. Returns the
+   pages added, or 0. */
+static unsigned long pool_grow(State *s)
+{
+    int slot = -1;
+    for (int i = 0; i < kPoolBlocks && slot < 0; i++)
+        if (!s->pool_blocks[i].h)
+            slot = i;
+    /* Leave the Process Manager some temporary memory of its own. */
+    if (slot < 0 || (unsigned long)TempFreeMem() < kOverReserve + kPoolBlock)
+        return 0;
+    Handle h = sys_temp(s, kPoolBlock + kPage);
+    if (!h)
+        return 0;
+    MoveHHi(h);
+    HLock(h);
+    unsigned long base = ((unsigned long)*h + kPage - 1) & kPageMask;
+    unsigned long phys = kcb_physical((void *)base, kPoolBlock);
+    if (!phys) { /* not one physical range */
+        DisposeHandle(h);
+        return 0;
+    }
+    for (unsigned long o = 0; o < kPoolBlock; o += kPage)
+        kcb_set(kKcbOpPoolPut, phys + o);
+    s->pool_blocks[slot].h = h;
+    s->pool_blocks[slot].phys = phys;
+    s->pool_grown++;
+    return kPoolBlock / kPage;
+}
+
+/* Take back and free one block whose pages are all in the pool. Returns
+   the pages taken, or 0 when no block is whole. */
+static unsigned long pool_shrink(State *s)
+{
+    for (int i = kPoolBlocks - 1; i >= 0; i--) {
+        PoolBlock *b = &s->pool_blocks[i];
+        if (!b->h)
+            continue;
+        KRegs k = {0};
+        k.r3 = kKcbOpPoolTake;
+        k.r4 = b->phys;
+        k.r5 = b->phys + kPoolBlock;
+        k.r6 = 1; /* count */
+        if (nk_call(kMPEnforcer, &k) != kPoolBlock / kPage)
+            continue;
+        k.r3 = kKcbOpPoolTake;
+        k.r4 = b->phys;
+        k.r5 = b->phys + kPoolBlock;
+        k.r6 = 0;
+        nk_call(kMPEnforcer, &k);
+        DisposeHandle(b->h);
+        b->h = 0;
+        s->pool_shrunk++;
+        return kPoolBlock / kPage;
+    }
+    return 0;
+}
+
+/* Make sure the pool holds its headroom and pages more. Task level, at a
+   point where the Memory Manager can be called. Returns 0 when the
+   machine has no memory for it. */
+static int sparse_ensure(State *s, unsigned long pages)
+{
+    long level = sparse_info(0);
+    if (level < 0)
+        return 0;
+    while ((unsigned long)level < kPoolHeadroom + pages) {
+        unsigned long n = pool_grow(s);
+        if (!n) {
+            s->sparse_short++;
+            return 0;
+        }
+        level += n;
+    }
+    return 1;
+}
+
+/* Keep the pool near its headroom (task level, from engine_poll): give
+   memory back when it holds much more, all of it when nothing is in the
+   range. */
+static void sparse_balance(State *s)
+{
+    if (!s->sparse_area)
+        return;
+    long level = sparse_info(0);
+    unsigned long keep = s->sparse_used ? 2 * kPoolHeadroom : 0;
+    while (level > 0 && (unsigned long)level > keep + kPoolBlock / kPage) {
+        unsigned long n = pool_shrink(s);
+        if (!n)
+            break;
+        level -= n;
+    }
+    if (s->sparse_used)
+        sparse_ensure(s, 0);
+}
+
+/* units pieces of the range, in a row: their address, or 0. */
+static unsigned long sparse_alloc(State *s, unsigned long units)
+{
+    unsigned long total = (s->sparse_hi - s->sparse_lo) / kSparseUnit;
+    if (!s->sparse_area || !units || units > total)
+        return 0;
+    unsigned long mask = units >= 32 ? 0xFFFFFFFFUL : (1UL << units) - 1;
+    for (unsigned long i = 0; i + units <= total; i++)
+        if (!(s->sparse_used & (mask << i))) {
+            s->sparse_used |= mask << i;
+            return s->sparse_lo + i * kSparseUnit;
+        }
+    return 0;
+}
+
+/* Give the pieces back: their pages return to the pool. Kernel calls
+   only, so it can run where drop_chunk does. */
+static void sparse_release(State *s, unsigned long addr, unsigned long units)
+{
+    if (!s->sparse_area || addr < s->sparse_lo)
+        return;
+    unsigned long i = (addr - s->sparse_lo) / kSparseUnit;
+    unsigned long mask = units >= 32 ? 0xFFFFFFFFUL : (1UL << units) - 1;
+    kcb_set2(kKcbOpSparseFree, addr, units * (kSparseUnit / kPage));
+    s->sparse_used &= ~(mask << i);
+}
+
+static int chunk_is_sparse(const Chunk *c)
+{
+    return c->handle == (Handle)&c->block;
+}
+
+/* Make the range (engine_start, with the block registered and the stubs
+   in): feed the kernel's free list for the area's page tables, from
+   system heap pages it keeps, and create the area. Without kernel patch
+   7, with virtual memory on, or with no room above RAM, there is none. */
+static void sparse_start(State *s)
+{
+    if (s->vm || !s->kcb || !s->pool || !s->sparse_want_hi ||
+        sparse_info(0) < 0)
+        return;
+    unsigned long lo = s->sparse_want_lo, hi = s->sparse_want_hi;
+    unsigned long pages = (hi - lo) / kPage;
+    unsigned long need = pages / 1024 + pages / 2048 + 8;
+    Ptr feed = NewPtrSysClear((need + 1) * kPage);
+    if (!feed)
+        return;
+    unsigned long a = ((unsigned long)feed + kPage - 1) & kPageMask;
+    for (unsigned long i = 0; i < need; i++, a += kPage) {
+        KRegs k = {0};
+        k.r3 = kcb_physical((void *)a, kPage);
+        if (k.r3)
+            nk_call(kcPutFreePage, &k);
+    }
+    KRegs k = {0};
+    k.r4 = 6;      /* read and write */
+    k.r5 = hi - lo;
+    k.r7 = 0x600C; /* at the base, 4 KB pages */
+    k.r8 = lo;
+    if (nk_call(kcCreateArea, &k))
+        return;
+    kcb_set2(kKcbOpSparse, lo, hi);
+    s->sparse_lo = lo;
+    s->sparse_hi = hi;
+    s->sparse_area = k.r9;
+}
+
+/* A chunk for domain d in the sparse range, with room for size bytes, or
+   0. Its zone covers whole pieces; only what is touched costs memory. */
+static Chunk *sparse_chunk(State *s, int d, unsigned long size)
+{
+    unsigned long units = (size + kChunkSlack + kSparseUnit - 1) / kSparseUnit;
+    int slot = -1;
+    for (int i = 0; i < kMaxChunks && slot < 0; i++)
+        if (!s->chunks[i].live)
+            slot = i;
+    if (!s->sparse_area || slot < 0 || units > kSparseMost ||
+        !sparse_ensure(s, 16))
+        return 0;
+    unsigned long lo = sparse_alloc(s, units);
+    if (!lo)
+        return 0;
+    unsigned long hi = lo + units * kSparseUnit;
+    THz z = (THz)(lo + 16);
+    THz old = GetZone();
+    InitZone(NULL, kChunkMasters, (Ptr)hi, z); /* makes z current */
+    SetZone(old);
+    unsigned long *sig = (unsigned long *)lo;
+    sig[0] = kChunkSig;
+    sig[1] = (unsigned long)z;
+
+    Chunk *c = &s->chunks[slot];
+    c->domain = d;
+    c->block = lo;
+    c->handle = (Handle)&c->block; /* chunk_is_sparse; the sweep's test
+                                      always holds */
+    c->lo = lo;
+    c->hi = hi;
+    c->zone = (unsigned long)z;
+    c->handles = 0;
+    c->keep = 0;
+    mark(s, lo, hi, owner_code(s, d));
+    c->live = 1;
+    s->pc.chunks_made++;
+    s->sparse_chunks++;
+    return c;
+}
+
 /* A handle of size bytes in chunk c, or 0. */
 static Handle chunk_alloc(Chunk *c, unsigned long size)
 {
@@ -1811,7 +2041,11 @@ static long pool_over(long trap, long size, int ptr)
     Chunk *c = 0;
     for (int i = 0; i <= kMaxChunks && !b; i++) {
         if (i == kMaxChunks) {
-            c = new_chunk(s, d, need, kOverReserve);
+            /* A new chunk: in the sparse range when there is one, where
+               it has room for later blocks and costs what is touched. */
+            c = sparse_chunk(s, d, need);
+            if (!c)
+                c = new_chunk(s, d, need, kOverReserve);
             if (!c)
                 break;
         } else {
@@ -1819,6 +2053,12 @@ static long pool_over(long trap, long size, int ptr)
             if (!c->live || c->domain != d)
                 continue;
         }
+        /* The block's pages come out of the pool as they are touched:
+           have them there first. */
+        if (chunk_is_sparse(c) &&
+            ((unsigned long)((THz)c->zone)->zcbFree < (unsigned long)size ||
+             !sparse_ensure(s, (unsigned long)size / kPage + 2)))
+            continue;
         b = ptr ? (unsigned long)chunk_alloc_ptr(c, size)
                 : (unsigned long)chunk_alloc(c, size);
     }
@@ -1894,9 +2134,11 @@ static void pool_disposed(unsigned long zone, long err)
             domain_of_zone(s, current_zone()) != c->domain)
             return;
         Handle h = c->handle;
+        int sparse = chunk_is_sparse(c);
         drop_chunk(s, c);
         s->pc.chunks_freed++;
-        DisposeHandle(h);
+        if (!sparse)
+            DisposeHandle(h);
         return;
     }
 }
@@ -2571,6 +2813,17 @@ static PoolStubs *pool_install(void)
         0x4267, 0x2F2F, 0x0006, 0x3F3C, 0x003F, 0xA88F, 0x301F, 0x48C0,
         0x4E75};
     memcpy(t.client, client, sizeof client);
+    /* A selector-only call: CLR.W -(A7) (the OSErr); MOVE.W 8(A7),-(A7)
+       (the selector); _OSDispatch; MOVE.W (A7)+,D0; EXT.L D0; RTS. */
+    const unsigned short selcall[kPoolSel] = {
+        0x4267, 0x3F2F, 0x0008, 0xA88F, 0x301F, 0x48C0, 0x4E75};
+    memcpy(t.selcall, selcall, sizeof selcall);
+    UniversalProcPtr us = NewRoutineDescriptor((ProcPtr)p->selcall,
+                                               kPoolClientInfo, kM68kISA);
+    if (us) {
+        BlockMoveData(us, &t.rd_sel, sizeof(RoutineDescriptor));
+        DisposeRoutineDescriptor(us);
+    }
     /* The trap table must be where the engine writes it. */
     volatile unsigned long *osd_e = trap_entry(_OSDispatch);
     volatile unsigned long *dh_e = trap_entry(_DisposeHandle);
@@ -3432,6 +3685,21 @@ static void kcb_start(State *s)
         ram = ram < kSpanHi - kMappedSpan ? ram + kMappedSpan : kSpanHi;
     if (ram > kSpanHi)
         ram = kSpanHi;
+    /* Sparse memory (virtual memory off): the range starts at the next
+       256 MB above logical RAM and stays in the segments application
+       VSIDs cover (0-5). The owner table covers it. */
+    s->sparse_want_lo = s->sparse_want_hi = 0;
+    if (!s->vm) {
+        unsigned long lo = (ram + 0x0FFFFFFFUL) & 0xF0000000UL;
+        unsigned long hi = lo + (unsigned long)kSparseUnits * kSparseUnit;
+        if (hi > 0x60000000UL)
+            hi = 0x60000000UL;
+        if (lo < hi) {
+            s->sparse_want_lo = lo;
+            s->sparse_want_hi = hi;
+            ram = hi;
+        }
+    }
     unsigned long entries = (ram + kPage - 1) >> 12;
     unsigned long most = (unsigned long)kKcbTablePages * kPage;
     if (entries > most)
@@ -3706,6 +3974,7 @@ long engine_start(State **out, unsigned long mode, const char *name)
             s->pool->quit_hook = 1;
         }
     }
+    sparse_start(s);
     /* After the pool stubs: the patch goes on to them. */
     self_exit_install();
     *out = s;
@@ -3732,6 +4001,7 @@ void engine_poll(State *s)
         engine_set_mem(s, s->want_mem);
     sys_follow(s);
     size_follow(s);
+    sparse_balance(s);
     if (s->pm_stub && !s->pm_site && s->kcb && s->kcb->lazy_pc &&
         s->kcb->lazy_pc != s->pm_tried && s->pm_tries < kPmTries)
         pm_hook_mapped(s);
