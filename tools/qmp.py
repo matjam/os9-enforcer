@@ -21,8 +21,10 @@ Guest UI (coordinates are guest screen pixels, x right, y down):
   tools/qmp.py click X Y                move there and click
   tools/qmp.py dclick X Y               move there and double-click
   tools/qmp.py drag X1 Y1 X2 Y2         press at X1,Y1, move to X2,Y2, release
-  tools/qmp.py key cmd-e                press a key combination
-                                        (modifiers: cmd, shift, opt, ctrl)
+  tools/qmp.py key cmd-e [MS]           press a key combination, held MS
+                                        milliseconds (default 100)
+                                        (modifiers: cmd, shift, opt, ctrl);
+                                        Force Quit (cmd-opt-esc) needs 600
   tools/qmp.py type 'some text'         type text on a US keyboard layout
 
 Set QMP_SOCK to use a socket other than run/qmp.sock.
@@ -149,8 +151,11 @@ class QMP:
         time.sleep(0.2)
         self.button(False)
 
-    def keys(self, qcodes):
-        self.cmd("send-key", keys=[{"type": "qcode", "data": q} for q in qcodes])
+    def keys(self, qcodes, hold=None):
+        args = {"keys": [{"type": "qcode", "data": q} for q in qcodes]}
+        if hold:
+            args["hold-time"] = hold
+        self.cmd("send-key", **args)
         time.sleep(0.05)
 
     def type_text(self, text):
@@ -317,8 +322,8 @@ def main(argv):
             q.click(int(args[0]), int(args[1]), count=2)
         elif op == "drag" and len(args) == 4:
             q.drag(*map(int, args))
-        elif op == "key" and len(args) == 1:
-            q.keys(combo(args[0]))
+        elif op == "key" and len(args) in (1, 2):
+            q.keys(combo(args[0]), int(args[1]) if len(args) == 2 else None)
         elif op == "type" and len(args) == 1:
             q.type_text(args[0])
         elif op == "cd-state" and not args:
