@@ -847,9 +847,104 @@ serialized, and applications run in parallel only outside it.
    scheduled tasks. The user has a plan for I/O waits, to discuss first.
 5. Optional: owner bytes for third-party extensions, so writes by them
    are named and can be limited.
+6. Memory on demand (agreed 2026-11-14, see "Memory on demand" below):
+   an application's memory follows what it uses, and the Get Info sizes
+   stop being a limit.
 
 Real hardware testing matters more with each kernel change, a
 dual-processor G4 above all.
+
+### Memory on demand
+
+The aim: an application gets "out of memory" only when the machine is
+out of memory, not when it reaches the size typed into Get Info, and
+memory it does not use is free for others.
+
+A partition is three things today: a range of addresses, a reservation
+of physical RAM made at launch, and a limit. The range has to stay: the
+heap, the stack and the A5 world are in one zone at fixed addresses, and
+all applications share one address space. The reservation and the limit
+can go.
+
+The design:
+1. Sparse partitions. Each application gets a large range of addresses
+   (bounded: applications share segments 0-5, about 1.5 GB), and a page
+   gets physical memory when it is first touched. The heap grows inside
+   the range; nothing moves.
+2. Reclaim. Pages that lie wholly in free heap blocks go back to the
+   pool and come back zero-filled. Compaction moves free space to the
+   top of the zone.
+3. Commit accounting, for the whole machine. The engine counts each
+   application's bytes in use at the Memory Manager traps. A request
+   fails only when the machine has no memory left after reclaiming:
+   compacting zones, and purging purgeable handles of applications
+   waiting in `WaitNextEvent` (not zones whose purge procedure is the
+   application's code). Accounting at the request means a page fault
+   never finds the pool empty.
+4. `MaxMem`, `FreeMem` and the like report the application's share of
+   what the machine has free, so an application that takes all it sees
+   takes a sensible amount.
+5. A guard page between the heap and the stack: a stack overflow faults
+   instead of writing into the heap.
+6. `GetProcessInformation` (`processSize`, `processFreeMem`) reports the
+   pages backed and the bytes in use, so About This Computer shows what
+   is used.
+
+With virtual memory on, the Virtual Memory Manager already backs pages
+on first touch: the work is the partition's size and place at launch (a
+Process Manager hook), and 2 to 6; reclaim means telling the VM Manager
+a page's contents are not needed. With virtual memory off, the kernel
+needs a zero-fill pager and a page pool, on top of patch 5's PTE build.
+
+Other designs, kept in reserve:
+- Overflow chunks: when `NewHandle` or `NewPtr` fails in the
+  application's zone, serve it from a chunk the application owns, as the
+  temporary memory pools do. No pager; `RecoverHandle`, `SetHandleSize`
+  and `FreeMem` do not see the chunk.
+- Sizing at launch from the high-water mark of earlier runs.
+- Compressing the pages of waiting applications, once there is a pager.
+- Mapping code read-only from one copy with virtual memory off.
+- A private address space for each application (the same addresses,
+  other pages): removes the shared 1.5 GB, but system code reaches other
+  applications' memory by address everywhere.
+
+Measured on 2026-11-14 (VM off, 512 MB, Enforcer on):
+
+- Free whole pages in running heaps (`tools/heap-pages.py`, which walks
+  each application's zone in a physical dump). With the Finder, four
+  background applications, Apple System Profiler, Sherlock 2, Scrapbook
+  and Stickies running:
+
+  | | Heap | Free | Whole free pages now |
+  |---|---|---|---|
+  | Apple System Profiler | 4,265 KB | 32% | 333 |
+  | Sherlock 2 | 3,157 KB | 46% | 362 |
+  | Scrapbook | 1,072 KB | 93% | 250 |
+  | Finder | 958 KB | 49% | 108 |
+  | all nine | 10,631 KB | 48% | 1,248 (4.9 MB) |
+
+  Nearly all free space is already in whole pages (1,248 of the 1,286
+  that one free block would give), so reclaim needs no compaction to get
+  most of it: almost half of what partitions hold today.
+- Launch does not touch the partition. Scribble with a 128 MB preferred
+  size got a partition of 32,884 pages (0x16397000-0x1E40B000). The
+  memwatch plugin on the RAM below 0x1E000000 (57,344 pages, all but the
+  partition's top 1 MB) counted 223 pages touched from startup to
+  Scribble at its prompt. So a large partition costs address space, not
+  memory, and with virtual memory on a larger partition is sparse as it
+  is.
+
+Mac OS 9's heap layout, as read in the dump: the zone header is 0x30
+bytes (`bkLim` at +0, `zcbFree` at +12); each block has a 16-byte header:
+the previous block, flags, the size with the header, and the master
+pointer's offset (relocatable) or the zone (nonrelocatable). The flags'
+first byte is 0x6B nonrelocatable, 0xAB relocatable, 0x00 or 0x10 free;
+the last block is a 12-byte nonrelocatable trailer.
+
+Next: with virtual memory on, give applications a larger partition at
+launch (the Process Manager reads the `SIZE` resource; find where, or
+answer its resource call with larger sizes), then check physical memory
+with several large partitions that add up to more than RAM.
 
 ### Switch cost
 
@@ -1176,7 +1271,8 @@ example after `tools/qmp.py quit`).
 
 `tools/memwatch/` reports which code reads or writes a range of physical
 memory: each PC and kind (load or store) once, with a count and the first
-address it touched. To find what touches the space after the NanoKernel:
+address it touched, and how many of the range's pages were read or
+written. To find what touches the space after the NanoKernel:
 
 ```bash
 SCRATCH=1 DISK=disks/os9-kernel.img PLUGIN=tools/memwatch/build/libmemwatch.dylib,lo=0xF29B40,hi=0xF60000,out=run/mw.txt ./run.sh &

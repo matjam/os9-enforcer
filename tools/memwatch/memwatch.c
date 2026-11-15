@@ -13,7 +13,9 @@
  * instruction's PC (a logical address) and kind (R or W). The report lists
  * each PC and kind once, in the order first seen, with the count, the
  * guest instruction count at the first access, and the first access's
- * logical and physical address and size. It is written when QEMU exits.
+ * logical and physical address and size. Its second line counts the 4 KB
+ * pages of the range that were read, written, or either. It is written
+ * when QEMU exits.
  */
 
 #include <glib.h>
@@ -41,6 +43,7 @@ static const char *out = "memwatch.txt";
 static GHashTable *seen;        /* (pc << 1 | write) -> Access */
 static GPtrArray *order;
 static GMutex lock;
+static uint8_t *pages;          /* per page of the range: 1 read, 2 written */
 static struct qemu_plugin_scoreboard *score;
 static qemu_plugin_u64 insns;
 
@@ -74,6 +77,8 @@ static void on_mem(unsigned int vcpu, qemu_plugin_meminfo_t info,
         g_ptr_array_add(order, a);
     }
     a->count++;
+    if (paddr >= lo)
+        pages[(paddr - lo) >> 12] |= write ? 2 : 1;
     g_mutex_unlock(&lock);
 }
 
@@ -98,6 +103,14 @@ static void on_exit(void *userdata)
         return;
     }
     fprintf(f, "# physical range 0x%" PRIx64 "-0x%" PRIx64 "\n", lo, hi);
+    uint64_t n = (hi - lo + 0xFFF) >> 12, r = 0, w = 0, any = 0;
+    for (uint64_t i = 0; i < n; i++) {
+        r += pages[i] & 1;
+        w += pages[i] >> 1;
+        any += pages[i] != 0;
+    }
+    fprintf(f, "# pages: %" PRIu64 " read, %" PRIu64 " written, %" PRIu64
+            " either, of %" PRIu64 "\n", r, w, any, n);
     fprintf(f, "# pc        kind  count       first-insn  vaddr     paddr     size\n");
     for (guint i = 0; i < order->len; i++) {
         Access *a = g_ptr_array_index(order, i);
@@ -131,6 +144,7 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
     }
     seen = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, g_free);
     order = g_ptr_array_new();
+    pages = g_malloc0((hi - lo + 0xFFF) >> 12);
     score = qemu_plugin_scoreboard_new(sizeof(uint64_t));
     insns = qemu_plugin_scoreboard_u64(score);
     qemu_plugin_register_vcpu_tb_trans_cb(id, tb_trans, NULL);
