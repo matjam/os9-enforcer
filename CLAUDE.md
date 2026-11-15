@@ -22,6 +22,25 @@ learned on the way.
 - When a hole is fixed or found, update both the Known holes list here and
   the Limits section of `README.md`.
 
+## Source layout
+
+| Directory | What it is |
+|---|---|
+| `common/` | The protection engine, the 68k and native write hooks, NanoKernel calls |
+| `enforcer/` | Enforcer Extension and the Enforcer control panel |
+| `installer/` | Enforcer Installer: patches the Mac OS ROM file, installs and removes Enforcer |
+| `kernel/` | The NanoKernel patches and the scripts that build and pack the ROM file |
+| `xlog/` | XLog, Guard, SysLog and SysGuard: console front ends on the engine |
+| `scribble/` | Scribble: writes into other memory, to test the engine |
+| `tmem/` | TMem: temporary memory experiments and a pool prototype |
+| `h68k/` | H68KTest: tests for both write hooks |
+| `wlog/` | WLog: the first write logger |
+| `probe/` | Probe: the first page protection experiment |
+| `toolchain/` | The scripts that install the Retro68 toolchain in `~/.local/opt/retro68` and find it |
+| `qemu/` | The patch and the script that install QEMU for the test machine in `~/.local/opt/qemu-os9` |
+| `refs/` | Reference sources (submodules): the NanoKernel reconstructions and tbxi |
+| `tools/` | Host scripts: drive the test machine, read the engine's state and the guest's memory, QEMU plugins, build helpers |
+
 ## Setup
 
 To set up a new clone on macOS, install the packages:
