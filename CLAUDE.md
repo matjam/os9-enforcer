@@ -12,8 +12,9 @@ learned on the way.
   and the patched QEMU in `~/.local/opt/retro68` and
   `~/.local/opt/qemu-os9` (`toolchain/build.sh`, `qemu/build.sh`). Nothing
   here is for another project, and other projects keep their own.
-- Commit each working step to `main`. The remote, `origin`, is the
-  GitHub repository matjam/os9-enforcer.
+- Commit each working step to `main` and push it. The remote, `origin`,
+  is the GitHub repository matjam/os9-enforcer. Leave release-please's
+  release pull request open: it is merged only when a release is wanted.
 - To have a change appear in the next release's changelog, start its
   commit subject with a Conventional Commits type: `feat:` (a new
   feature; raises the minor version), `fix:` (a fix; raises the patch
