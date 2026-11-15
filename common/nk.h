@@ -20,6 +20,8 @@ enum {
                                   4 KB pages), r8 base -> r8 base, r9 area.
                                   The pages have no memory until mapped. */
     kcDeleteArea = 74,         /* r3 area, with nothing mapped */
+    kcGetPhysicalAddress = 81, /* r3 area, r4 address -> r5 its physical
+                                  address; an error for a page with none */
     kcPutFreePage = 84,        /* r3 a physical page, for the kernel's own
                                   free list (area page tables come from it) */
     kcGetFreePageCount = 100,  /* -> r4 */

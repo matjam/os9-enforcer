@@ -238,6 +238,28 @@ typedef struct {
     unsigned long phys;  /* of its first whole page */
 } PoolBlock;
 
+/* Sparse partitions: an application that asks for 640 KB or more is
+   launched with a partition of kPartSize (the launch size hook), and the
+   Process Manager's request for a partition of kPartMin or more is served
+   from the sparse range (hooks at its allocation and its release;
+   engine.c, part_hook). The partition starts a page into its pieces,
+   after a Memory Manager block header. The application's heap can then
+   grow to the partition's size and costs what it touches. */
+enum {
+    kMaxParts = 16,
+    kPartUnits = 2,         /* pieces kPartSize needs */
+    kPartSize = 0x1D00000,  /* 29 MB: launch adds the stack and, for a
+                               native application, its code (1.5 MB for
+                               Apple System Profiler), and the whole has to
+                               fit kPartUnits pieces */
+    kPartMin = 0x1800000    /* 24 MB */
+};
+
+typedef struct {
+    unsigned long lo;    /* its first piece */
+    unsigned long units; /* 0: free */
+} SparsePart;
+
 /* The 68k stubs, in a system heap block of their own that is never freed:
    an application's own patch of one of the traps can still lead to a
    stub, and a disabled stub passes every call on.
@@ -261,7 +283,8 @@ enum {
     kPoolClient = 9,
     kPoolAlloc = 32,
     kPoolDp = 40,
-    kPoolSel = 7
+    kPoolSel = 7,
+    kPoolMd = 43
 };
 
 /* Overflow: when NewHandle or NewPtr fails in the current application's
@@ -324,6 +347,18 @@ typedef struct {
        sel(long selector). */
     unsigned short selcall[kPoolSel];
     RoutineDescriptor rd_sel;
+    /* _MemoryDispatch for the sparse range (sparse_lo to sparse_hi; 0, 0
+       when there is none). With virtual memory off, the ROM's HoldMemory,
+       LockMemory and GetPhysical know logical RAM only (they test against
+       low memory 0x1EF4 and count locks in a table of its pages), so a
+       disk read into sparse memory failed with ioErr. The stub passes
+       selectors 0-5 for an address in the range to pool_md, which gives
+       the pages memory and takes their physical addresses from the
+       kernel. */
+    volatile unsigned long sparse_lo, sparse_hi;
+    unsigned long md_old;
+    RoutineDescriptor rd_md;
+    unsigned short md[kPoolMd];
     unsigned short nh[kPoolAlloc], np[kPoolAlloc], dp[kPoolDp];
 } PoolStubs;
 
@@ -597,6 +632,12 @@ typedef struct {
     unsigned long sparse_chunks; /* chunks made in the range */
     unsigned long sparse_short;  /* requests refused: no memory for the pool */
     unsigned long pool_grown, pool_shrunk; /* blocks added and freed */
+    /* Sparse partitions: the stubs' block (0: no hooks), partitions made
+       and given back, and the pieces of each. */
+    unsigned long *part;
+    unsigned long part_made, part_freed;
+    unsigned long md_calls; /* _MemoryDispatch calls for the sparse range */
+    SparsePart parts[kMaxParts];
     PoolBlock pool_blocks[kPoolBlocks];
 } State;
 

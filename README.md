@@ -95,7 +95,10 @@ To stop an application that does not respond, use Force Quit
   preferred size, but no more than a quarter of the free memory (an eighth
   with virtual memory off). When its
   partition is full, a new block comes from temporary memory that the
-  application owns, as long as 2 MB of temporary memory stays free.
+  application owns, as long as 2 MB of temporary memory stays free. With
+  virtual memory off, the patched kernel also gives memory page by page:
+  a larger application gets a 29 MB partition that takes memory only
+  where it is touched and gives it back when the application quits.
 - **Stopping.** When the current application writes into another
   application, the write is denied and the application is stopped with
   `ExitToShell` in its own context. The target's memory is not changed.
@@ -171,13 +174,21 @@ Preemption:
   out, other than turning Enforcer off.
 
 Memory sizes:
-- Growing an existing block (`SetHandleSize`, `SetPtrSize`) past the
-  partition still fails: a block cannot move out of its heap. Only new
-  blocks come from outside it.
-- `FreeMem`, `MaxMem` and About This Computer count only the partition,
-  not the memory an application has outside it.
-- With virtual memory off, a larger partition reserves real memory whether
-  the application uses it or not.
+- With virtual memory off, an application that asks for 640 KB or more
+  gets a 29 MB partition that uses memory only where it is touched (up to
+  16 such applications, on a Mac with room for it above its RAM: 512 MB
+  of addresses below 1.5 GB). Others, and all applications with virtual
+  memory on, get up to four times their size as described above.
+- Past the partition, growing an existing block (`SetHandleSize`,
+  `SetPtrSize`) still fails: a block cannot move out of its heap. Only
+  new blocks come from outside it.
+- `FreeMem`, `MaxMem` and About This Computer count the partition's size,
+  not the memory in use behind it.
+- Memory an application frees inside its partition goes back to the Mac
+  only when the application quits.
+- If an application touches new memory faster than Enforcer can supply
+  it and the supply runs out, the application fails as on a Mac without
+  enough memory.
 - The sizes are one setting for every application: on or off.
 
 Compatibility:

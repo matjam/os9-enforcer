@@ -47,7 +47,8 @@ SPACES = ["skips", "spaces", "vsid_mask", "spaces_on", "pm_site", "pm_stub",
           "size_raised", "size_from", "size_to", "mem_on", "want_mem",
           "sparse_want_lo", "sparse_want_hi", "sparse_lo", "sparse_hi",
           "sparse_area", "sparse_used", "sparse_chunks", "sparse_short",
-          "pool_grown", "pool_shrunk"]
+          "pool_grown", "pool_shrunk", "part", "part_made", "part_freed",
+          "md_calls"]
 # The yield stub's data (common/hyield.h).
 YIELD = (["magic", "entry", "vecbr", "check", "wne", "entered", "yielded",
           "lost", "starting", "not_task", "in_call", "other_stack",
@@ -207,6 +208,10 @@ def print_kernel(k):
                   k["sparse_lo"], k["sparse_hi"], k["sparse_area"],
                   k["sparse_used"], k["sparse_chunks"], k["sparse_short"],
                   k["pool_grown"], k["pool_shrunk"]))
+        print("    sparse partitions: hooks %s; made %d, given back %d; "
+              "MemoryDispatch calls for the range %d" % (
+                  "at %08X" % k["part"] if k["part"] else "not installed",
+                  k["part_made"], k["part_freed"], k["md_calls"]))
     else:
         print("  sparse memory: none (planned %08X-%08X)" % (
             k["sparse_want_lo"], k["sparse_want_hi"]))

@@ -1266,6 +1266,72 @@ int main(void)
                                ? "PASS" : "FAIL");
             continue;
         }
+        case 'I': {
+            /* I/O into sparse memory: a disk driver needs the physical
+               addresses of its buffer. Get a block in a sparse chunk
+               (overflow), then for a touched part and an untouched part
+               of it: GetPhysical, and a read of this application's own
+               file straight into it. */
+            enum { kTry = 24, kBlk = 0x80000 };
+            static Handle hs[kTry];
+            Handle sp = 0;
+            int n = 0;
+            for (; n < kTry && !sp; n++) {
+                hs[n] = NewHandle(kBlk);
+                if (hs[n] && in_chunk(hs[n]))
+                    sp = hs[n];
+            }
+            if (!sp) {
+                printf("no block in a chunk\n");
+            } else {
+                HLock(sp);
+                char *b = *sp;
+                ProcessSerialNumber me = {0, kCurrentProcess};
+                ProcessInfoRec pi;
+                FSSpec spec;
+                memset(&pi, 0, sizeof pi);
+                pi.processInfoLength = sizeof pi;
+                pi.processAppSpec = &spec;
+                GetProcessInformation(&me, &pi);
+                b[0x1000] = 1; /* touched: pages 1 to 16 */
+                for (int o = 0x1000; o < 0x11000; o += 0x1000)
+                    b[o] = 1;
+                unsigned long pt = kcb_physical(b + 0x1000, 4096);
+                unsigned long pu = kcb_physical(b + 0x40000, 4096);
+                OSErr lk = LockMemory(b + 0x50000, 0x10000);
+                unsigned long pl = kcb_physical(b + 0x50000, 4096);
+                short ref = 0;
+                OSErr oe = FSpOpenDF(&spec, fsRdPerm, &ref);
+                long len = 0x10000;
+                OSErr r1 = oe ? oe : FSRead(ref, &len, b + 0x1000);
+                long got1 = len;
+                len = 0x10000;
+                if (!oe)
+                    SetFPos(ref, fsFromStart, 0);
+                OSErr r2 = oe ? oe : FSRead(ref, &len, b + 0x20000);
+                long got2 = len;
+                len = 0x10000;
+                if (!oe)
+                    SetFPos(ref, fsFromStart, 0);
+                OSErr r3 = oe ? oe : FSRead(ref, &len, b + 0x50000);
+                if (!oe)
+                    FSClose(ref);
+                int same = !memcmp(b + 0x1000, b + 0x20000, 0x10000) &&
+                           !memcmp(b + 0x1000, b + 0x50000, 0x10000);
+                printf("block %08lX in a chunk. GetPhysical: touched "
+                       "%08lX, untouched %08lX, after LockMemory (%d) "
+                       "%08lX\n", (unsigned long)b, pt, pu, lk, pl);
+                printf("read 64 KB into touched pages: %d (%ld bytes), "
+                       "untouched: %d (%ld bytes), locked: %d; the three "
+                       "%s\n", r1, got1, r2, got2, r3,
+                       same ? "are the same" : "DIFFER");
+                printf("%s\n", !r1 && !r2 && !r3 && same ? "PASS" : "FAIL");
+            }
+            for (int i = 0; i < n; i++)
+                if (hs[i])
+                    DisposeHandle(hs[i]);
+            continue;
+        }
         case 'J': {
             /* Sparse memory (kernel patch 7): a 64 MB area above RAM with
                no memory behind it, and a pool of 64 pages. Touch 48 pages

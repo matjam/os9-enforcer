@@ -48,8 +48,9 @@ enum {
     kSzRaised = 1,
     kSzFrom = 2,
     kSzTo = 3,
+    kSzSparse = 4, /* the size of a sparse partition, or 0 for none */
     kSzCode = 8,
-    kSzLongs = 40
+    kSzLongs = 48
 };
 
 /* SysPages.flags */
@@ -1776,6 +1777,86 @@ static int chunk_is_sparse(const Chunk *c)
     return c->handle == (Handle)&c->block;
 }
 
+/* _MemoryDispatch for an address in the sparse range (engine.h), from its
+   stub: sel 0 HoldMemory, 1 UnholdMemory, 2 LockMemory, 3
+   LockMemoryContiguous, 4 UnlockMemory (a0 the address, a1 the length),
+   5 GetPhysical (a0 the table: a logical address and length, then
+   physical address and length pairs; a1 how many pairs it holds).
+   Returns the error in the low word and, for GetPhysical, the pairs
+   filled in the high word. Holding and locking give the pages memory;
+   nothing takes it away before the chunk or partition is given back. */
+static long pool_md(long sel, unsigned long a0, unsigned long a1)
+{
+    State *s = g_state;
+    if (!s || !s->sparse_area)
+        return (long)(unsigned short)paramErr;
+    s->md_calls++;
+    if (sel == 1 || sel == 4)
+        return 0;
+    unsigned long addr = a0, len = a1;
+    unsigned long *t = (unsigned long *)a0;
+    if (sel == 5) {
+        addr = t[0];
+        len = t[1];
+    }
+    if (!len || addr < s->sparse_lo || addr + len > s->sparse_hi ||
+        addr + len < addr)
+        return (long)(unsigned short)paramErr;
+    unsigned long first = addr & kPageMask;
+    unsigned long last = (addr + len - 1) & kPageMask;
+    if (CurrentExecutionLevel() == kTaskLevel)
+        sparse_ensure(s, (last - first) / kPage + 1);
+    unsigned long pairs = 0, run = 0, run_len = 0, done = 0;
+    for (unsigned long p = first;; p += kPage) {
+        (void)*(volatile unsigned char *)p; /* a page, if it had none */
+        KRegs k = {0};
+        k.r3 = s->sparse_area;
+        k.r4 = p;
+        if (nk_call(kcGetPhysicalAddress, &k))
+            return (long)(unsigned short)paramErr;
+        unsigned long phys = k.r5 & kPageMask;
+        unsigned long from = p == first ? addr : p;
+        unsigned long to = p == last ? addr + len : p + kPage;
+        if (sel == 5) {
+            if (run_len && run + run_len == phys + (from - p)) {
+                run_len += to - from;
+            } else {
+                if (run_len) {
+                    if (pairs == a1)
+                        break; /* the table is full */
+                    t[2 + 2 * pairs] = run;
+                    t[3 + 2 * pairs] = run_len;
+                    pairs++;
+                    done += run_len;
+                }
+                run = phys + (from - p);
+                run_len = to - from;
+            }
+        } else if (sel == 3) {
+            if (run_len && run + run_len != phys)
+                return (long)(unsigned short)-620; /* notEnoughMemoryErr */
+            if (!run_len)
+                run = phys;
+            run_len += kPage;
+        }
+        if (p == last) {
+            if (sel == 5 && run_len && pairs < a1) {
+                t[2 + 2 * pairs] = run;
+                t[3 + 2 * pairs] = run_len;
+                pairs++;
+                done += run_len;
+            }
+            break;
+        }
+    }
+    if (sel == 5) { /* what is left to translate, as the ROM leaves it */
+        t[0] = addr + done;
+        t[1] = len - done;
+        return (long)(pairs << 16);
+    }
+    return 0;
+}
+
 /* Make the range (engine_start, with the block registered and the stubs
    in): feed the kernel's free list for the area's page tables, from
    system heap pages it keeps, and create the area. Without kernel patch
@@ -1809,6 +1890,8 @@ static void sparse_start(State *s)
     s->sparse_lo = lo;
     s->sparse_hi = hi;
     s->sparse_area = k.r9;
+    s->pool->sparse_hi = hi; /* the _MemoryDispatch stub's range */
+    s->pool->sparse_lo = lo;
 }
 
 /* A chunk for domain d in the sparse range, with room for size bytes, or
@@ -2824,6 +2907,66 @@ static PoolStubs *pool_install(void)
         BlockMoveData(us, &t.rd_sel, sizeof(RoutineDescriptor));
         DisposeRoutineDescriptor(us);
     }
+    /* _MemoryDispatch (D0 the selector, A0 and A1 its arguments; D0 the
+       result, A0 the pairs GetPhysical filled):
+         00 tst.w   enabled
+         06 beq.s   4E
+         08 cmpi.w  #5,d0            ; selectors 0-5 only
+         0C bhi.s   4E
+         0E move.l  d1,-(sp)
+         10 move.l  a0,d1            ; the address,
+         12 cmpi.w  #5,d0
+         16 bne.s   1A
+         18 move.l  (a0),d1          ; or GetPhysical's table's
+         1A cmp.l   sparse_lo,d1
+         20 bcs.s   4C
+         22 cmp.l   sparse_hi,d1
+         28 bcc.s   4C
+         2A move.l  a1,-(sp)         ; pool_md(selector, a0, a1)
+         2C move.l  a0,-(sp)
+         2E ext.l   d0
+         30 move.l  d0,-(sp)
+         32 movea.l #rd_md,a0
+         38 jsr     (a0)
+         3A lea     12(sp),sp
+         3E move.l  d0,d1
+         40 swap    d1
+         42 movea.w d1,a0            ; the pairs
+         44 ext.l   d0               ; the error
+         46 move.l  (sp)+,d1
+         48 tst.w   d0
+         4A rts
+         4C move.l  (sp)+,d1
+         4E move.l  md_old,-(sp)
+         54 rts */
+    UniversalProcPtr um = NewRoutineDescriptor((ProcPtr)pool_md, 0xFF1,
+                                               kPowerPCISA);
+    if (um) {
+        BlockMoveData(um, &t.rd_md, sizeof(RoutineDescriptor));
+        DisposeRoutineDescriptor(um);
+    }
+    volatile unsigned long *md_e = trap_entry(0xA05C);
+    t.md_old = *md_e;
+    {
+        unsigned long en = (unsigned long)&p->enabled;
+        unsigned long lo = (unsigned long)&p->sparse_lo;
+        unsigned long hi = (unsigned long)&p->sparse_hi;
+        unsigned long rm = (unsigned long)&p->rd_md;
+        unsigned long mo = (unsigned long)&p->md_old;
+        const unsigned short md[kPoolMd] = {
+            0x4A79, HI16(en), LO16(en), 0x6746,
+            0x0C40, 0x0005, 0x6240,
+            0x2F01, 0x2208, 0x0C40, 0x0005, 0x6602, 0x2210,
+            0xB2B9, HI16(lo), LO16(lo), 0x652A,
+            0xB2B9, HI16(hi), LO16(hi), 0x6422,
+            0x2F09, 0x2F08, 0x48C0, 0x2F00,
+            0x207C, HI16(rm), LO16(rm), 0x4E90,
+            0x4FEF, 0x000C,
+            0x2200, 0x4841, 0x3041, 0x48C0, 0x221F, 0x4A40, 0x4E75,
+            0x221F,
+            0x2F39, HI16(mo), LO16(mo), 0x4E75};
+        memcpy(t.md, md, sizeof md);
+    }
     /* The trap table must be where the engine writes it. */
     volatile unsigned long *osd_e = trap_entry(_OSDispatch);
     volatile unsigned long *dh_e = trap_entry(_DisposeHandle);
@@ -2930,6 +3073,8 @@ static PoolStubs *pool_install(void)
     *nh_e = (unsigned long)p->nh;
     *np_e = (unsigned long)p->np;
     *dp_e = (unsigned long)p->dp;
+    if (um && us)
+        *md_e = (unsigned long)p->md;
     *osd_e = (unsigned long)p->osd;
     *dh_e = (unsigned long)p->dh;
     *ets_e = (unsigned long)p->ets;
@@ -2969,6 +3114,7 @@ static void pool_keep(State *s)
     keep_one(s, trap_entry(_NewHandle), p->nh_old, p->nh);
     keep_one(s, trap_entry(_NewPtr), p->np_old, p->np);
     keep_one(s, trap_entry(_DisposePtr), p->dp_old, p->dp);
+    keep_one(s, trap_entry(0xA05C), p->md_old, p->md);
 }
 
 /* Disable the stubs and take out those still first in their traps. The
@@ -2981,6 +3127,7 @@ static void pool_remove(State *s)
     p->enabled = 0;
     p->quit_hook = 0;
     s->pool = 0;
+    remove_one(trap_entry(0xA05C), p->md_old, p->md);
     remove_one(trap_entry(_DisposePtr), p->dp_old, p->dp);
     remove_one(trap_entry(_NewPtr), p->np_old, p->np);
     remove_one(trap_entry(_NewHandle), p->nh_old, p->nh);
@@ -3229,8 +3376,20 @@ static void size_stub_aim(unsigned long *p, unsigned long site)
     unsigned long *c = p + kSzCode;
     *c++ = 0x3CA00000 | base >> 16;      /* lis r5,base@h */
     *c++ = 0x60A50000 | (base & 0xFFFF); /* ori r5,r5,base@l */
-    *c++ = 0x80C50000 | kSzCap * 4;      /* lwz r6,cap(r5) */
     *c++ = 0x809F0002;                   /* lwz r4,2(r31) */
+    /* A sparse partition (kSzSparse not 0): that size, for an application
+       that asks for 640 KB or more and less than it. */
+    *c++ = 0x80C50000 | kSzSparse * 4;   /* lwz r6,sparse(r5) */
+    *c++ = 0x28060000;                   /* cmplwi r6,0 */
+    *c++ = 0x41820020;                   /* beq normal */
+    *c++ = 0x3CE0000A;                   /* lis r7,0x000A */
+    *c++ = 0x7C043840;                   /* cmplw r4,r7 */
+    *c++ = 0x41800014;                   /* blt normal */
+    *c++ = 0x7C062040;                   /* cmplw r6,r4 */
+    *c++ = 0x40810050;                   /* ble done */
+    *c++ = 0x7CC73378;                   /* mr r7,r6 */
+    *c++ = 0x48000030;                   /* b store */
+    *c++ = 0x80C50000 | kSzCap * 4;      /* normal: lwz r6,cap(r5) */
     *c++ = 0x28060000;                   /* cmplwi r6,0 */
     *c++ = 0x4182003C;                   /* beq done */
     *c++ = 0x54870003;                   /* rlwinm. r7,r4,0,0,1 */
@@ -3241,7 +3400,7 @@ static void size_stub_aim(unsigned long *p, unsigned long site)
     *c++ = 0x7CC73378;                   /* mr r7,r6 */
     *c++ = 0x7C072040;                   /* cmplw r7,r4 */
     *c++ = 0x4081001C;                   /* ble done */
-    *c++ = 0x90FF0002;                   /* stw r7,2(r31) */
+    *c++ = 0x90FF0002;                   /* store: stw r7,2(r31) */
     *c++ = 0x81050000 | kSzRaised * 4;   /* lwz r8,raised(r5) */
     *c++ = 0x39080001;                   /* addi r8,r8,1 */
     *c++ = 0x91050000 | kSzRaised * 4;   /* stw r8,raised(r5) */
@@ -3346,6 +3505,274 @@ static void size_unhook(State *s)
     s->size_stub = 0;
 }
 
+/* Sparse partitions (engine.h). Three sites in the Process Manager's
+   fragment, found from the size hook's site Z (the fragment's code is the
+   same every boot) and checked by their instructions:
+
+   P1, Z - 0x14798, where it allocates a new process's partition (r3 the
+   size, r31 the process entry; the handle goes to entry + 48 and its
+   block's address to entry + 44):
+       bl    alloc          ; its allocator in its own zone
+       nop
+   P2, Z - 0x134DC, where it frees the partition at quit and after a
+   failed launch:
+       lwz   r3,48(r31)
+       bl    DisposeHandle  ; import glue
+       lwz   r2,20(r1)
+   P3, Z - 0x8CD0, in the quit code that makes the partition's block the
+   scrap when the scrap is in the dying heap (it shrinks the block and
+   keeps it):
+       cmpwi r0,0           ; a flag that is 0
+       beq   take           ; Z - 0x8C20: take the partition
+                            ; else copy the scrap to a new handle
+
+   The block the stubs live in (system heap, never freed), in longs:
+   kPtLo and kPtHi the sparse range; kPtNew the engine's part_new (its
+   transition vector), 0 once the engine stops; kPtAlloc and kPtDispose
+   the routines P1 and P2 called; kPtCopy and kPtTake P3's two ways on;
+   kPtMp the master pointers of the handles part_new returns; then code.
+
+   P1's stub calls part_new(size): a handle, 0 (no memory: the Process
+   Manager then tries a smaller size), or -1 for "not sparse", and then
+   calls the Process Manager's allocator. P2's stub needs no engine: for a
+   handle among kPtMp it clears the master pointer and returns; part_reap
+   gives the memory back. P3's stub takes the copy way for a partition in
+   the range.
+
+   The Process Manager calls HLock on the handle at launch and
+   GetHandleSize at quit (to clear the Notification and Time Manager
+   queues of entries in the partition), so the block has a Memory Manager
+   header: a locked relocatable block of the size, its master pointer
+   given as an offset from the Process Manager's zone. */
+enum {
+    kPtLo = 0,
+    kPtHi = 1,
+    kPtNew = 2,
+    kPtAlloc = 3,
+    kPtDispose = 4,
+    kPtCopy = 5,
+    kPtTake = 6,
+    kPtMp = 8,
+    kPtCode = kPtMp + kMaxParts,
+    kPtLongs = kPtCode + 72,
+    kP1Delta = 0x14798,
+    kP2Delta = 0x134DC,
+    kP3Delta = 0x8CD0
+};
+
+/* Whether a sparse partition can be made now. */
+static int part_room(State *s)
+{
+    if (!s->part || !s->sparse_area || s->mode == kModeOff || !s->mem_on)
+        return 0;
+    int slot = 0;
+    for (int i = 0; i < kMaxParts; i++)
+        if (!s->parts[i].units)
+            slot = 1;
+    unsigned long total = (s->sparse_hi - s->sparse_lo) / kSparseUnit;
+    unsigned long mask = (1UL << kPartUnits) - 1;
+    for (unsigned long i = 0; slot && i + kPartUnits <= total; i++)
+        if (!(s->sparse_used & (mask << i)))
+            return 1;
+    return 0;
+}
+
+/* From P1's stub, in the launching application's context, with the
+   Process Manager's zone current: the partition's handle, 0, or -1. */
+static long part_new(long size)
+{
+    State *s = g_state;
+    if (!s || !s->running || !s->part || !s->sparse_area ||
+        s->mode == kModeOff || !s->mem_on || !s->pm_zone ||
+        (unsigned long)size < kPartMin)
+        return -1;
+    unsigned long units =
+        ((unsigned long)size + kPage + kSparseUnit - 1) / kSparseUnit;
+    int slot = -1;
+    for (int i = 0; i < kMaxParts && slot < 0; i++)
+        if (!s->parts[i].units)
+            slot = i;
+    if (slot < 0 || units > kSparseMost || !sparse_ensure(s, 64))
+        return -1;
+    unsigned long lo = sparse_alloc(s, units);
+    if (!lo)
+        return -1;
+    unsigned long p = lo + kPage, end = lo + units * kSparseUnit;
+    unsigned long *mp = &s->part[kPtMp + slot];
+    unsigned long *h = (unsigned long *)(p - 16);
+    h[0] = 0;
+    h[1] = 0xAB000004UL;                /* relocatable; 4 bytes of padding */
+    h[2] = (unsigned long)size + 16;
+    h[3] = (unsigned long)mp - s->pm_zone;
+    *mp = p;
+    /* The Memory Manager takes a handle only below its top of memory. */
+    volatile unsigned long *top = lowmem(0x1E10);
+    if (*top < end)
+        *top = end;
+    s->parts[slot].lo = lo;
+    s->parts[slot].units = units;
+    s->part_made++;
+    return (long)mp;
+}
+
+/* Give back the partitions P2's stub has freed (task level). */
+static void part_reap(State *s)
+{
+    if (!s->part)
+        return;
+    for (int i = 0; i < kMaxParts; i++)
+        if (s->parts[i].units && !s->part[kPtMp + i]) {
+            sparse_release(s, s->parts[i].lo, s->parts[i].units);
+            s->parts[i].units = 0;
+            s->part_freed++;
+        }
+}
+
+static unsigned long *emit_base(unsigned long *c, unsigned reg,
+                                unsigned long base)
+{
+    *c++ = 0x3C000000 | reg << 21 | base >> 16;                /* lis */
+    *c++ = 0x60000000 | reg << 21 | reg << 16 | (base & 0xFFFF); /* ori */
+    return c;
+}
+
+/* Hook the three sites (engine_start, after size_hook and sparse_start;
+   virtual memory off, where the fragment is in the system heap). */
+static void part_hook(State *s)
+{
+    if (!s->size_site || s->size_mapped || !s->sparse_area)
+        return;
+    volatile unsigned long *p1 =
+        (volatile unsigned long *)(s->size_site - kP1Delta);
+    volatile unsigned long *p2 =
+        (volatile unsigned long *)(s->size_site - kP2Delta);
+    volatile unsigned long *p3 =
+        (volatile unsigned long *)(s->size_site - kP3Delta);
+    if (p1[0] != 0x4800E109 || p1[1] != 0x60000000 || p1[-1] != 0x807F03E2 ||
+        p2[0] != 0x48014B45 || p2[-1] != 0x807F0030 || p2[1] != 0x80410014 ||
+        p3[0] != 0x418200B0 || p3[-1] != 0x2C000000 || p3[1] != 0x809B0000)
+        return;
+    unsigned long *b = (unsigned long *)NewPtrSysClear(kPtLongs * 4);
+    if (!b || (unsigned long)b + kPtLongs * 4 >= 0x2000000UL) {
+        if (b)
+            DisposePtr((Ptr)b);
+        return;
+    }
+    unsigned long base = (unsigned long)b;
+    b[kPtLo] = s->sparse_lo;
+    b[kPtHi] = s->sparse_hi;
+    b[kPtNew] = (unsigned long)part_new; /* its transition vector */
+    b[kPtAlloc] = (unsigned long)p1 + 0xE108;
+    b[kPtDispose] = (unsigned long)p2 + 0x14B44;
+    b[kPtCopy] = (unsigned long)p3 + 4;
+    b[kPtTake] = (unsigned long)p3 + 0xB0;
+    unsigned long *c = b + kPtCode;
+
+    unsigned long *s1 = c; /* P1: r3 the size */
+    *c++ = 0x7C0802A6;                 /* mflr r0 */
+    *c++ = 0x90010008;                 /* stw r0,8(r1) */
+    *c++ = 0x9421FFC0;                 /* stwu r1,-64(r1) */
+    *c++ = 0x90410014;                 /* stw r2,20(r1) */
+    *c++ = 0x90610038;                 /* stw r3,56(r1) */
+    c = emit_base(c, 12, base);
+    *c++ = 0x818C0000 | kPtNew * 4;    /* lwz r12,new(r12) */
+    *c++ = 0x280C0000;                 /* cmplwi r12,0 */
+    *c++ = 0x41820020;                 /* beq orig */
+    *c++ = 0x800C0000;                 /* lwz r0,0(r12) */
+    *c++ = 0x804C0004;                 /* lwz r2,4(r12) */
+    *c++ = 0x7C0903A6;                 /* mtctr r0 */
+    *c++ = 0x4E800421;                 /* bctrl: part_new(size) */
+    *c++ = 0x80410014;                 /* lwz r2,20(r1) */
+    *c++ = 0x2C03FFFF;                 /* cmpwi r3,-1 */
+    *c++ = 0x40820020;                 /* bne done */
+    *c++ = 0x80610038;                 /* orig: lwz r3,56(r1) */
+    c = emit_base(c, 12, base);
+    *c++ = 0x818C0000 | kPtAlloc * 4;  /* lwz r12,alloc(r12) */
+    *c++ = 0x7D8903A6;                 /* mtctr r12 */
+    *c++ = 0x4E800421;                 /* bctrl */
+    *c++ = 0x80410014;                 /* lwz r2,20(r1) */
+    *c++ = 0x38210040;                 /* done: addi r1,r1,64 */
+    *c++ = 0x80010008;                 /* lwz r0,8(r1) */
+    *c++ = 0x7C0803A6;                 /* mtlr r0 */
+    *c++ = 0x4E800020;                 /* blr */
+
+    unsigned long *s2 = c; /* P2: r3 the handle, in place of the glue */
+    *c++ = 0x90410014;                 /* stw r2,20(r1), as the glue does */
+    c = emit_base(c, 12, base);
+    *c++ = 0x396C0000 | kPtMp * 4;     /* addi r11,r12,mp */
+    *c++ = 0x7C035840;                 /* cmplw r3,r11 */
+    *c++ = 0x41800020;                 /* blt orig */
+    *c++ = 0x396C0000 | kPtCode * 4;   /* addi r11,r12,mp end */
+    *c++ = 0x7C035840;                 /* cmplw r3,r11 */
+    *c++ = 0x40800014;                 /* bge orig */
+    *c++ = 0x38000000;                 /* li r0,0 */
+    *c++ = 0x90030000;                 /* stw r0,0(r3): freed */
+    *c++ = 0x38600000;                 /* li r3,0 */
+    *c++ = 0x4E800020;                 /* blr */
+    *c++ = 0x816C0000 | kPtDispose * 4; /* orig: lwz r11,dispose(r12) */
+    *c++ = 0x7D6903A6;                 /* mtctr r11 */
+    *c++ = 0x4E800420;                 /* bctr */
+
+    unsigned long *s3 = c; /* P3: cr0 from the flag; r27 -> the entry */
+    *c++ = 0x4082002C;                 /* bne copy */
+    *c++ = 0x819B0000;                 /* lwz r12,0(r27) */
+    *c++ = 0x818C002C;                 /* lwz r12,44(r12): the partition */
+    c = emit_base(c, 11, base);
+    *c++ = 0x800B0000 | kPtLo * 4;     /* lwz r0,lo(r11) */
+    *c++ = 0x7C0C0040;                 /* cmplw r12,r0 */
+    *c++ = 0x41800024;                 /* blt take */
+    *c++ = 0x800B0000 | kPtHi * 4;     /* lwz r0,hi(r11) */
+    *c++ = 0x7C0C0040;                 /* cmplw r12,r0 */
+    *c++ = 0x40800018;                 /* bge take */
+    c = emit_base(c, 11, base);        /* copy: */
+    *c++ = 0x816B0000 | kPtCopy * 4;   /* lwz r11,copy(r11) */
+    *c++ = 0x7D6903A6;                 /* mtctr r11 */
+    *c++ = 0x4E800420;                 /* bctr */
+    c = emit_base(c, 11, base);        /* take: */
+    *c++ = 0x816B0000 | kPtTake * 4;   /* lwz r11,take(r11) */
+    *c++ = 0x7D6903A6;                 /* mtctr r11 */
+    *c++ = 0x4E800420;                 /* bctr */
+    flush_code(b + kPtCode, (unsigned long)(c - (b + kPtCode)) * 4);
+
+    s->part = b;
+    *p1 = 0x48000003 | (unsigned long)s1; /* bla */
+    *p2 = 0x48000003 | (unsigned long)s2;
+    *p3 = 0x48000002 | (unsigned long)s3; /* ba */
+    flush_code(p1, 4);
+    flush_code(p2, 4);
+    flush_code(p3, 4);
+}
+
+/* The engine is stopping: P1 goes back to the Process Manager's
+   allocator. With no sparse partition left, the sites get their
+   instructions back; otherwise the stubs stay, and P2 and P3 still work
+   without the engine. */
+static void part_unhook(State *s)
+{
+    if (!s->part)
+        return;
+    s->part[kPtNew] = 0;
+    part_reap(s);
+    int live = 0;
+    for (int i = 0; i < kMaxParts; i++)
+        live |= s->parts[i].units != 0;
+    if (!live && s->size_site) {
+        volatile unsigned long *p1 =
+            (volatile unsigned long *)(s->size_site - kP1Delta);
+        volatile unsigned long *p2 =
+            (volatile unsigned long *)(s->size_site - kP2Delta);
+        volatile unsigned long *p3 =
+            (volatile unsigned long *)(s->size_site - kP3Delta);
+        *p1 = 0x4800E109;
+        *p2 = 0x48014B45;
+        *p3 = 0x418200B0;
+        flush_code(p1, 4);
+        flush_code(p2, 4);
+        flush_code(p3, 4);
+    }
+    s->part = 0; /* the block stays */
+}
+
 /* The cap for the next launch, and the stub's counts (task level). */
 static void size_follow(State *s)
 {
@@ -3359,10 +3786,12 @@ static void size_follow(State *s)
         cap = ((unsigned long)((THz)s->pm_zone)->zcbFree /
                (s->vm ? kSizeShare : kSizeShareReal)) & ~0xFFFUL;
     p[kSzCap] = cap;
+    p[kSzSparse] = cap && part_room(s) ? kPartSize : 0;
     s->size_cap = cap;
     s->size_raised = p[kSzRaised];
     s->size_from = p[kSzFrom];
     s->size_to = p[kSzTo];
+    part_reap(s);
 }
 
 void engine_set_mem(State *s, int on)
@@ -3975,6 +4404,7 @@ long engine_start(State **out, unsigned long mode, const char *name)
         }
     }
     sparse_start(s);
+    part_hook(s);
     /* After the pool stubs: the patch goes on to them. */
     self_exit_install();
     *out = s;
@@ -4037,6 +4467,7 @@ void engine_stop(State *s)
         unprotect_domain(s, i);
     }
     s->sys_on = 0;
+    part_unhook(s);
     size_unhook(s);
     pm_unhook(s);
     kcb_stop(s);

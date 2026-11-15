@@ -331,7 +331,8 @@ allowed store changes nothing.
 | `G` | `TempNewHandle` in system mode (`BeginSystemMode`) | PASS: the handle is the Process Manager's, not in a chunk |
 | `A` | draw an Appearance scroll bar with a thumb for 3 s; first in a fresh boot, then again after `q`, a launch and `m` | the first passes 1 request on in system mode (the theme's thumb image); the second thumb is the same as the first |
 | `O` | 6 MB of handles and 2 MB of pointers in 256 KB blocks (the file asks for a 1 MB partition), written, read back and disposed | PASS: every block, those the partition cannot hold in chunks, the chunks freed after disposing |
-| `J` | sparse memory (kernel patch 7, VM off; once a boot: it leaves 450 KB in the system heap): a 64 MB area with a pool of 64 pages, 48 pages touched, freed, one touched again | PASS: each page zero at first touch and holding its data, the pool's counts right, the area deleted |
+| `J` | sparse memory (kernel patch 7, VM off; once a boot: it leaves 450 KB in the system heap): a 64 MB area with a pool of 64 pages, 48 pages touched, freed, one touched again | PASS: each page zero at first touch and holding its data, the pool's counts right, the area deleted. SKIP when the engine has the sparse range |
+| `I` | I/O into sparse memory: a 64 KB read of its own file into touched, untouched and locked pages of a block in a sparse chunk | PASS: three reads without error, the same bytes |
 
 `Y`, `V` and `D` flip the word, read it back and restore it, and print
 whether the store landed.
@@ -1073,17 +1074,12 @@ Not built, and why:
   kernel with a pool of pages, and the partition placed outside the
   Process Manager's heap.
 
-The pager is built (2026-11-15, "Sparse memory (kernel patch 7)"). What
-is left is using it:
-1. The engine owns the pool: pages from locked temporary memory, kept
-   ahead of use, with the owner table sized for the sparse range.
-2. Overflow chunks in a sparse area: a chunk's zone can then be large,
-   and its free pages go back with `OP_SPARSE_FREE`.
-3. Partitions in a sparse area. Launch (`0x117E170` reads the sizes; the
-   caller stores the preferred size and calls one routine that makes the
-   process, retrying smaller on `memFullErr` down to the minimum) has the
-   partition as a block of the Process Manager's heap, with its size,
-   lock and disposal going through that heap.
+The pager is built (2026-11-15, "Sparse memory (kernel patch 7)"), and
+the engine uses it for overflow chunks and for partitions; see "Built"
+below. Launch (`0x117E170` reads the sizes; the caller stores the
+preferred size and calls one routine that makes the process, retrying
+smaller on `memFullErr` down to the minimum) has the partition as a block
+of the Process Manager's heap.
 
 Traced so far (2026-11-15, a VM-off dump; addresses of that boot):
 - The Process Manager's native fragment has its TOC at 0x010CC17C (206
@@ -1112,28 +1108,83 @@ Traced so far (2026-11-15, a VM-off dump; addresses of that boot):
   (`GetProcessInformation`) is 0x011682A0 and 0x1D (`TempNewHandle`)
   0x0117C568. The whole Process Manager is native on 9.2.2.
 
-The engine's side of sparse memory (design, 2026-11-15):
-- The range: above logical RAM, in segments the VSIDs cover (0x30000000
-  to 0x50000000 on a 512 MB machine; none when RAM fills segments 0-5).
-  The area's page tables cost about 1.5 pages a megabyte, fed to the
-  kernel's free list from system heap pages for good. The owner table has
-  to cover the range (one byte a page).
-- The pool is a balloon: the engine takes temporary memory, locks it and
-  gives its pages to the kernel's pool, keeping most of the free memory
-  there and leaving a reserve in the Process Manager's heap. It gives
-  pages back (`OP_POOL_GET`, then frees the block when all its pages are
-  back) when Mac OS needs memory: at a `TempNewHandle` or a launch that
-  would fail, and when the reserve falls. Mac OS's count of free memory
-  then stays honest: pool pages are used temporary memory.
-- A touch with the pool empty cannot be served at the fault: that point
-  can be inside the Memory Manager or at interrupt time, where nothing
-  can be allocated. With the balloon holding the free memory, an empty
-  pool means the machine is out of memory. The application is then
-  stopped as for an offense; commit accounting at the Memory Manager
-  traps (design point 3) is what would turn that into `memFullErr`
-  before it happens.
-- Pages come back to the pool from freed heap blocks (`OP_SPARSE_FREE`),
-  design point 2.
+Where the Process Manager uses the partition (read from the same dump;
+offsets from the size hook's site Z, 0x0117E258 there):
+- The process entry (1,416 bytes, its own handle) holds the partition's
+  handle at +48, its address at +44, the size asked at +994 and the size
+  reported at +72. The partition is allocated at Z − 0x14798 (P1: `bl` to
+  the fragment's allocator, which makes a relocatable block high in the
+  Process Manager's zone through `_HeapDispatch`), then locked.
+- The zone is set up at the block's start (`InitZone`, 64 master
+  pointers), the A5 world at its top and the stack under that. Nothing
+  moves or resizes a partition while its application runs.
+- The handle is used as a Memory Manager object in seven places: `HLock`
+  at launch; `GetHandleSize` twice at quit, to take the application's
+  entries out of the Notification and Time Manager queues; two more under
+  virtual memory only; `DisposeHandle` at Z − 0x134DC (P2), at quit and
+  after a failed launch; and, at quit, when the scrap lies in the dying
+  heap, `SetHandleSize` and `HUnlock` to turn the partition's block into
+  the scrap (the branch at Z − 0x8CD0, P3, chooses between that and
+  copying the scrap to a new handle).
+- `GetProcessInformation` reads +44 and +72 and asks `FreeMem` in the
+  application's zone; it does not use the handle.
+
+Built (2026-11-15), virtual memory off:
+- The range and the pool (`sparse_start`, `pool_grow`, `pool_shrink`,
+  `sparse_ensure`, `sparse_balance`): 0x20000000 to 0x40000000 on the
+  512 MB machine (the next 256 MB above logical RAM, 512 MB long, inside
+  segments 0-5), in 16 MB pieces. The area's page tables are fed to the
+  kernel's free list from system heap pages (about 200 for this range).
+  The owner table covers the range. The pool's pages are 1 MB blocks of
+  temporary memory made in system mode (`BeginSystemMode`), locked. The
+  engine keeps 4 MB of headroom plus what an allocation it sees needs,
+  and gives whole blocks back at its poll. It is not a balloon over all
+  free memory: other launches keep the memory they had.
+- Overflow chunks in the range (`sparse_chunk`): one zone on whole
+  pieces. Scribble `O`'s 16 overflow blocks share one.
+- Sparse partitions (`part_hook`, `part_new`, `part_reap`): the size hook
+  gives an application that asks for 640 KB or more a 29 MB preferred
+  size; P1's stub asks `part_new`, which returns a handle the engine
+  makes (a master pointer in the stubs' block, the partition a page into
+  its pieces behind a Memory Manager header that `HLock` and
+  `GetHandleSize` accept) for a request of 24 MB or more; P2's stub
+  clears that master pointer instead of disposing, with no engine code,
+  and `part_reap` returns the pieces; P3's stub takes the copy way for a
+  partition in the range. The stubs stay if the engine stops while a
+  sparse partition lives.
+- `_MemoryDispatch` for the range (`pool_md`): with virtual memory off the
+  ROM's `HoldMemory`, `LockMemory` and `GetPhysical` are 68k code that
+  tests against low memory 0x1EF4 (the top of logical memory) and counts
+  locks in a table of its pages, so a disk read into sparse memory, and
+  with it every launch into a sparse partition, failed with ioErr (−36).
+  The stub hands selectors 0 to 5 for an address in the range to the
+  engine, which touches the pages and asks the kernel
+  (`MPGetPhysicalAddress`, call 81) for their physical addresses. The
+  disk driver does come through the trap.
+
+Tested (VM off, 512 MB): Apple System Profiler, Sherlock 2 and Scrapbook
+launched into sparse partitions at 0x20001000, 0x23001000 and 0x26001000
+and ran, with 10 pool blocks (10 MB) behind the three; all quit, three
+partitions given back, 13 of 14 pool blocks freed. Scribble `I` (a read
+of 64 KB into touched, untouched and locked sparse pages) passes; `O`,
+`Z` and `n` pass.
+
+Left:
+- A touch with the pool empty still faults as in the stock kernel. The
+  headroom covers what the engine does not see (blocks the ROM allocates
+  for itself without the trap table, the stack); an application that
+  outruns it between polls is not handled.
+- The engine does not see a successful `NewHandle` in a sparse partition,
+  so it does not top the pool up for it (only its poll does).
+- Freed heap pages do not go back until the partition does (reclaim).
+- `GetProcessInformation` reports the partition's 29 MB as its size, not
+  the pages behind it, and a sparse chunk by its pieces.
+- Launching with the pieces or the partition slots (16) used up falls
+  back to the Process Manager's heap with the raised size.
+- The Finder and the applications launched before the engine is up keep
+  ordinary partitions.
+- Not tested: an application that takes all the memory `MaxMem` reports;
+  the scrap at quit (P3); a real Mac.
 
 ### Switch cost
 
