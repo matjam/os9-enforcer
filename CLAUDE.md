@@ -302,7 +302,10 @@ use `tools/xlog-read.py`.
 
 Scribble (`scribble/`) makes the stores the engine has to judge. Type a
 letter and Return. Each store writes the value already there, so an
-allowed store changes nothing.
+allowed store changes nothing. The build makes it twice: Scribble asks
+for 512 KB and keeps an ordinary partition (the overflow tests need a
+small one); ScribbleBig asks for 1 MB and, with virtual memory off, is
+launched into a sparse partition, where `o`, `Z`, `n` and `E` were run.
 
 | Key | Store | Expected in enforce mode |
 |---|---|---|
@@ -333,6 +336,7 @@ allowed store changes nothing.
 | `O` | 6 MB of handles and 2 MB of pointers in 256 KB blocks (the file asks for a 1 MB partition), written, read back and disposed | PASS: every block, those the partition cannot hold in chunks, the chunks freed after disposing |
 | `J` | sparse memory (kernel patch 7, VM off; once a boot: it leaves 450 KB in the system heap): a 64 MB area with a pool of 64 pages, 48 pages touched, freed, one touched again | PASS: each page zero at first touch and holding its data, the pool's counts right, the area deleted. SKIP when the engine has the sparse range |
 | `I` | I/O into sparse memory: a 64 KB read of its own file into touched, untouched and locked pages of a block in a sparse chunk | PASS: three reads without error, the same bytes |
+| `E` | in ScribbleBig (a sparse partition): a 1 MB handle grown to 20 MB with `SetHandleSize`, written and read back, and a 4 MB pointer | PASS: no error, in the partition, no fault with the pool empty. SKIP in an ordinary partition |
 
 `Y`, `V` and `D` flip the word, read it back and restore it, and print
 whether the store landed.
@@ -860,8 +864,11 @@ Worst first. Keep in step with Limits in `README.md`.
     heap.
 20. Overflow serves new blocks only. Growing a block past the partition
     (`SetHandleSize`, `SetPtrSize`, `ReallocateHandle`, `PtrAndHand`,
-    `Munger`) fails as before: a block cannot leave its zone. The larger
-    partition from launch sizes is what helps there.
+    `Munger`) fails as before: a block cannot leave its zone. A sparse
+    partition (virtual memory off, an application asking for 640 KB or
+    more) moves that limit to 29 MB: Scribble `E` grows a 1 MB handle to
+    20 MB there. With virtual memory on, and for smaller applications,
+    the limit is the partition from launch sizes.
 21. `FreeMem`, `MaxMem`, `PurgeSpace` and `GetProcessInformation` count
     only the partition. An application that asks for all it sees gets
     less than there is; About This Computer does not show an
@@ -1174,8 +1181,13 @@ Left:
   headroom covers what the engine does not see (blocks the ROM allocates
   for itself without the trap table, the stack); an application that
   outruns it between polls is not handled.
-- The engine does not see a successful `NewHandle` in a sparse partition,
-  so it does not top the pool up for it (only its poll does).
+- The engine tops the pool up at the traps it sees (`pool_top`): after a
+  `NewHandle` or `NewPtr` of 16 KB or more in a sparse zone, and before
+  `SetHandleSize`, `ReallocateHandle` and `SetPtrSize` to 16 KB or more
+  while the current application's zone is sparse. Scribble `E` without
+  the second group emptied the pool: the application quit with a type 2
+  error, and the machine went on. Calls the ROM makes for itself past the
+  trap table, smaller blocks and the stack come out of the headroom.
 - Freed heap pages do not go back until the partition does (reclaim).
 - `GetProcessInformation` reports the partition's 29 MB as its size, not
   the pages behind it, and a sparse chunk by its pieces.

@@ -281,10 +281,11 @@ enum {
     kPoolEts = 12,
     kPoolGne = 27,
     kPoolClient = 9,
-    kPoolAlloc = 32,
+    kPoolAlloc = 58,
     kPoolDp = 40,
     kPoolSel = 7,
-    kPoolMd = 43
+    kPoolMd = 43,
+    kPoolGrow = 34
 };
 
 /* Overflow: when NewHandle or NewPtr fails in the current application's
@@ -358,6 +359,16 @@ typedef struct {
     volatile unsigned long sparse_lo, sparse_hi;
     unsigned long md_old;
     RoutineDescriptor rd_md;
+    /* pool_top, from the allocation stubs: a block of 16 KB or more was
+       made in a sparse zone; have its pages in the pool. */
+    RoutineDescriptor rd_top;
+    /* Stubs on _SetHandleSize, _ReallocateHandle and _SetPtrSize (A0 the
+       block, D0 the new size): for 16 KB or more while the current
+       application's zone is in the sparse range, pool_top(size) first, so
+       that the Memory Manager's copy and the application's use of the
+       grown block find pages. */
+    unsigned long sh_old, rh_old, sp_old;
+    unsigned short sh[kPoolGrow], rh[kPoolGrow], spz[kPoolGrow];
     unsigned short md[kPoolMd];
     unsigned short nh[kPoolAlloc], np[kPoolAlloc], dp[kPoolDp];
 } PoolStubs;

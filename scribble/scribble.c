@@ -615,8 +615,9 @@ int main(void)
                "owner table, X make the Enforcer Extension quit "
                "as in a crash, Z run 5 s without yielding, C/U the same "
                "in a native/68k callback, H 20 s in a 68k callback, G "
-               "temporary memory in system mode, A draw a scroll bar, O 8 MB in this 1 MB partition, J sparse "
-               "memory, q "
+               "temporary memory in system mode, A draw a scroll bar, O 8 MB in this small partition, J sparse "
+               "memory, I read into sparse memory, E grow a block to 20 "
+               "MB, q "
                "quit; then Return\n");
         int ch = getchar();
         while (ch != '\n' && getchar() != '\n')
@@ -1264,6 +1265,52 @@ int main(void)
                                !mmbad &&
                                counted && chunks2 <= chunks0 + 1
                                ? "PASS" : "FAIL");
+            continue;
+        }
+        case 'E': {
+            /* Growing a block past what Get Info gives (needs a sparse
+               partition: build Scribble with a 1 MB size): a 1 MB handle
+               grown to 20 MB with SetHandleSize, written and read back,
+               and a 4 MB pointer beside it. Without the sparse partition
+               the growth fails (known hole 20). */
+            unsigned long zone = (unsigned long)ApplicationZone();
+            State *es = engine_state();
+            int sparse = es && es->sparse_area && zone >= es->sparse_lo &&
+                         zone < es->sparse_hi;
+            enum { kGrow = 20 << 20 };
+            Handle h = NewHandle(1 << 20);
+            OSErr e1 = MemError();
+            if (h)
+                SetHandleSize(h, kGrow);
+            OSErr e2 = h ? MemError() : e1;
+            unsigned long wrong = 0;
+            if (h && !e2) {
+                HLock(h);
+                unsigned long *w = (unsigned long *)*h;
+                for (unsigned long i = 0; i < kGrow / 4; i += 256)
+                    w[i] = 0x45000000UL ^ i;
+                for (unsigned long i = 0; i < kGrow / 4; i += 256)
+                    if (w[i] != (0x45000000UL ^ i))
+                        wrong++;
+            }
+            Ptr p = NewPtr(4 << 20);
+            OSErr e3 = MemError();
+            printf("zone %08lX (%s partition); NewHandle %d, SetHandleSize "
+                   "to 20 MB %d, %lu words wrong; NewPtr 4 MB %d (%s)\n",
+                   zone, sparse ? "a sparse" : "an ordinary", e1, e2, wrong,
+                   e3, !p ? "none"
+                           : PtrZone(p) == (THz)zone ? "in the partition"
+                                                     : "outside it");
+            if (es)
+                printf("pool %ld pages, faults with it empty %ld\n",
+                       kcb_set(kKcbOpSparseInfo, 0),
+                       kcb_set(kKcbOpSparseInfo, 2));
+            if (p)
+                DisposePtr(p);
+            if (h)
+                DisposeHandle(h);
+            printf("%s\n", !sparse ? "SKIP: not in a sparse partition"
+                           : !e1 && !e2 && !wrong && !e3 ? "PASS" : "FAIL");
             continue;
         }
         case 'I': {

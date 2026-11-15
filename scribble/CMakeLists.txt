@@ -9,3 +9,10 @@ target_compile_options(Scribble PRIVATE -O2 -Wall)
 target_include_directories(Scribble PRIVATE ../common)
 # MP tasks, for the Y test.
 target_link_libraries(Scribble MPLibrary)
+
+# The same program with a 1 MB size, which gets a sparse partition (the E
+# test).
+add_application(ScribbleBig scribble.c scribble-big.r CONSOLE)
+target_compile_options(ScribbleBig PRIVATE -O2 -Wall)
+target_include_directories(ScribbleBig PRIVATE ../common)
+target_link_libraries(ScribbleBig MPLibrary)

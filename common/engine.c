@@ -2825,15 +2825,50 @@ static void pool_launch(void)
 */
 enum { kGNEFilter = 0x29A };
 
+/* The stub above, with one more step when the routine worked: for a
+   request of 16 KB or more made with TheZone in the sparse range (a
+   sparse partition or chunk), pool_top(size) puts that much in the
+   kernel's pool before the block is touched:
+     1A tst.w   d0
+     1C bne.s   52               ; it failed: overflow, as above
+     1E cmpi.l  #$3FFF,4(sp)     ; the size
+     26 bls.s   66
+     28 move.l  $0118.w,d1       ; TheZone
+     2C cmp.l   sparse_lo,d1
+     32 bcs.s   66
+     34 cmp.l   sparse_hi,d1
+     3A bcc.s   66
+     3C move.l  a0,-(sp)
+     3E move.l  8(sp),-(sp)
+     42 movea.l #rd_top,a0
+     48 jsr     (a0)
+     4A addq.l  #4,sp
+     4C movea.l (sp)+,a0
+     4E moveq   #0,d0
+     50 bra.s   66
+     52 ...                      ; pool_over, as above
+     66 addq.l  #8,sp
+     68 tst.w   d0
+     6A rts
+     6C move.l  old,-(sp)
+     72 rts */
 static void alloc_stub(unsigned short *dst, unsigned long en,
-                       unsigned long old, unsigned long rd)
+                       unsigned long old, unsigned long rd,
+                       unsigned long lo, unsigned long hi, unsigned long rt)
 {
     const unsigned short code[kPoolAlloc] = {
-        0x4A79, HI16(en), LO16(en), 0x6730,
-        0x0801, 0x000A, 0x662A,
+        0x4A79, HI16(en), LO16(en), 0x6764,
+        0x0801, 0x000A, 0x665E,
         0x2F00, 0x2F01,
         0x2279, HI16(old), LO16(old), 0x4E91,
-        0x4A40, 0x6714,
+        0x4A40, 0x6634,
+        0x0CAF, 0x0000, 0x3FFF, 0x0004, 0x633E,
+        0x2238, 0x0118,
+        0xB2B9, HI16(lo), LO16(lo), 0x6532,
+        0xB2B9, HI16(hi), LO16(hi), 0x642A,
+        0x2F08, 0x2F2F, 0x0008,
+        0x207C, HI16(rt), LO16(rt), 0x4E90,
+        0x588F, 0x205F, 0x7000, 0x6014,
         0x227C, HI16(rd), LO16(rd), 0x4E91,
         0x2040, 0x4A80, 0x6604,
         0x7094, 0x6002,
@@ -2841,6 +2876,55 @@ static void alloc_stub(unsigned short *dst, unsigned long en,
         0x508F, 0x4A40, 0x4E75,
         0x2F39, HI16(old), LO16(old), 0x4E75};
     memcpy(dst, code, sizeof code);
+}
+
+/* SetHandleSize, ReallocateHandle and SetPtrSize (A0 the block, D0 the
+   new size), with old the trap's routine:
+     00 tst.w   enabled
+     06 beq.s   3C
+     08 cmpi.l  #$3FFF,d0
+     0E bls.s   3C
+     10 move.l  d1,-(sp)
+     12 move.l  $02AA.w,d1       ; ApplZone
+     16 cmp.l   sparse_lo,d1
+     1C bcs.s   3A
+     1E cmp.l   sparse_hi,d1
+     24 bcc.s   3A
+     26 movem.l d0/a0,-(sp)
+     2A move.l  d0,-(sp)         ; pool_top(size)
+     2C movea.l #rd_top,a0
+     32 jsr     (a0)
+     34 addq.l  #4,sp
+     36 movem.l (sp)+,d0/a0
+     3A move.l  (sp)+,d1
+     3C move.l  old,-(sp)
+     42 rts */
+static void grow_stub(unsigned short *dst, unsigned long en,
+                      unsigned long old, unsigned long lo, unsigned long hi,
+                      unsigned long rt)
+{
+    const unsigned short code[kPoolGrow] = {
+        0x4A79, HI16(en), LO16(en), 0x6734,
+        0x0C80, 0x0000, 0x3FFF, 0x632C,
+        0x2F01, 0x2238, 0x02AA,
+        0xB2B9, HI16(lo), LO16(lo), 0x651C,
+        0xB2B9, HI16(hi), LO16(hi), 0x6414,
+        0x48E7, 0x8080, 0x2F00,
+        0x207C, HI16(rt), LO16(rt), 0x4E90,
+        0x588F, 0x4CDF, 0x0101,
+        0x221F,
+        0x2F39, HI16(old), LO16(old), 0x4E75};
+    memcpy(dst, code, sizeof code);
+}
+
+/* From the stubs on _NewHandle and _NewPtr: a block of size bytes was
+   made in a sparse zone. */
+static void pool_top(long size)
+{
+    State *s = g_state;
+    if (s && s->running && s->sparse_area && size > 0 &&
+        CurrentExecutionLevel() == kTaskLevel)
+        sparse_ensure(s, (unsigned long)size / kPage + 2);
 }
 
 static PoolStubs *pool_install(void)
@@ -3053,10 +3137,33 @@ static PoolStubs *pool_install(void)
         0x2F39, HI16(go), LO16(go), 0x4E75,
         0x4E75};
     memcpy(t.gne, gne, sizeof gne);
+    UniversalProcPtr ut = NewRoutineDescriptor((ProcPtr)pool_top, 0xC1,
+                                               kPowerPCISA);
+    if (ut) {
+        BlockMoveData(ut, &t.rd_top, sizeof(RoutineDescriptor));
+        DisposeRoutineDescriptor(ut);
+    }
     alloc_stub(t.nh, en, (unsigned long)&p->nh_old,
-               (unsigned long)&p->rd_overh);
+               (unsigned long)&p->rd_overh, (unsigned long)&p->sparse_lo,
+               (unsigned long)&p->sparse_hi, (unsigned long)&p->rd_top);
     alloc_stub(t.np, en, (unsigned long)&p->np_old,
-               (unsigned long)&p->rd_overp);
+               (unsigned long)&p->rd_overp, (unsigned long)&p->sparse_lo,
+               (unsigned long)&p->sparse_hi, (unsigned long)&p->rd_top);
+    volatile unsigned long *sh_e = trap_entry(0xA024); /* SetHandleSize */
+    volatile unsigned long *rh_e = trap_entry(0xA027); /* ReallocateHandle */
+    volatile unsigned long *sp_e = trap_entry(0xA020); /* SetPtrSize */
+    t.sh_old = *sh_e;
+    t.rh_old = *rh_e;
+    t.sp_old = *sp_e;
+    grow_stub(t.sh, en, (unsigned long)&p->sh_old,
+              (unsigned long)&p->sparse_lo, (unsigned long)&p->sparse_hi,
+              (unsigned long)&p->rd_top);
+    grow_stub(t.rh, en, (unsigned long)&p->rh_old,
+              (unsigned long)&p->sparse_lo, (unsigned long)&p->sparse_hi,
+              (unsigned long)&p->rd_top);
+    grow_stub(t.spz, en, (unsigned long)&p->sp_old,
+              (unsigned long)&p->sparse_lo, (unsigned long)&p->sparse_hi,
+              (unsigned long)&p->rd_top);
     unsigned long po = (unsigned long)&p->dp_old;
     const unsigned short dp[kPoolDp] = {
         0x4A79, HI16(en), LO16(en), 0x6740,
@@ -3075,6 +3182,11 @@ static PoolStubs *pool_install(void)
     *dp_e = (unsigned long)p->dp;
     if (um && us)
         *md_e = (unsigned long)p->md;
+    if (ut) {
+        *sh_e = (unsigned long)p->sh;
+        *rh_e = (unsigned long)p->rh;
+        *sp_e = (unsigned long)p->spz;
+    }
     *osd_e = (unsigned long)p->osd;
     *dh_e = (unsigned long)p->dh;
     *ets_e = (unsigned long)p->ets;
@@ -3115,6 +3227,9 @@ static void pool_keep(State *s)
     keep_one(s, trap_entry(_NewPtr), p->np_old, p->np);
     keep_one(s, trap_entry(_DisposePtr), p->dp_old, p->dp);
     keep_one(s, trap_entry(0xA05C), p->md_old, p->md);
+    keep_one(s, trap_entry(0xA024), p->sh_old, p->sh);
+    keep_one(s, trap_entry(0xA027), p->rh_old, p->rh);
+    keep_one(s, trap_entry(0xA020), p->sp_old, p->spz);
 }
 
 /* Disable the stubs and take out those still first in their traps. The
@@ -3127,6 +3242,9 @@ static void pool_remove(State *s)
     p->enabled = 0;
     p->quit_hook = 0;
     s->pool = 0;
+    remove_one(trap_entry(0xA020), p->sp_old, p->spz);
+    remove_one(trap_entry(0xA027), p->rh_old, p->rh);
+    remove_one(trap_entry(0xA024), p->sh_old, p->sh);
     remove_one(trap_entry(0xA05C), p->md_old, p->md);
     remove_one(trap_entry(_DisposePtr), p->dp_old, p->dp);
     remove_one(trap_entry(_NewPtr), p->np_old, p->np);
