@@ -134,6 +134,8 @@ allowed store changes nothing.
 | `Z` | run 2.5 s twice in its own code without `WaitNextEvent` | preempted: gaps while other applications run, Process Manager switches, `WaitNextEvent` calls by the stub; the two sums equal |
 | `C` | the same loop in a callback Mixed Mode calls from native code | preempted (`CallUniversalProc` from PowerPC to PowerPC leaves no frame: nothing is in progress) |
 | `U` | the same loop in a callback called from 68k code | not preempted: every check "chain not ending at the base" |
+| `H` | `U` for 20 s; press Command-Option-Escape during it | Force Quit comes up, and Cancel or Force Quit works before the 20 s end |
+| `G` | `TempNewHandle` in system mode (`BeginSystemMode`) | PASS: the handle is the Process Manager's, not in a chunk |
 
 `Y`, `V` and `D` flip the word, read it back and restore it, and print
 whether the store landed.
@@ -341,6 +343,19 @@ window: log, deny, log the system heap, deny with the system heap logged.
   signature. The first 128 KB chunk is kept; any other is freed with its
   last handle. When no chunk can be made, the request goes on to the
   Process Manager and the block has no owner.
+- System mode: system software makes temporary memory that must outlive
+  the current application between `BeginSystemMode` and `EndSystemMode`
+  (`_OSDispatch` selectors 0x40 and 0x41, not in InterfaceLib; the
+  selectors are in `MFPrivate.p`). The Process Manager then puts the
+  handle on its system list, not the current process's
+  (`p_systemModeLevel` in `c_TempNewHandle`, ProcessMgr `Memory.c` in the
+  System 7.1 source), and an application's quit leaves it alone. The stub
+  asks `GetSystemClientProcess` (selector 0x3F) first: when it names the
+  system (PSN 0.1), the request goes on to the Process Manager
+  (`PoolCounters.system`). Before, it went into the current application's
+  chunk and was freed at its quit (issue 1: the Appearance theme's cached
+  scroll bar thumb, a temporary-memory GWorld). A boot makes about 40 such
+  requests with virtual memory on and about 120 with it off.
 - An owner must never outlive its memory: a stale owner can stop an
   application for writing its own new memory. The engine drops a domain
   and its chunks at `ExitToShell`, and a sweep drops any domain or chunk

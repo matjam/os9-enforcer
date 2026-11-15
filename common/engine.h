@@ -237,7 +237,8 @@ enum {
     kPoolOsd = 28,
     kPoolDh = 43,
     kPoolEts = 12,
-    kPoolGne = 30
+    kPoolGne = 30,
+    kPoolClient = 9
 };
 
 /* The GetNextEvent filter (jGNEFilter, low memory 0x29A, which every
@@ -271,6 +272,12 @@ typedef struct {
        or 0 once an event call has run since: the Process Manager shows
        Force Quit only in an event call. */
     volatile unsigned long force_quit;
+    /* GetSystemClientProcess (_OSDispatch selector $3F, which InterfaceLib
+       does not export) as 68k code, called through rd_client: long
+       client(ProcessSerialNumber *). It names the system, not the current
+       application, while the caller is in system mode (BeginSystemMode). */
+    unsigned short client[kPoolClient];
+    RoutineDescriptor rd_client;
 } PoolStubs;
 
 typedef struct {
@@ -282,6 +289,7 @@ typedef struct {
     unsigned long gone;   /* domains and chunks the sweep found freed */
     unsigned long reinstalled; /* stubs the timer put back in the table */
     unsigned long launched; /* domains added at an event call */
+    unsigned long system; /* passed on: made in system mode */
 } PoolCounters;
 
 /* A cross-domain writer: a store site, the application current at the

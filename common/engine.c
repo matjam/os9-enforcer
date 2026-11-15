@@ -1592,7 +1592,8 @@ static int add_current(State *s)
 enum {
     kPoolNewInfo = 0xF1,       /* long (long frame) */
     kPoolDisposedInfo = 0x3C1, /* void (long zone, long err) */
-    kPoolQuitInfo = 0x01       /* void (void) */
+    kPoolQuitInfo = 0x01,      /* void (void) */
+    kPoolClientInfo = 0xF1     /* long (ProcessSerialNumber *), 68k */
 };
 
 /* A trap's entry in the trap table: OS traps (0xA0xx) at 0x400, Toolbox
@@ -1691,16 +1692,35 @@ static Chunk *new_chunk(State *s, int d, unsigned long size)
     return c;
 }
 
+/* Whether the caller is in system mode: the Process Manager then counts
+   its files and temporary memory as the system's, not the current
+   application's. System software makes memory that outlives the current
+   application this way; the Process Manager puts such a TempNewHandle on
+   its system list, which an application's quit leaves alone. */
+static int system_mode(State *s)
+{
+    ProcessSerialNumber psn = {0, 0};
+    long err = CallUniversalProc((UniversalProcPtr)&s->pool->rd_client,
+                                 kPoolClientInfo, &psn);
+    return err == noErr && psn.highLongOfPSN == 0 &&
+           psn.lowLongOfPSN == kSystemProcess;
+}
+
 /* TempNewHandle, from the _OSDispatch stub. frame is the 68k stack at the
    stub: the return address, the selector (a word), the OSErr pointer, the
    size, then the function result. Returns 0 when it has stored the
    result (the stub then returns to the caller), or 1 to pass the call on
-   to the Process Manager. */
+   to the Process Manager: always in system mode, where the memory is not
+   the current application's. */
 static long pool_new(unsigned long frame)
 {
     State *s = g_state;
     if (!s || !s->running || !s->kcb || !s->pool)
         return 1;
+    if (system_mode(s)) {
+        s->pc.system++;
+        return 1;
+    }
     unsigned char *f = (unsigned char *)frame;
     OSErr *res = (OSErr *)get32(f + 6);
     long size = (long)get32(f + 10);
@@ -2297,7 +2317,11 @@ static PoolStubs *pool_install(void)
                                                kPoolQuitInfo, kPowerPCISA);
     UniversalProcPtr ul = NewRoutineDescriptor((ProcPtr)pool_launch,
                                                kPoolQuitInfo, kPowerPCISA);
-    if (!p || !un || !ud || !uq || !ul) {
+    UniversalProcPtr uc =
+        p ? NewRoutineDescriptor((ProcPtr)p->client, kPoolClientInfo,
+                                 kM68kISA)
+          : 0;
+    if (!p || !un || !ud || !uq || !ul || !uc) {
         if (p)
             DisposePtr((Ptr)p);
         return 0;
@@ -2309,10 +2333,19 @@ static PoolStubs *pool_install(void)
     BlockMoveData(ud, &t.rd_disposed, sizeof(RoutineDescriptor));
     BlockMoveData(uq, &t.rd_quit, sizeof(RoutineDescriptor));
     BlockMoveData(ul, &t.rd_launch, sizeof(RoutineDescriptor));
+    BlockMoveData(uc, &t.rd_client, sizeof(RoutineDescriptor));
     DisposeRoutineDescriptor(un);
     DisposeRoutineDescriptor(ud);
     DisposeRoutineDescriptor(uq);
     DisposeRoutineDescriptor(ul);
+    DisposeRoutineDescriptor(uc);
+    /* GetSystemClientProcess: CLR.W -(A7) (the OSErr); MOVE.L 6(A7),-(A7)
+       (the ProcessSerialNumber); MOVE.W #$3F,-(A7); _OSDispatch; MOVE.W
+       (A7)+,D0; EXT.L D0; RTS. */
+    const unsigned short client[kPoolClient] = {
+        0x4267, 0x2F2F, 0x0006, 0x3F3C, 0x003F, 0xA88F, 0x301F, 0x48C0,
+        0x4E75};
+    memcpy(t.client, client, sizeof client);
     /* The trap table must be where the engine writes it. */
     volatile unsigned long *osd_e = trap_entry(_OSDispatch);
     volatile unsigned long *dh_e = trap_entry(_DisposeHandle);

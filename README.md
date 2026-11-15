@@ -79,7 +79,9 @@ application run, and the notification says so.
   per-application segment IDs on.
 - **Temporary memory.** Each application's `TempNewHandle` memory comes
   from chunks owned by that application, so it is protected like its
-  partition.
+  partition. Temporary memory that system software makes for itself (in
+  the Process Manager's system mode) stays the Process Manager's and
+  outlives the application.
 - **Stopping.** When the current application writes into another
   application, the write is denied and the application is stopped with
   `ExitToShell` in its own context. The target's memory is not changed.

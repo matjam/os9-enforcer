@@ -35,8 +35,8 @@ KERNEL = ["kcb", "kcb_err", "owners", "kcb_raw", "owners_raw", "kseen",
 # After those: the temporary memory pools (PoolStubs pointer, PoolCounters,
 # vm, pm_zone), then the Chunk table.
 POOL = ["pool", "news", "passed", "disposed", "chunks_made", "chunks_freed",
-        "chunks_dropped", "quits", "gone", "reinstalled", "launched", "vm",
-        "pm_zone", "owners_size"]
+        "chunks_dropped", "quits", "gone", "reinstalled", "launched",
+        "system", "vm", "pm_zone", "owners_size"]
 POOL_STUBS = ["magic", "enabled_inside", "osd_old", "dh_old", "ets_old"]
 CHUNK = ["live", "domain", "handle", "block", "lo", "hi", "zone", "handles",
          "keep"]
@@ -239,12 +239,12 @@ def print_pool(k):
               "%08X" % (k["pool"], k["stub_enabled_inside"] >> 16,
                         k["stub_enabled_inside"] & 0xFFFF, k["stub_osd_old"],
                         k["stub_dh_old"], k["stub_ets_old"]))
-    print("  taken %d, passed on %d, disposed %d; chunks made %d, freed %d, "
-          "dropped %d; quits %d, gone %d; stubs put back %d; added at an "
-          "event call %d" % (
-              k["news"], k["passed"], k["disposed"], k["chunks_made"],
-              k["chunks_freed"], k["chunks_dropped"], k["quits"], k["gone"],
-              k["reinstalled"], k["launched"]))
+    print("  taken %d, passed on %d, passed on in system mode %d, disposed "
+          "%d; chunks made %d, freed %d, dropped %d; quits %d, gone %d; "
+          "stubs put back %d; added at an event call %d" % (
+              k["news"], k["passed"], k["system"], k["disposed"],
+              k["chunks_made"], k["chunks_freed"], k["chunks_dropped"],
+              k["quits"], k["gone"], k["reinstalled"], k["launched"]))
     for c in k["chunks"]:
         print("  chunk [%3d] domain %d: %08X-%08X zone %08X, handle %08X -> "
               "%08X, %d handles%s" % (

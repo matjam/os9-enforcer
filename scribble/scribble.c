@@ -78,6 +78,11 @@
  *      is in progress below both: preemption must leave them alone.
  *   H  U for 20 s. Command-Option-Escape during it must bring up Force
  *      Quit, and its buttons must work before the 20 s are up.
+ *
+ *   G  TempNewHandle in system mode (BeginSystemMode), as system software
+ *      makes memory that outlives the current application: the handle
+ *      must be the Process Manager's, not in one of this application's
+ *      chunks (issue 1).
  */
 
 #include <stdio.h>
@@ -385,6 +390,44 @@ static void cb_spin(void)
 static const unsigned short code68k_call[] = {0x206F, 0x0004, 0x4E90,
                                               0x4E75};
 
+/* Process Manager calls that InterfaceLib does not export (MFPrivate), as
+   68k code: _OSDispatch with the selector passed to it and no other
+   parameter, and GetSystemClientProcess (selector $3F) with the address of
+   a ProcessSerialNumber. Both return the OSErr. */
+static const unsigned short code68k_osd[] = {
+    0x4267,         /* CLR.W -(A7): room for the OSErr */
+    0x3F2F, 0x0008, /* MOVE.W 8(A7),-(A7): the selector */
+    0xA88F,         /* _OSDispatch */
+    0x301F, 0x48C0, /* MOVE.W (A7)+,D0; EXT.L D0 */
+    0x4E75};        /* RTS */
+static const unsigned short code68k_client[] = {
+    0x4267,         /* CLR.W -(A7) */
+    0x2F2F, 0x0006, /* MOVE.L 6(A7),-(A7): the ProcessSerialNumber */
+    0x3F3C, 0x003F, /* MOVE.W #$3F,-(A7) */
+    0xA88F,         /* _OSDispatch */
+    0x301F, 0x48C0, /* MOVE.W (A7)+,D0; EXT.L D0 */
+    0x4E75};        /* RTS */
+enum {
+    kBeginSystemMode = 0x40,
+    kEndSystemMode = 0x41,
+    kCall68kInfo = 0xF1 /* long (long), C stack */
+};
+
+/* Call 68k code with one long parameter. */
+static long call68k(const unsigned short *code, unsigned long size, long arg)
+{
+    Ptr p = NewPtr(size);
+    if (!p)
+        return memFullErr;
+    BlockMove(code, p, size); /* flushes the code caches */
+    UniversalProcPtr u =
+        NewRoutineDescriptor((ProcPtr)p, kCall68kInfo, kM68kISA);
+    long r = CallUniversalProc(u, kCall68kInfo, arg);
+    DisposeRoutineDescriptor(u);
+    DisposePtr(p);
+    return r;
+}
+
 /* Whether handle h lives in one of Enforcer's temporary memory chunks:
    its zone follows the chunk signature (common/engine.h). */
 static int in_chunk(Handle h)
@@ -400,11 +443,12 @@ static void pool_report(void)
         printf("Enforcer is not running\n");
         return;
     }
-    printf("chunks %d; taken %lu, passed %lu, disposed %lu, made %lu, "
-           "freed %lu, dropped %lu, quits %lu, gone %lu\n",
-           engine_live_chunks(s), s->pc.news, s->pc.passed, s->pc.disposed,
-           s->pc.chunks_made, s->pc.chunks_freed, s->pc.chunks_dropped,
-           s->pc.quits, s->pc.gone);
+    printf("chunks %d; taken %lu, passed %lu, passed in system mode %lu, "
+           "disposed %lu, made %lu, freed %lu, dropped %lu, quits %lu, gone "
+           "%lu\n",
+           engine_live_chunks(s), s->pc.news, s->pc.passed, s->pc.system,
+           s->pc.disposed, s->pc.chunks_made, s->pc.chunks_freed,
+           s->pc.chunks_dropped, s->pc.quits, s->pc.gone);
 }
 
 /* A word in the middle of a temporary memory chunk of another
@@ -563,8 +607,8 @@ int main(void)
                "right after a switch, K into the control block and the "
                "owner table, X make the Enforcer Extension quit "
                "as in a crash, Z run 5 s without yielding, C/U the same "
-               "in a native/68k callback, H 20 s in a 68k callback, q "
-               "quit; then Return\n");
+               "in a native/68k callback, H 20 s in a 68k callback, G "
+               "temporary memory in system mode, q quit; then Return\n");
         int ch = getchar();
         while (ch != '\n' && getchar() != '\n')
             ;
@@ -951,6 +995,54 @@ int main(void)
             printf("temporary memory: handle %08lX, block %08lX, %s\n",
                    (unsigned long)h, (unsigned long)*h,
                    in_chunk(h) ? "in a chunk" : "not in a chunk");
+            pool_report();
+            continue;
+        }
+        case 'G': {
+            /* Temporary memory made in system mode (BeginSystemMode, as
+               system software makes memory that must outlive the current
+               application) must stay the Process Manager's, on its
+               system list: not in one of this application's chunks,
+               which are freed when it quits (issue 1). */
+            OSErr err = 0, err2 = 0;
+            ProcessSerialNumber in = {0, 0}, out = {0, 0};
+            Handle own = TempNewHandle(0x1000, &err);
+            long b = call68k(code68k_osd, sizeof code68k_osd,
+                             kBeginSystemMode);
+            long c = call68k(code68k_client, sizeof code68k_client,
+                             (long)&in);
+            Handle sys = TempNewHandle(0x1000, &err2);
+            long e = call68k(code68k_osd, sizeof code68k_osd,
+                             kEndSystemMode);
+            long c2 = call68k(code68k_client, sizeof code68k_client,
+                              (long)&out);
+            printf("BeginSystemMode %ld, client %ld (%lu.%lu); "
+                   "EndSystemMode %ld, client %ld (%lu.%lu)\n",
+                   b, c, (unsigned long)in.highLongOfPSN,
+                   (unsigned long)in.lowLongOfPSN, e, c2,
+                   (unsigned long)out.highLongOfPSN,
+                   (unsigned long)out.lowLongOfPSN);
+            printf("own handle %08lX (%d): %s; system-mode handle %08lX "
+                   "(%d): %s\n",
+                   (unsigned long)own, err,
+                   own && in_chunk(own) ? "in a chunk" : "not in a chunk",
+                   (unsigned long)sys, err2,
+                   sys && in_chunk(sys) ? "in a chunk" : "not in a chunk");
+            int system = in.highLongOfPSN == 0 &&
+                         in.lowLongOfPSN == kSystemProcess;
+            if (!system)
+                printf("SKIP: the Process Manager did not enter system "
+                       "mode\n");
+            else if (sys && !in_chunk(sys))
+                printf("PASS: the system-mode handle is the Process "
+                       "Manager's\n");
+            else
+                printf("FAIL: the system-mode handle is in a chunk, "
+                       "freed when Scribble quits\n");
+            if (own)
+                DisposeHandle(own);
+            if (sys)
+                DisposeHandle(sys);
             pool_report();
             continue;
         }
