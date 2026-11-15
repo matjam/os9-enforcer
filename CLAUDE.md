@@ -330,6 +330,7 @@ allowed store changes nothing.
 | `H` | `U` for 20 s; press Command-Option-Escape during it | Force Quit comes up, and Cancel or Force Quit works before the 20 s end |
 | `G` | `TempNewHandle` in system mode (`BeginSystemMode`) | PASS: the handle is the Process Manager's, not in a chunk |
 | `A` | draw an Appearance scroll bar with a thumb for 3 s; first in a fresh boot, then again after `q`, a launch and `m` | the first passes 1 request on in system mode (the theme's thumb image); the second thumb is the same as the first |
+| `O` | 6 MB of handles and 2 MB of pointers in 256 KB blocks (the file asks for a 1 MB partition), written, read back and disposed | PASS: every block, those the partition cannot hold in chunks, the chunks freed after disposing |
 
 `Y`, `V` and `D` flip the word, read it back and restore it, and print
 whether the store landed.
@@ -550,6 +551,26 @@ window: log, deny, log the system heap, deny with the system heap logged.
   chunk and was freed at its quit (issue 1: the Appearance theme's cached
   scroll bar thumb, a temporary-memory GWorld). A boot makes about 40 such
   requests with virtual memory on and about 120 with it off.
+- Overflow: stubs on `_NewHandle` and `_NewPtr` call the trap's routine;
+  when it fails (after the application's grow zone procedure) with
+  `TheZone` equal to `ApplZone` and no system-heap bit in the trap word,
+  `pool_over` allocates the block in one of the application's chunks. A
+  new chunk for it is at least 1 MB (`kOverChunk`) and is made only while
+  2 MB of temporary memory stays free (`kOverReserve`). The stub on
+  `_DisposePtr`, like the one on `_DisposeHandle`, finds a chunk's block
+  by the zone in its header and frees the chunk with its last block. The
+  engine's own allocation in a chunk's zone has `TheZone` on the chunk,
+  so a failure there does not come back in. Scribble `O` tests it.
+- Launch sizes: the Process Manager reads a `SIZE` resource in one
+  routine, which copies 10 bytes (flags, preferred size, minimum size)
+  into a record and adds the default stack (low memory 0x322) less 8 KB.
+  `size_hook` replaces the `mr r3,r29` at its exit with a branch to a stub
+  that raises the preferred size to 4 times what the file asks, capped at
+  `size_cap`: a quarter of the Process Manager zone's `zcbFree`, which
+  `size_follow` sets at task level (0 with protection off). The site is
+  found by its instructions, in the system heap (virtual memory off) or in
+  the file-mapped code around the switch hook's site (`pm_hook_mapped`,
+  patched with `OP_PATCH`). `xlog-read.py` prints a `launch sizes:` line.
 - An owner must never outlive its memory: a stale owner can stop an
   application for writing its own new memory. The engine drops a domain
   and its chunks at `ExitToShell`, and a sweep drops any domain or chunk
@@ -780,6 +801,18 @@ Worst first. Keep in step with Limits in `README.md`.
     itself.
 19. Each engine start leaves one yield stub (about 1 KB) in the system
     heap.
+20. Overflow serves new blocks only. Growing a block past the partition
+    (`SetHandleSize`, `SetPtrSize`, `ReallocateHandle`, `PtrAndHand`,
+    `Munger`) fails as before: a block cannot leave its zone. The larger
+    partition from launch sizes is what helps there.
+21. `FreeMem`, `MaxMem`, `PurgeSpace` and `GetProcessInformation` count
+    only the partition. An application that asks for all it sees gets
+    less than there is; About This Computer does not show an
+    application's chunks.
+22. An application that tests for memory by asking for a huge block and
+    expects it to fail can now get it, down to the 2 MB reserve.
+23. With virtual memory off, a partition raised at launch reserves RAM the
+    application may never touch (up to a quarter of what was free).
 
 Compatibility review (2026-11-13) also noted: programs that write-protect
 their own pages lose those faults to the kernel and the hooks; the engine
@@ -941,10 +974,25 @@ pointer's offset (relocatable) or the zone (nonrelocatable). The flags'
 first byte is 0x6B nonrelocatable, 0xAB relocatable, 0x00 or 0x10 free;
 the last block is a 12-byte nonrelocatable trailer.
 
-Next: with virtual memory on, give applications a larger partition at
-launch (the Process Manager reads the `SIZE` resource; find where, or
-answer its resource call with larger sizes), then check physical memory
-with several large partitions that add up to more than RAM.
+Built so far (2026-11-14, see "The engine" for how):
+- Launch sizes: an application gets up to 4 times its preferred size, no
+  more than a quarter of the free memory. This is design point 1 inside
+  what the Process Manager's heap can give: with virtual memory on the
+  partition is sparse; with it off it reserves RAM. Scribble's 1,040 KB
+  became 4,160 KB, VM off and on.
+- Overflow chunks, the reserve design, for when the partition is full:
+  Scribble `O` gets 8 MB in its partition, VM off and on. Apple System
+  Profiler and Sherlock 2 ran with the stubs in and made no failed
+  request.
+
+Why not a partition that grows: the Process Manager allocates a partition
+as one block of its heap, whose addresses are the logical memory (RAM, or
+the virtual memory size). A range beyond that needs the partition placed
+outside the Process Manager's heap, which means taking over launch.
+
+Still to build: reclaim (2), with `ReleaseMemoryData` under virtual
+memory; `GetProcessInformation` counting chunks (6); `MaxMem` and
+`FreeMem` (4); the stack guard page (5); a control panel setting.
 
 ### Switch cost
 
