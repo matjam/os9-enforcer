@@ -234,7 +234,7 @@ typedef struct {
  * entry only when it holds exactly *_old, so the chain cannot loop. */
 enum {
     kPoolMagic = 'Pool',
-    kPoolOsd = 28,
+    kPoolOsd = 60,
     kPoolDh = 43,
     kPoolEts = 12,
     kPoolGne = 27,
@@ -292,6 +292,12 @@ typedef struct {
     volatile unsigned short overflow; /* 0 turns overflow off */
     unsigned long nh_old, np_old, dp_old;
     RoutineDescriptor rd_overh, rd_overp;
+    /* GetProcessInformation (_OSDispatch selector 0x3A): after the Process
+       Manager fills the record, pool_info adds the application's chunks to
+       processSize and their free bytes to processFreeMem, so About This
+       Computer counts the memory an application has outside its
+       partition. */
+    RoutineDescriptor rd_info;
     unsigned short nh[kPoolAlloc], np[kPoolAlloc], dp[kPoolDp];
 } PoolStubs;
 

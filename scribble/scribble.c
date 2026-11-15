@@ -1170,6 +1170,12 @@ int main(void)
             static Ptr ps[kN];
             State *s = engine_state();
             int chunks0 = s ? engine_live_chunks(s) : 0;
+            ProcessSerialNumber me = {0, kCurrentProcess};
+            ProcessInfoRec pi0, pi1;
+            memset(&pi0, 0, sizeof pi0);
+            pi0.processInfoLength = sizeof pi0;
+            pi1 = pi0;
+            GetProcessInformation(&me, &pi0);
             int got = 0, over = 0, bad = 0, dirty = 0;
             for (int i = 0; i < kN; i++) {
                 int ptr = i >= 24, clear = i & 1;
@@ -1210,6 +1216,7 @@ int main(void)
                         bad++;
             }
             int chunks1 = s ? engine_live_chunks(s) : 0;
+            GetProcessInformation(&me, &pi1);
             for (int i = 0; i < kN; i++) {
                 if (i >= 24 && ps[i])
                     DisposePtr(ps[i]);
@@ -1232,8 +1239,18 @@ int main(void)
                 printf("overflow: handles %lu, pointers %lu, not served "
                        "%lu\n", s->pc.over_handles, s->pc.over_ptrs,
                        s->pc.over_none);
+            /* GetProcessInformation counts the chunks: the size grows by at
+               least the blocks in them. */
+            printf("process size %lu KB (%lu free) before, %lu KB (%lu "
+                   "free) with the blocks\n",
+                   (unsigned long)pi0.processSize >> 10,
+                   (unsigned long)pi0.processFreeMem >> 10,
+                   (unsigned long)pi1.processSize >> 10,
+                   (unsigned long)pi1.processFreeMem >> 10);
+            int counted = pi1.processSize - pi0.processSize >=
+                          (unsigned long)over * kBlock;
             printf("%s\n", got == kN && over > 0 && !bad && !dirty && home &&
-                               chunks2 <= chunks0 + 1
+                               counted && chunks2 <= chunks0 + 1
                                ? "PASS" : "FAIL");
             continue;
         }

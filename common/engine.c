@@ -1837,6 +1837,34 @@ static long pool_over(long trap, long size, int ptr)
     return (long)b;
 }
 
+/* GetProcessInformation has filled the record at info (engine.h): add the
+   process's chunks to its size and their free bytes to its free memory. */
+static void pool_info(unsigned long info, long psn)
+{
+    State *s = g_state;
+    ProcessInfoRec *r = (ProcessInfoRec *)info;
+    (void)psn; /* can be a constant; the record holds the number */
+    if (!s || !s->running || !s->pool || !r || r->processInfoLength < 40)
+        return;
+    for (int d = 0; d < kMaxDomains; d++) {
+        Domain *dom = &s->domains[d];
+        if (!dom->live || dom->dying || d == s->sys_dom ||
+            !same_psn(&dom->psn, &r->processNumber))
+            continue;
+        unsigned long size = 0, free = 0;
+        for (int i = 0; i < kMaxChunks; i++) {
+            Chunk *c = &s->chunks[i];
+            if (!c->live || c->domain != d)
+                continue;
+            size += c->hi - c->lo;
+            free += (unsigned long)((THz)c->zone)->zcbFree;
+        }
+        r->processSize += size;
+        r->processFreeMem += free;
+        return;
+    }
+}
+
 static long pool_overh(long trap, long size)
 {
     return pool_over(trap, size, 0);
@@ -2320,24 +2348,44 @@ static void pool_launch(void)
 
 /* Install the stubs, disabled. The stubs, as assembled:
 
-   _OSDispatch:
+   _OSDispatch (on the stack: the return address, the selector, the
+   arguments, the result):
      00 tst.w   enabled          ; off: pass
-     06 beq.s   30
+     06 beq.s   70
      08 tst.w   inside           ; the engine's own call: pass
-     0E bne.s   30
-     10 cmpi.w  #$001D,4(sp)     ; not TempNewHandle: pass
-     16 bne.s   30
-     18 pea     (sp)             ; pool_new(frame)
-     1A movea.l #rd_new,a0
-     20 jsr     (a0)
-     22 addq.l  #4,sp
-     24 tst.l   d0
-     26 bne.s   30
-     28 movea.l (sp)+,a0         ; taken: drop the selector and arguments
-     2A lea     10(sp),sp
-     2E jmp     (a0)
-     30 move.l  osd_old,-(sp)
-     36 rts
+     0E bne.s   70
+     10 cmpi.w  #$001D,4(sp)     ; TempNewHandle
+     16 beq.s   58
+     18 cmpi.w  #$003A,4(sp)     ; not GetProcessInformation: pass
+     1E bne.s   70
+     20 subq.l  #2,sp            ; call the routine with the same arguments
+     22 move.l  12(sp),-(sp)     ; the serial number
+     26 move.l  12(sp),-(sp)     ; the record
+     2A move.w  #$003A,-(sp)
+     2E movea.l osd_old,a0
+     34 jsr     (a0)
+     36 move.w  (sp)+,d0
+     38 move.w  d0,14(sp)        ; the result
+     3C bne.s   50
+     3E move.l  10(sp),-(sp)     ; pool_info(record, serial number)
+     42 move.l  10(sp),-(sp)
+     46 movea.l #rd_info,a0
+     4C jsr     (a0)
+     4E addq.l  #8,sp
+     50 movea.l (sp)+,a0         ; drop the selector and arguments
+     52 lea     10(sp),sp
+     56 jmp     (a0)
+     58 pea     (sp)             ; pool_new(frame)
+     5A movea.l #rd_new,a0
+     60 jsr     (a0)
+     62 addq.l  #4,sp
+     64 tst.l   d0
+     66 bne.s   70
+     68 movea.l (sp)+,a0         ; taken: drop the selector and arguments
+     6A lea     10(sp),sp
+     6E jmp     (a0)
+     70 move.l  osd_old,-(sp)
+     76 rts
 
    DisposeHandle (A0 the handle; the trap dispatcher keeps A1, D1, D2):
      00 tst.w   enabled
@@ -2489,7 +2537,9 @@ static PoolStubs *pool_install(void)
                                                 kPoolOverInfo, kPowerPCISA);
     UniversalProcPtr uop = NewRoutineDescriptor((ProcPtr)pool_overp,
                                                 kPoolOverInfo, kPowerPCISA);
-    if (!p || !un || !ud || !uq || !ul || !uc || !uoh || !uop) {
+    UniversalProcPtr ui = NewRoutineDescriptor((ProcPtr)pool_info,
+                                               kPoolDisposedInfo, kPowerPCISA);
+    if (!p || !un || !ud || !uq || !ul || !uc || !uoh || !uop || !ui) {
         if (p)
             DisposePtr((Ptr)p);
         return 0;
@@ -2506,6 +2556,8 @@ static PoolStubs *pool_install(void)
     BlockMoveData(uop, &t.rd_overp, sizeof(RoutineDescriptor));
     DisposeRoutineDescriptor(uoh);
     DisposeRoutineDescriptor(uop);
+    BlockMoveData(ui, &t.rd_info, sizeof(RoutineDescriptor));
+    DisposeRoutineDescriptor(ui);
     t.overflow = 1;
     DisposeRoutineDescriptor(un);
     DisposeRoutineDescriptor(ud);
@@ -2557,10 +2609,18 @@ static PoolStubs *pool_install(void)
     unsigned long rn = (unsigned long)&p->rd_new;
     unsigned long rd = (unsigned long)&p->rd_disposed;
     unsigned long rq = (unsigned long)&p->rd_quit;
+    unsigned long ri = (unsigned long)&p->rd_info;
     const unsigned short osd[kPoolOsd] = {
-        0x4A79, HI16(en), LO16(en), 0x6728,
-        0x4A79, HI16(in), LO16(in), 0x6620,
-        0x0C6F, 0x001D, 0x0004, 0x6618,
+        0x4A79, HI16(en), LO16(en), 0x6768,
+        0x4A79, HI16(in), LO16(in), 0x6660,
+        0x0C6F, 0x001D, 0x0004, 0x6740,
+        0x0C6F, 0x003A, 0x0004, 0x6650,
+        0x558F, 0x2F2F, 0x000C, 0x2F2F, 0x000C, 0x3F3C, 0x003A,
+        0x2079, HI16(oo), LO16(oo), 0x4E90,
+        0x301F, 0x3F40, 0x000E, 0x6612,
+        0x2F2F, 0x000A, 0x2F2F, 0x000A,
+        0x207C, HI16(ri), LO16(ri), 0x4E90, 0x508F,
+        0x205F, 0x4FEF, 0x000A, 0x4ED0,
         0x4857, 0x207C, HI16(rn), LO16(rn), 0x4E90, 0x588F,
         0x4A80, 0x6608,
         0x205F, 0x4FEF, 0x000A, 0x4ED0,
