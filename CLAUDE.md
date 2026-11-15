@@ -131,6 +131,9 @@ allowed store changes nothing.
 | `W` | native code into the Finder right after a switch back, while the engine still has another process current | denied, Scribble stopped cleanly |
 | `K` | native and 68k stores into the control block and the owner table | dropped by the kernel (6 counted in `CB_TABLES`), Scribble goes on |
 | `X` | make the Enforcer Extension call `ExitToShell` without `engine_stop` | engine stops itself, control block unregistered |
+| `Z` | run 2.5 s twice in its own code without `WaitNextEvent` | preempted: gaps while other applications run, Process Manager switches, `WaitNextEvent` calls by the stub; the two sums equal |
+| `C` | the same loop in a callback Mixed Mode calls from native code | preempted (`CallUniversalProc` from PowerPC to PowerPC leaves no frame: nothing is in progress) |
+| `U` | the same loop in a callback called from 68k code | not preempted: every check "chain not ending at the base" |
 
 `Y`, `V` and `D` flip the word, read it back and restore it, and print
 whether the store landed.
@@ -357,6 +360,77 @@ window: log, deny, log the system heap, deny with the system heap logged.
   control block is locked contiguous, the owner table locked, and the
   extension's partition and the hooks' blocks held.
 
+### Preemption (kernel patch 6, `common/hyield.s`)
+
+Mac OS switches applications only when the current one calls
+`WaitNextEvent`, `GetNextEvent` or `EventAvail`. With preemption, the
+current application's own native code that runs past a slice (20 ms,
+`kSliceMs`) without a switch is made to call `WaitNextEvent(0, &e, 0,
+nil)` when that is safe, and then goes on where it was.
+
+- The redirect (kernel, `preempt`, at 0x146D0 in `NKScheduler.s`, "TRIGGER
+  AN INTERRUPT IN THE BLUE TASK"): to run a 68k interrupt while the blue
+  task runs native code, the scheduler moves it from its alternate context
+  (the NCB, which holds the native registers: PC at +0xFC, MSR at +0xA4)
+  to the emulator's. When the slice is over (`CB_NEXT`), the code is in
+  user mode, the emulator's 68k interrupt mask (ECB r25) is 0, and the PC
+  is in the current application's own code (`code_of` against
+  `ApplZone`), the patch puts the stub's entry in the NCB's PC and keeps
+  the PC in `CB_YIELD_PC`. After the interrupt the emulator resumes the
+  native code, in the stub. One redirect is pending at a time.
+- A slice starts when `ApplZone` changes (`slice_new`, called from
+  `OP_SWITCH` and the lazy switch), and at `OP_YIELD`. The application
+  `ApplZone` leaves gets its `CB_YIELDED` byte (one per owner): it has
+  called `WaitNextEvent` itself, so its Toolbox is set up. `OP_FRESH`
+  clears the byte for a new domain.
+- The stub (`common/hyield.s`, in the system heap): moves r1 below the
+  interrupted code's 224-byte red zone, aligns it to 64, saves r0, r2-r31,
+  LR, CTR, CR, XER, f0-f13, FPSCR, and with AltiVec (the engine makes the
+  branch over it a nop) VRSAVE, v0-v19 and VSCR when VRSAVE is not 0. It
+  takes the PC with `OP_YIELD`, calls the engine's `yield_check` through
+  its TVector, calls `WaitNextEvent` when the check says so, restores, and
+  returns with `OP_RESUME`.
+- `OP_RESUME`: jumping to an arbitrary PC with every register intact
+  needs LR or CTR, which are the application's, so the kernel does it.
+  The stub restores everything but r0, r1, r3, r4, LR, CTR, CR and XER and
+  passes a 64-byte-aligned register block on its frame; the kernel finds
+  it through `phys_of`, puts PC, LR and CR in r10, r12 and r13 (which
+  `SchExitInterrupt` loads before its `rfi`), r0 in the ContextBlock, r1
+  in the EWA, CTR and XER in place, and returns through `MPReturn`. It
+  needs no control block, so a stub that comes back from `WaitNextEvent`
+  after the engine stopped still returns. The stub is never freed.
+- `yield_check` (engine, in the preempted application's context): task
+  level (`CurrentExecutionLevel`; deferred tasks run with mask 0); the
+  application's `CB_YIELDED` byte set; r1 between `ApplLimit` and
+  `CurStackBase` with 32 KB free; and the stack's back chain ends at its
+  base (0 or past `CurStackBase`) with return addresses that are the
+  application's until the first that is not and none after it. A Toolbox
+  routine that called back into the application leaves the application's
+  frames below its own; the launch frames are the system's with none of
+  the application's below. When the check says no, the next try is 2 ms
+  later (`kYieldRetryMs`).
+- Preemption is on with protection (`preempt_set` in `engine_set_mode`),
+  off in Off mode and before `engine_stop`.
+
+Measured (2026-11-14, QEMU, Scribble `Z`, 5 s of Scribble's own code that
+never calls `WaitNextEvent`): with VM off, 188-192 redirects, all safe,
+each a `WaitNextEvent` call, 48-52 Process Manager switches (none
+without preemption), gaps up to 6 ms in Scribble's loop; with VM on, 226
+calls and 68 switches. The sums of the two runs were equal every time.
+
+Findings:
+- GCC uses LR as a scratch register in a function that has saved it
+  (Scribble's `spin` keeps the timebase in it), so the LR says nothing
+  about the caller.
+- A Mixed Mode switch frame, where 68k code called native code, ends the
+  native back chain with a link that has bit 0 set (Scribble `U`: the
+  chain ended at 0x1EDFE431). The 68k frames past it are not on the
+  chain, so the check cannot see who called.
+- `CallUniversalProc` from PowerPC code to a PowerPC routine leaves no
+  frame: the callback's caller is the caller of `CallUniversalProc`.
+- The redirects at startup were in applications that launch, compute and
+  quit before they call `WaitNextEvent` (the `starting` count).
+
 ### Findings that constrain the design
 
 - Protection bits 11 make a page read-only for all code, the kernel
@@ -455,6 +529,20 @@ Worst first. Keep in step with Limits in `README.md`.
 14. Crash cleanup is tested with Scribble `X` (a direct `ExitToShell`). A
     real crash of the extension, or a Force Quit, that does not reach
     `ExitToShell` through the trap table is not covered or tested.
+15. Preemption covers native code only: 68k code, and native code under a
+    68k caller (the chain ends at a switch frame), runs until it yields.
+16. Preemption calls `WaitNextEvent`, which can move memory: an
+    application that keeps a pointer into an unlocked handle across its
+    own long loop can find the block moved. Not seen; not tested.
+17. The yield stub puts its frame (about 1 KB) on the application's stack
+    before the check looks at the room left, so an application within
+    1 KB of its stack's limit overflows into its heap.
+18. A long Toolbox call, or a callback the Toolbox makes (a `ModalDialog`
+    filter), is never preempted, and there is no hang recovery: an
+    application that never yields at a safe point holds the processor as
+    before.
+19. Each engine start leaves one yield stub (about 1 KB) in the system
+    heap.
 
 Compatibility review (2026-11-13) also noted: programs that write-protect
 their own pages lose those faults to the kernel and the hooks; the engine
@@ -505,12 +593,14 @@ serialized, and applications run in parallel only outside it.
    so resumes it in a stub that calls `WaitNextEvent` with an empty mask
    and then continues where it was. The Process Manager does the switch
    and still picks who runs next.
+   - Done (2026-11-14, kernel patch 6, see "Preemption" above): the
+     redirect at the blue task's 68k interrupt, the yield stub,
+     `OP_RESUME`, the engine's check, and Scribble `Z`, `C` and `U`.
    - Toolbox calls that run their own event loop (`ModalDialog`) count
      as safe, from an allow-list checked in the guest.
    - Hang recovery: a clean quit at a safe point for an application that
      stops yielding.
-   - A control panel setting, a per-application exclusion list, and a
-     Scribble command that loops without yielding.
+   - A control panel setting and a per-application exclusion list.
    - 68k code later, if the emulator's state allows it.
 3. Import interposition for native applications: wrappers on imports
    from system libraries. Exact "on behalf of" attribution for Toolbox
@@ -775,7 +865,7 @@ To check which kernel is running, dump it and compare it with the build
 (`build.sh` prints its size):
 
 ```bash
-../os9-protect/tools/qmp.py raw '{"execute":"pmemsave","arguments":{"val":15794176,"size":108700,"filename":"/tmp/nk-live.bin"}}'
+../os9-protect/tools/qmp.py raw '{"execute":"pmemsave","arguments":{"val":15794176,"size":109248,"filename":"/tmp/nk-live.bin"}}'
 ```
 
 ```bash
@@ -823,6 +913,7 @@ address, the task's ID, the page's new PTE); the latest is number
 | PIH (OpenPIC): acknowledge; end of interrupt; CR bits for the emulator | 0x16068; 0x16028; 0x15524 |
 | MP call table (entry n: routine − 4n); entry 109 (patch 4); `MPCallBad` | 0xACB8; 0xAE6C; 0xAF0C |
 | `CommonMPCallReturnPath` (result in r3) | 0xB124 |
+| The scheduler moves the blue task from native code to the emulator for a 68k interrupt (`NKScheduler.s`, patch 6) | 0x146D0 |
 | `GetPTEFromPLE`; `AcquireLock` | 0x124F8; 0x2700 |
 
 Kernel structures the patches use: the CoherenceGroup pointer is the word

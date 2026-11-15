@@ -114,6 +114,18 @@ kernel:
         .set    CB_VSWITCH, 0x058               # VSID switches (OP_SWITCH)
         .set    CB_LAZY, 0x05C                  # VSID switches at a store
         .set    CB_LAZY_PC, 0x060               # and the PC of the last
+        .set    CB_SLICE, 0x064                 # preemption (patch 6): the
+                                                # slice in timebase ticks, 0
+                                                # for off;
+        .set    CB_NEXT, 0x068                  # no redirect before this
+                                                # timebase (low word);
+        .set    CB_STUB, 0x06C                  # the yield stub;
+        .set    CB_YIELD_PC, 0x070              # the PC a redirect replaced,
+                                                # 0 when none is pending;
+        .set    CB_PREEMPTS, 0x074              # redirects made;
+        .set    CB_ZONE, 0x078                  # ApplZone at the last slice
+        .set    CB_YIELDED, 0x080               # 128 bytes, one per owner:
+                                                # 1 once ApplZone left it
         .set    CB_PAGES, 0x100                 # owner table pages, physical
                                                 # (128 of them: 2 GB)
         .set    CB_RING, 0x300                  # RING_N events of 32 bytes
@@ -147,10 +159,27 @@ kernel:
         .set    OP_SWITCH, 5
         .set    OP_FLUSH, 6
         .set    OP_PATCH, 7
+        .set    OP_PREEMPT, 8
+        .set    OP_YIELD, 9
+        .set    OP_RESUME, 10
+        .set    OP_FRESH, 11
         .set    VSID_APP, 0xFFF00               # application VSIDs: segment
                                                 # << 20 | VSID_APP + owner
-        .set    CTX_R6, 0x134                   # ContextBlock.r6 and .r7: an
-        .set    CTX_R7, 0x13C                   # MP call's 4th and 5th arguments
+        .set    CTX_MSR, 0x0A4                  # ContextBlock: MSR,
+        .set    CTX_CODEPTR, 0x0FC              # the PC,
+        .set    CTX_R0, 0x104                   # r0,
+        .set    CTX_R6, 0x134                   # r6 and r7 (an MP call's 4th
+        .set    CTX_R7, 0x13C                   # and 5th arguments)
+        .set    MSR_PR, 0x4000                  # user mode
+        .set    RB_PC, 0x00                     # OP_RESUME's register block
+        .set    RB_LR, 0x04
+        .set    RB_CTR, 0x08
+        .set    RB_CR, 0x0C
+        .set    RB_XER, 0x10
+        .set    RB_R0, 0x14
+        .set    RB_R1, 0x18
+        .set    RB_R3, 0x1C
+        .set    RB_R4, 0x20
 
 # --- Patch sites, in offset order ------------------------------------------
 
@@ -175,6 +204,10 @@ kernel:
                                                 # from resolving . - kernel)
         stock   0x10B68                         # MPSetAreaAccess @pageloop
         b       cpup_keep_writable              # was: mr r8,r29
+
+        stock   0x146D0                         # the blue task's 68k interrupt
+        bl      preempt                         # from native code (patch 6)
+                                                # was: lwz r6,KDP.PA_ECB(r1)
 
         stock   STOCK_END
 
@@ -406,6 +439,12 @@ check:  lwz     9, CB_APPLZONE(31)              # who is current: the owner
         li      8, CB_LAZY
         bl      count
         stw     10, CB_LAZY_PC(31)              # for the engine's hook
+        lwz     9, CB_APPLZONE(31)              # a new slice (patch 6)
+        lhz     8, 0(9)
+        lhz     9, 2(9)
+        rlwimi  9, 8, 16, 0, 15
+        mr      8, 9
+        bl      slice_new
         b       retry
 2:      mr      8, 27                           # the page's owner
         bl      owner_of
@@ -1022,7 +1061,22 @@ enf_register:
 #     file-mapped code page stays clean. The page must have a PTE (read it
 #     first) and should be held, or it can be read in again without the
 #     change. paramErr when the word differs or there is no PTE.
+#   OP_PREEMPT (patch 6): r4 the time slice in timebase ticks (0: off), r5
+#     the yield stub's entry. The slice starts again now.
+#   OP_YIELD: from the yield stub. Returns the PC the redirect replaced
+#     (0 when none is pending, and none is pending after it), and allows
+#     the next redirect r4 ticks from now (0: one slice).
+#   OP_FRESH: r4 an owner byte, given to a new application: its
+#     CB_YIELDED byte back to 0.
+#   OP_RESUME: r4 a register block (RB_*, 64-byte aligned) in the blue
+#     task's space. Returns to its PC with its LR, CTR, CR, XER, r0, r1, r3
+#     and r4, and every other register as at the call. It needs no block
+#     registered: a stub that called WaitNextEvent can come back after the
+#     engine stopped. paramErr when the block's page has no PTE (store into
+#     it and call again).
 enf_op:
+        cmpwi   3, OP_RESUME
+        beq     eo_resume
         bl      1f
 1:      mflr    16
         lwz     31, enf_cb - 1b(16)
@@ -1042,6 +1096,12 @@ enf_op:
         beq     eo_flush
         cmpwi   3, OP_PATCH
         beq     eo_patch
+        cmpwi   3, OP_PREEMPT
+        beq     eo_preempt
+        cmpwi   3, OP_YIELD
+        beq     eo_yield
+        cmpwi   3, OP_FRESH
+        beq     eo_fresh
 eo_bad: li      3, -50
         b       MPReturn
 eo_ok:  li      3, 0
@@ -1130,6 +1190,8 @@ eo_spaces:
         b       eo_ok
 
 eo_switch:
+        mr      8, 4
+        bl      slice_new                       # patch 6
         lwz     9, CB_SPACES(31)
         cmpwi   9, 0
         beq     eo_ok
@@ -1189,6 +1251,73 @@ eo_patch:
         isync
         b       eo_ok
 
+eo_preempt:
+        cmpwi   4, 0
+        beq     1f
+        andi.   9, 5, 3
+        bne     eo_bad                          # not an instruction
+        cmpwi   5, 0
+        beq     eo_bad
+        stw     5, CB_STUB(31)
+1:      stw     4, CB_SLICE(31)
+        mftb    9
+        add     9, 9, 4
+        stw     9, CB_NEXT(31)
+        b       eo_ok
+
+eo_yield:
+        lwz     3, CB_YIELD_PC(31)
+        li      9, 0
+        stw     9, CB_YIELD_PC(31)
+        cmpwi   4, 0
+        bne     1f
+        lwz     4, CB_SLICE(31)
+1:      mftb    9
+        add     9, 9, 4
+        stw     9, CB_NEXT(31)
+        b       MPReturn
+
+eo_fresh:
+        cmplwi  4, 128
+        bge     eo_bad
+        addi    9, 4, CB_YIELDED
+        li      17, 0
+        stbx    17, 31, 9
+        b       eo_ok
+
+# r4 the block. Returns through MPReturn with r10 (the PC), r12 (LR) and
+# r13 (CR) set, which SchExitInterrupt loads before its rfi, the caller's
+# r0 in the ContextBlock and its r1 in the EWA, which it loads from there,
+# and r3, r4, CTR and XER in place. r5 is the caller's: nothing here uses
+# it.
+eo_resume:
+        andi.   9, 4, 63
+        bne     eo_bad
+        mr      22, 4
+        addi    8, 1, KDP_HTABLock
+        bl      AcquireLock
+        mr      8, 22
+        bl      phys_of
+        li      9, 0
+        stw     9, KDP_HTABLock(1)
+        cmpwi   8, 0
+        beq     eo_bad                          # no PTE
+        lwz     10, RB_PC(8)
+        lwz     12, RB_LR(8)
+        lwz     9, RB_CTR(8)
+        mtctr   9
+        lwz     13, RB_CR(8)
+        lwz     9, RB_XER(8)
+        mtxer   9
+        lwz     9, RB_R0(8)
+        stw     9, CTX_R0(6)
+        lwz     9, RB_R1(8)
+        mfsprg  17, 0
+        stw     9, EWA_R1(17)
+        lwz     3, RB_R3(8)
+        lwz     4, RB_R4(8)
+        b       MPReturn
+
 # phys_of: r8 a logical address in the blue task's space -> r8 its
 # physical address, or 0 when its page has no PTE. The caller holds the
 # HTAB lock. Keeps r22-r29, r31; uses r9, r14-r21, r30, cr0, cr1, cr5-7.
@@ -1245,6 +1374,109 @@ spaces_off:
         li      9, 0
         stw     9, KDP_HTABLock(1)
         mtlr    26
+        blr
+
+# Patch 6: preemption at safe points.
+#
+# Mac OS switches applications only when the current one calls
+# WaitNextEvent (or GetNextEvent, EventAvail). An application that
+# computes for a long time without calling it keeps every other one
+# stopped. With OP_PREEMPT, an application's own native code that runs
+# past its slice is sent to the engine's yield stub, which calls
+# WaitNextEvent for it when that is safe, then lets it go on.
+#
+# The redirect: at 0x146D0 the scheduler is about to move the blue task
+# from native code (its alternate context, r6, physical, which holds the
+# code's registers) to the 68k emulator, to run a 68k interrupt. When the
+# slice is over (CB_NEXT), the code runs in user mode with the 68k
+# interrupt mask at 0, and the PC is in the current application's own
+# code, the patch puts the stub's address in the context's PC and keeps
+# the PC in CB_YIELD_PC: after the interrupt the code goes on in the stub.
+# One redirect is pending at a time, until the stub takes the PC with
+# OP_YIELD; the stub returns to it with OP_RESUME. The stub decides what
+# the kernel cannot see: task level, and no Toolbox call in progress.
+#
+# A slice starts when ApplZone changes (slice_new, at OP_SWITCH and at a
+# lazy switch) and at OP_YIELD. The application ApplZone leaves gets its
+# CB_YIELDED byte: it has called WaitNextEvent (or the like) itself, so it
+# has set up the Toolbox, and the stub can call it for it.
+#
+# At the site: r1 the KDP, r6 the alternate context, r7 the flags, r8 the
+# alternate context's flags (live), r19 the EWA, r27 the task's flags, r29
+# PSA.MCR, r30 the task (live). r9, r14-r18, r20-r26, r28, r31, CR and LR
+# are free: the code after the site sets them before it uses them.
+preempt:
+        mflr    24
+        mr      28, 8
+        bl      1f
+1:      mflr    20
+        lwz     31, enf_cb - 1b(20)
+        cmpwi   31, 0
+        beq     9f                              # no block
+        lwz     9, CB_SLICE(31)
+        cmpwi   9, 0
+        beq     9f                              # preemption off
+        lwz     9, CB_YIELD_PC(31)
+        cmpwi   9, 0
+        bne     9f                              # one is pending
+        lwz     9, CTX_MSR(6)
+        andi.   9, 9, MSR_PR
+        beq     9f                              # supervisor mode
+        lwz     9, KDP_PA_ECB(1)                # the 68k interrupt mask, as
+        lwz     9, ECB_R25(9)                   # the emulator left it
+        andi.   9, 9, 7
+        bne     9f                              # interrupt time
+        mftb    9
+        lwz     21, CB_NEXT(31)
+        subf.   9, 21, 9
+        blt     9f                              # inside the slice
+        lwz     9, CB_APPLZONE(31)              # the current application
+        cmpwi   9, 0
+        beq     9f
+        lhz     8, 0(9)
+        lhz     9, 2(9)
+        rlwimi  9, 8, 16, 0, 15
+        mr      8, 9
+        bl      code_of
+        cmplwi  8, OWNER_APP
+        blt     9f                              # none
+        mr      22, 8
+        lwz     23, CTX_CODEPTR(6)
+        mr      8, 23
+        bl      code_of
+        cmpw    8, 22
+        bne     9f                              # not its own code
+        stw     23, CB_YIELD_PC(31)
+        lwz     9, CB_STUB(31)
+        stw     9, CTX_CODEPTR(6)
+        li      8, CB_PREEMPTS
+        bl      count
+9:      mr      8, 28
+        lwz     6, KDP_PA_ECB(1)                # the replaced instruction
+        mtlr    24
+        blr
+
+# slice_new: r8 a zone (ApplZone). When it is not the zone of the last
+# slice, a slice starts now, and the application of that last zone has
+# given up the processor. r31 the block; uses r8, r9, r16, r17.
+slice_new:
+        lwz     9, CB_ZONE(31)
+        cmpw    8, 9
+        beqlr
+        stw     8, CB_ZONE(31)
+        lwz     17, CB_SLICE(31)
+        mftb    16
+        add     16, 16, 17
+        stw     16, CB_NEXT(31)
+        mflr    16
+        mr      8, 9
+        bl      code_of
+        mtlr    16
+        cmplwi  8, OWNER_APP
+        bltlr
+        addi    8, 8, CB_YIELDED
+        li      9, 1
+        stbx    9, 31, 8
         blr
 
         .globl  task_log                        # for build.sh's nm

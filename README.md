@@ -3,7 +3,8 @@
 Crash containment for Mac OS 9.2.2 on NewWorld Macs. When an application
 writes into another application's memory, Enforcer blocks the write and
 stops the application that made it. The other applications and the system
-keep running, and you do not need to restart.
+keep running, and you do not need to restart. An application that computes
+for a long time without giving up the processor is made to share it.
 
 ## Requirements
 
@@ -86,6 +87,11 @@ application run, and the notification says so.
   that is not current, a Multiprocessing Services task, interrupt-time code,
   a deferred task), the kernel or the engine skips the write and the writer
   goes on.
+- **Preemption.** An application whose own PowerPC code runs for 20 ms
+  without calling `WaitNextEvent` is made to call it, when that is safe:
+  at task level, with no Toolbox call in progress. Other applications get
+  time, and it then goes on where it was. It is on with Enforce and Log
+  only.
 - **Without the extension,** the patched kernel opens no write-protected
   page that Apple's kernel would not.
 
@@ -130,6 +136,19 @@ Known holes:
   normally has) is protected page by page as before: for up to 16 ms after
   a switch, a write by the new application into a page the previous one
   was using is not caught.
+
+Preemption:
+- Only PowerPC code is preempted. A 68k application, and PowerPC code
+  called from 68k code, runs until it calls `WaitNextEvent` itself.
+- An application that is inside a long Toolbox call, or in a routine the
+  Toolbox called back (a dialog filter, for example), is not preempted.
+- An application that has not called `WaitNextEvent` once since it
+  launched is not preempted.
+- `WaitNextEvent` can move memory. An application that keeps a pointer
+  into an unlocked handle across a long computation can find the block
+  moved after it was preempted.
+- There is no setting to turn preemption off, or to leave an application
+  out, other than turning Enforcer off.
 
 Compatibility:
 - An application's temporary memory comes from chunks of its own. A large

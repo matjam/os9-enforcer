@@ -497,6 +497,11 @@ typedef struct {
     unsigned long pm_site;
     unsigned long *pm_stub;
     unsigned long pm_mapped, pm_tried, pm_tries;
+    /* Preemption (kernel patch 6, kcb.h kKcbOpPreempt): the yield stub
+       (common/hyield.h), or 0; preempt_on is 1 while the kernel has it,
+       which is while protection is on, with slices of slice_ms. */
+    struct YieldData *yield;
+    unsigned long preempt_on, slice_ms;
 } State;
 
 /* Install the hooks, the fallback handler and the timer, read the process

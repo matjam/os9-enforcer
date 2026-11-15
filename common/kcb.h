@@ -66,7 +66,14 @@ enum {
     kKcbOpSpaces = 4,  /* r4 on, r5 segment mask (bit n: segment n, 0-5) */
     kKcbOpSwitch = 5,  /* r4 a zone: its application's VSIDs */
     kKcbOpFlush = 6,   /* r4 first page, r5 pages: drop their PTEs */
-    kKcbOpPatch = 7    /* r4 address, r5 old word, r6 new: kcb_patch */
+    kKcbOpPatch = 7,   /* r4 address, r5 old word, r6 new: kcb_patch */
+    /* Preemption (kernel patch 6). */
+    kKcbOpPreempt = 8, /* r4 slice in timebase ticks (0 off), r5 the stub */
+    kKcbOpYield = 9,   /* from the stub: returns the PC; next redirect in r4
+                          ticks (0: one slice) */
+    kKcbOpResume = 10, /* from the stub: r4 a register block (common/
+                          hyield.s); needs no block registered */
+    kKcbOpFresh = 11   /* r4 a new application's owner: yielded[r4] = 0 */
 };
 
 /* KEvent.info, low byte. */
@@ -124,7 +131,15 @@ typedef struct {
        store because ApplZone had changed without one. */
     volatile unsigned long spaces, rebuilt, vswitch, lazy;
     volatile unsigned long lazy_pc; /* the PC of the last lazy switch */
-    unsigned long reserved[39];
+    /* Preemption (kKcbOpPreempt): the slice in timebase ticks (0 off), the
+       timebase (low word) before which no redirect is made, the yield
+       stub, the PC a redirect replaced (0 when none is pending), redirects
+       made, and ApplZone when the last slice started. */
+    volatile unsigned long slice, next, stub, yield_pc, preempts, zone;
+    unsigned long reserved;
+    /* One byte per owner: 1 once ApplZone left that application, which
+       then has called WaitNextEvent (or the like) itself. */
+    volatile unsigned char yielded[128];
     unsigned long pages[kKcbTablePages]; /* physical */
     KEvent ring[kKcbRing];              /* event n at (n - 1) % kKcbRing */
 } KernelCB;
@@ -139,6 +154,9 @@ _Static_assert(offsetof(KernelCB, tables) == 0x4C, "CB_TABLES");
 _Static_assert(offsetof(KernelCB, spaces) == 0x50, "CB_SPACES");
 _Static_assert(offsetof(KernelCB, lazy) == 0x5C, "CB_LAZY");
 _Static_assert(offsetof(KernelCB, lazy_pc) == 0x60, "CB_LAZY_PC");
+_Static_assert(offsetof(KernelCB, slice) == 0x64, "CB_SLICE");
+_Static_assert(offsetof(KernelCB, zone) == 0x78, "CB_ZONE");
+_Static_assert(offsetof(KernelCB, yielded) == 0x80, "CB_YIELDED");
 _Static_assert(offsetof(KernelCB, pages) == 0x100, "CB_PAGES");
 _Static_assert(offsetof(KernelCB, ring) == 0x300, "CB_RING");
 _Static_assert(sizeof(KEvent) == 32, "event size");

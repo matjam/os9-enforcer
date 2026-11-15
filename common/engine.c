@@ -9,6 +9,7 @@
 #include <stddef.h>
 #include <string.h>
 #include <MacMemory.h>
+#include <Events.h>
 #include <Gestalt.h>
 #include <Processes.h>
 #include <Timer.h>
@@ -21,6 +22,8 @@
 #include "hook.h"
 #include "h68k.h"
 #include "hnat.h"
+#include "hyield.h"
+#include "hyield_code.h"
 
 enum { kTimerMs = 16, kBusErrorVector = 0x08 };
 
@@ -899,8 +902,10 @@ static void sys_start(State *s)
         sys_exclude_block(s, s->kcb_raw, GetPtrSize(s->kcb_raw));
         sys_exclude_block(s, s->owners_raw, GetPtrSize(s->owners_raw));
     }
-    /* The hook's stub stores into its save area at every switch. */
+    /* The hook's stub stores into its save area at every switch, and the
+       yield stub counts in its block. */
     sys_exclude_block(s, s->pm_stub, s->pm_stub ? kStubLongs * 4 : 0);
+    sys_exclude_block(s, s->yield, s->yield ? sizeof hyield_code : 0);
     unsigned long hi = sys_heap_hi(s, lo, sp->cap), n = (hi - lo) / kPage;
     sys_check_access(s, 0, n);
 
@@ -1446,6 +1451,9 @@ static int add_domain(State *s, int i, const ProcessSerialNumber *psn,
 
     Domain *d = &s->domains[i];
     memset(d, 0, sizeof *d);
+    /* Not preempted until it has given up the processor (yield_check). */
+    if (s->kcb && kcb_set(kKcbOpFresh, owner_code(s, i)))
+        s->c.kernel_errors++;
     d->lo = lo;
     d->hi = hi;
     d->location = loc;
@@ -2415,6 +2423,8 @@ static void pool_remove(State *s)
     remove_one(trap_entry(_OSDispatch), p->osd_old, p->osd);
 }
 
+static void preempt_set(State *s, int on);
+
 void engine_set_mode(State *s, unsigned long mode)
 {
     if (mode > kModeEnforce)
@@ -2432,7 +2442,8 @@ void engine_set_mode(State *s, unsigned long mode)
         /* Application VSIDs off before the kernel's mode, so that no store
            meets a page read-only by owner in kKcbPass. After mode is off,
            the timer protects nothing, so every page opened here stays
-           open. */
+           open. Off is without preemption too. */
+        preempt_set(s, 0);
         spaces_set(s, 0);
         set_deny(s, kModeOff);
         s->mode = kModeOff;
@@ -2446,6 +2457,7 @@ void engine_set_mode(State *s, unsigned long mode)
     if (old == kModeOff) {
         spaces_set(s, 1);
         protect_others(s);
+        preempt_set(s, 1);
     }
 }
 
@@ -2711,6 +2723,173 @@ static void pm_unhook(State *s)
     DisposePtr((Ptr)s->pm_stub);
     s->pm_site = 0;
     s->pm_stub = 0;
+}
+
+/* Preemption at safe points (kernel patch 6, common/hyield.s). The kernel
+   sends the current application's native code to the yield stub when it
+   has run kSliceMs without a switch; yield_check decides whether the stub
+   calls WaitNextEvent for it. */
+enum {
+    kSliceMs = 20,
+    kYieldRetryMs = 2,        /* the next try after a check that said no */
+    kYieldStack = 0x8000,     /* free stack WaitNextEvent is given */
+    kYieldFrames = 1024       /* the longest chain followed */
+};
+
+#ifndef gestaltPowerPCProcessorFeatures
+#define gestaltPowerPCProcessorFeatures 'ppcf'
+#endif
+#ifndef gestaltPowerPCHasVectorInstructions
+#define gestaltPowerPCHasVectorInstructions 4
+#endif
+
+/* The owner of the code at addr: an application's byte without
+   kOwnerCode, kOwnerSystem, or 0. */
+static unsigned owner_at(State *s, unsigned long addr)
+{
+    unsigned long page = addr >> 12;
+    if (page >= s->kcb->entries)
+        return 0;
+    return s->owners[page] & ~kOwnerCode;
+}
+
+/* From the yield stub, in the preempted application's context and at the
+   level it was preempted at, with r1 below the application's frames.
+   Returns 1 when the application can call WaitNextEvent now:
+   - it has given up the processor before (KernelCB.yielded), so it has
+     set up the Toolbox;
+   - at task level (not a deferred task or an interrupt handler);
+   - r1 on the application's stack (between ApplLimit and CurStackBase,
+     not a thread's), with kYieldStack free below it;
+   - no Toolbox call in progress: the stack's chain ends at its base (0,
+     or a link at or past CurStackBase), and its return addresses are the
+     application's code until the first that is not, and none after it
+     is. A chain that ends on any other link leaves its callers unknown:
+     a 68k caller's switch frame (Scribble U) ends it so. A Toolbox
+     routine that called back into the
+     application leaves the application's own frames below its own; the
+     frames that launched the application are the system's, with none of
+     the application's below them. The first frame's return address is
+     left out (a function that has called nothing yet has not written
+     it), and so is the LR, which compilers use as a scratch register
+     once they have saved it.
+   Writes only the stub's block: the program running the engine may be
+   another application's memory here. */
+static long yield_check(unsigned long sp, unsigned long pc, unsigned long lr,
+                        volatile YieldData *y)
+{
+    State *s = g_state;
+    long ok = 0;
+    unsigned long n = 0;
+    y->last_sp = sp;
+    y->last_pc = pc;
+    y->last_lr = lr;
+    y->last_base = 0;
+    if (!s || !s->kcb)
+        return 0;
+    if (CurrentExecutionLevel() != kTaskLevel) {
+        y->not_task++;
+        goto no;
+    }
+    unsigned long zone = current_zone();
+    unsigned owner = owner_at(s, zone);
+    y->last_owner = owner;
+    if (owner < kOwnerApp || !s->kcb->yielded[owner]) {
+        y->starting++;
+        goto no;
+    }
+    if (owner_at(s, pc) != owner) {
+        y->in_call++;
+        goto no;
+    }
+    unsigned long base = lowmem_long(0x908);  /* CurStackBase */
+    unsigned long limit = lowmem_long(0x130); /* ApplLimit */
+    y->last_base = base;
+    if (sp >= base || sp < limit) {
+        y->other_stack++;
+        goto no;
+    }
+    if (sp - limit < kYieldStack) {
+        y->low_stack++;
+        goto no;
+    }
+    {
+        unsigned long prev = sp, f = *(volatile unsigned long *)sp;
+        int sys = 0;
+        while (f > prev && f < base && !(f & 3)) {
+            unsigned long ret = ((volatile unsigned long *)f)[2];
+            if (n < 11)
+                y->chain[n] = ret;
+            n++;
+            if (owner_at(s, ret) != owner)
+                sys = 1;
+            else if (sys) {
+                y->in_call++;
+                goto no;
+            }
+            if (n >= kYieldFrames)
+                break;
+            prev = f;
+            f = *(volatile unsigned long *)f;
+        }
+        if (n < 11)
+            y->chain[n] = f; /* where it ended */
+        /* It must end at the stack's base. A chain that ends on another
+           link (a Mixed Mode switch frame, where 68k code called the
+           native code above it) hides who called. */
+        if (f && f < base) {
+            y->broken++;
+            goto no;
+        }
+    }
+    y->safe++;
+    ok = 1;
+no:
+    y->last_n = n;
+    if (!ok)
+        kcb_set(kKcbOpYield, kYieldRetryMs * s->c.tb_per_ms);
+    return ok;
+}
+
+/* The yield stub, in the system heap, held. It is never freed: an
+   application preempted in WaitNextEvent comes back into it, maybe after
+   the engine stopped. */
+static void preempt_new(State *s)
+{
+    if (!s->kcb)
+        return;
+    YieldData *y = (YieldData *)NewPtrSysClear(sizeof hyield_code);
+    if (!y)
+        return;
+    memcpy(y, hyield_code, sizeof hyield_code);
+    if (y->magic != kYieldMagic) {
+        DisposePtr((Ptr)y);
+        return;
+    }
+    y->check = yield_check;
+    y->wne = (void *)WaitNextEvent;
+    long f = 0;
+    if (Gestalt(gestaltPowerPCProcessorFeatures, &f) == noErr &&
+        (f & (1L << gestaltPowerPCHasVectorInstructions)))
+        *(unsigned long *)((char *)y + y->vecbr) = 0x60000000; /* nop */
+    flush_code(y, sizeof hyield_code);
+    hold(s, y, sizeof hyield_code, 1);
+    s->yield = y;
+    s->slice_ms = kSliceMs;
+}
+
+/* On with protection (engine_set_mode), off before the engine stops. */
+static void preempt_set(State *s, int on)
+{
+    if (!s->yield || !s->kcb || on == (int)s->preempt_on)
+        return;
+    unsigned long entry = (unsigned long)s->yield + s->yield->entry;
+    if (kcb_set2(kKcbOpPreempt, on ? s->slice_ms * s->c.tb_per_ms : 0,
+                 entry)) {
+        s->c.kernel_errors++; /* a kernel without patch 6 */
+        return;
+    }
+    s->preempt_on = on;
 }
 
 /* The kernel's owner check (common/kcb.h): allocate the control block and
@@ -2981,6 +3160,8 @@ long engine_start(State **out, unsigned long mode, const char *name)
             hold(s, s->pm_stub, kStubLongs * 4, 1);
         }
     }
+    /* Preemption comes on with protection, too. */
+    preempt_new(s);
     s->seen[kSrc68k] = s->h68k->count_handled;
     s->seen[kSrcNative] = s->hnat->count_handled;
     /* For tools/xlog-read.py. */
@@ -3060,7 +3241,9 @@ void engine_stop(State *s)
     pool_remove(s);
     /* Stop denying and protecting, stop the tick, take what the rings
        hold, then open everything before the hooks stop managing it.
-       Application VSIDs go first, as in engine_set_mode. */
+       Preemption and application VSIDs go first, as in engine_set_mode;
+       the yield stub stays (preempt_new). */
+    preempt_set(s, 0);
     spaces_set(s, 0);
     set_deny(s, kModeOff);
     s->mode = kModeOff;

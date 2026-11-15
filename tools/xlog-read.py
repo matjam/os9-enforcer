@@ -44,12 +44,20 @@ MAX_CHUNKS = 128
 # After the Chunk table: skips, application VSIDs and the Process Manager
 # hook.
 SPACES = ["skips", "spaces", "vsid_mask", "spaces_on", "pm_site", "pm_stub",
-          "pm_mapped", "pm_tried", "pm_tries"]
+          "pm_mapped", "pm_tried", "pm_tries", "yield", "preempt_on",
+          "slice_ms"]
+# The yield stub's data (common/hyield.h).
+YIELD = (["magic", "entry", "vecbr", "check", "wne", "entered", "yielded",
+          "lost", "starting", "not_task", "in_call", "other_stack",
+          "low_stack", "broken", "safe", "last_sp", "last_pc", "last_lr",
+          "last_owner", "last_base", "last_n"] +
+         ["chain%d" % i for i in range(11)])
 KCB = ["magic", "version", "mode", "current", "entries", "denied_page",
        "seq", "frame", "allowed", "logged", "denied", "bail", "self",
        "skipped", "applzone", "deny_native_page", "deny_native_seq",
        "deny_68k_page", "deny_68k_seq", "tables", "spaces", "rebuilt",
-       "vswitch", "lazy", "lazy_pc"]
+       "vswitch", "lazy", "lazy_pc", "slice", "next", "stub", "yield_pc",
+       "preempts", "zone"]
 KCB_RING, KCB_RING_N, KCB_EVENTS = 0x300, 488, 12
 EVF = [(1, "68k"), (2, "task"), (4, "offense"), (8, "denied"),
        (16, "skipped")]
@@ -109,6 +117,10 @@ def collect(addr):
         o += MAX_CHUNKS * 4 * len(CHUNK)
         kernel.update(zip(SPACES, struct.unpack(">%dI" % len(SPACES),
                                                 d[o:o + 4 * len(SPACES)])))
+        if kernel["yield"]:
+            kernel.update(("y_" + n, v) for n, v in zip(
+                YIELD, struct.unpack(">%dI" % len(YIELD),
+                                     read(kernel["yield"], 4 * len(YIELD)))))
         if kernel["pool"]:
             kernel.update(("stub_" + n, v) for n, v in zip(
                 POOL_STUBS, struct.unpack(">%dI" % len(POOL_STUBS),
@@ -178,6 +190,28 @@ def print_kernel(k):
                   k["pm_stub"]) if k["pm_site"] else
               "not installed (%d searches, the last from %08X)" % (
                   k["pm_tries"], k["pm_tried"])))
+    if k["yield"]:
+        print("  preemption: %s, slice %d ms (kernel %d ticks), stub %08X; "
+              "redirects %d (pending %08X); stub entries %d, WaitNextEvent "
+              "calls %d, lost %d" % (
+                  "on" if k["preempt_on"] else "off", k["slice_ms"],
+                  k["cb_slice"], k["yield"] + k["y_entry"],
+                  k["cb_preempts"], k["cb_yield_pc"], k["y_entered"],
+                  k["y_yielded"], k["y_lost"]))
+        n = k["y_last_n"]
+        print("    checks: starting %d, not task %d, in a call %d, other "
+              "stack %d, low stack %d, chain not ending at the base %d, safe "
+              "%d; the last: sp %08X pc %08X lr %08X owner %d stack base "
+              "%08X, %d frames: %s%s" % (
+                  k["y_starting"], k["y_not_task"], k["y_in_call"],
+                  k["y_other_stack"], k["y_low_stack"], k["y_broken"],
+                  k["y_safe"], k["y_last_sp"], k["y_last_pc"],
+                  k["y_last_lr"], k["y_last_owner"], k["y_last_base"], n,
+                  " ".join("%08X" % k["y_chain%d" % i]
+                           for i in range(min(11, n))),
+                  ", ended at %08X" % k["y_chain%d" % n] if n < 11 else ""))
+    else:
+        print("  preemption: no yield stub")
     if k["events"]:
         print("  last events (owner/code/current: 1 system heap, 3+ domain "
               "slot + 3):")

@@ -67,6 +67,15 @@
  *      control block and one of its owner table, each read back: the
  *      kernel drops all four and counts them, and this application goes
  *      on.
+ *
+ *   Z  run about 5 s in a loop of this application's own code that never
+ *      calls WaitNextEvent, twice the same work. With preemption (kernel
+ *      patch 6) the loop sees gaps while other applications run, and the
+ *      two runs' sums are the same.
+ *   C  the same loop for 2.5 s in a callback that Mixed Mode calls from
+ *      native code (CallUniversalProc);
+ *   U  and in one called from 68k code in this application's heap. A call
+ *      is in progress below both: preemption must leave them alone.
  */
 
 #include <stdio.h>
@@ -81,6 +90,7 @@
 #include <AppleEvents.h>
 
 #include "engine.h"
+#include "hyield.h"
 
 /* In InterfaceLib, not in the Multiversal Interfaces. */
 typedef struct {
@@ -295,6 +305,84 @@ static unsigned long long micros(void)
     return (unsigned long long)w.hi << 32 | w.lo;
 }
 
+static unsigned long tb(void)
+{
+    unsigned long t;
+    __asm__ volatile("mftb %0" : "=r"(t));
+    return t;
+}
+
+/* Z's loop: iters rounds of integer and floating-point work in registers,
+   with no call, timing each round with the timebase. A round that took
+   more than gap ticks is a time the loop did not run. */
+typedef struct {
+    unsigned long isum, gaps, max_gap, ticks;
+    double fsum;
+} Spin;
+
+static void __attribute__((noinline)) spin(unsigned long iters,
+                                           unsigned long gap, Spin *r)
+{
+    unsigned long a = 1, b = 2, c = 3, d = 4, e = 5, f = 6, g = 7, h = 8;
+    double x = 1.0, y = 0.5, z = 0.25, w = 2.0;
+    unsigned long start = tb(), prev = start, gaps = 0, max_gap = 0;
+    for (unsigned long i = 0; i < iters; i++) {
+        for (int k = 0; k < 64; k++) {
+            a = a * 1664525 + 1013904223;
+            b ^= a >> 7;
+            c += b;
+            d = (d << 3) ^ c;
+            e += d >> 5;
+            f ^= e;
+            g += f * 3;
+            h ^= g >> 11;
+            x = x * 1.0000001 + y;
+            y = y * 0.9999999 - z * 1e-9;
+            z += x * 1e-12;
+            w = w * 0.5 + z;
+        }
+        unsigned long now = tb();
+        if (now - prev > gap) {
+            gaps++;
+            if (now - prev > max_gap)
+                max_gap = now - prev;
+        }
+        prev = now;
+    }
+    r->isum = a ^ b ^ c ^ d ^ e ^ f ^ g ^ h;
+    r->fsum = x + y + z + w;
+    r->gaps = gaps;
+    r->max_gap = max_gap;
+    r->ticks = prev - start;
+}
+
+/* Timebase ticks a millisecond, and spin's rounds for ms milliseconds. */
+static unsigned long spin_rounds(unsigned long ms, unsigned long *per_ms)
+{
+    unsigned long long u0 = micros();
+    unsigned long t0 = tb();
+    while (micros() - u0 < 50000)
+        ;
+    *per_ms = (tb() - t0) / 50;
+    Spin cal;
+    spin(200, ~0UL, &cal);
+    return (unsigned long)(200.0 * ms * *per_ms / (cal.ticks + 1));
+}
+
+/* C and U: spin called back from system code. */
+static Spin g_cb;
+static unsigned long g_cb_rounds, g_cb_gap;
+
+static void cb_spin(void)
+{
+    spin(g_cb_rounds, g_cb_gap, &g_cb);
+}
+
+/* MOVEA.L 4(A7),A0; JSR (A0); RTS: calls the routine descriptor passed
+   to it, from 68k code. */
+static const unsigned short code68k_call[] = {0x206F, 0x0004, 0x4E90,
+                                              0x4E75};
+
 /* Whether handle h lives in one of Enforcer's temporary memory chunks:
    its zone follows the chunk signature (common/engine.h). */
 static int in_chunk(Handle h)
@@ -472,7 +560,8 @@ int main(void)
                "V from a Time Manager task, D from a deferred task, W "
                "right after a switch, K into the control block and the "
                "owner table, X make the Enforcer Extension quit "
-               "as in a crash, q quit; then Return\n");
+               "as in a crash, Z run 5 s without yielding, C/U the same "
+               "in a native/68k callback, q quit; then Return\n");
         int ch = getchar();
         while (ch != '\n' && getchar() != '\n')
             ;
@@ -557,7 +646,7 @@ int main(void)
                space, and the owner table's last, for pages at the top of
                logical memory that nobody owns. */
             volatile unsigned long *words[2] = {
-                (volatile unsigned long *)&s->kcb->reserved[0],
+                (volatile unsigned long *)&s->kcb->reserved,
                 (volatile unsigned long *)(s->owners + s->owners_size - 4)};
             const char *names[2] = {"control block", "owner table"};
             unsigned long before = s->kcb->tables;
@@ -751,6 +840,93 @@ int main(void)
                    (unsigned long)(t2 - t1), rebuilt,
                    rebuilt ? (double)((t1 - t0) - (t2 - t1)) / rebuilt : 0.0,
                    sum);
+            continue;
+        }
+        case 'Z': {
+            /* Run about 5 s without calling WaitNextEvent: the same loop
+               twice, 2.5 s each. With preemption (kernel patch 6), the
+               yield stub calls WaitNextEvent for Scribble every slice:
+               the loop sees gaps while other applications run, and the
+               two runs' sums must be the same (every register came back
+               as it was). */
+            unsigned long per_ms;
+            unsigned long iters = spin_rounds(2500, &per_ms);
+            Spin r1, r2;
+            State *s = engine_state();
+            unsigned long p0 = s && s->kcb ? s->kcb->preempts : 0;
+            volatile YieldData *y = s ? s->yield : 0;
+            unsigned long y0 = y ? y->yielded : 0, e0 = y ? y->entered : 0;
+            unsigned long w0 = s ? s->c.pm_switches : 0;
+            spin(iters, per_ms, &r1);
+            spin(iters, per_ms, &r2);
+            printf("%lu rounds twice: %s; %lu ms and %lu ms\n", iters,
+                   r1.isum == r2.isum && r1.fsum == r2.fsum
+                       ? "sums equal" : "SUMS DIFFER",
+                   r1.ticks / per_ms, r2.ticks / per_ms);
+            printf("gaps over 1 ms: %lu and %lu, the longest %lu us and "
+                   "%lu us\n", r1.gaps, r2.gaps,
+                   r1.max_gap * 1000 / per_ms, r2.max_gap * 1000 / per_ms);
+            if (s) {
+                s = engine_state();
+                printf("redirects %lu, stub entries %lu, WaitNextEvent "
+                       "calls %lu, Process Manager switches %lu\n",
+                       s && s->kcb ? s->kcb->preempts - p0 : 0,
+                       y ? y->entered - e0 : 0, y ? y->yielded - y0 : 0,
+                       s ? s->c.pm_switches - w0 : 0);
+                if (y)
+                    printf("checks: starting %lu, not task %lu, in a call "
+                           "%lu, other stack %lu, low stack %lu, safe %lu\n",
+                           y->starting, y->not_task, y->in_call,
+                           y->other_stack, y->low_stack, y->safe);
+            }
+            continue;
+        }
+        case 'C':
+        case 'U': {
+            /* Spin 2.5 s in a callback: called by Mixed Mode from native
+               code (C), or from 68k code in this application's heap (U).
+               A Toolbox call is in progress below it, so preemption must
+               not call WaitNextEvent: every check says "in a call". */
+            unsigned long per_ms;
+            g_cb_rounds = spin_rounds(2500, &per_ms);
+            g_cb_gap = per_ms;
+            State *s = engine_state();
+            volatile YieldData *y = s ? s->yield : 0;
+            if (!y) {
+                printf("needs Enforcer with preemption\n");
+                continue;
+            }
+            unsigned long safe0 = y->safe, call0 = y->in_call,
+                          w0 = y->yielded, e0 = y->entered,
+                          b0 = y->broken;
+            UniversalProcPtr cbu = NewRoutineDescriptor(
+                (ProcPtr)cb_spin, kCStackBased, kPowerPCISA);
+            if (ch == 'C') {
+                CallUniversalProc(cbu, kCStackBased);
+            } else {
+                Ptr c68 = NewPtr(sizeof code68k_call);
+                ProcInfoType pi1 = kCStackBased |
+                                   STACK_ROUTINE_PARAMETER(1, kFourByteCode);
+                BlockMove(code68k_call, c68, sizeof code68k_call);
+                UniversalProcPtr u68 =
+                    NewRoutineDescriptor((ProcPtr)c68, pi1, kM68kISA);
+                CallUniversalProc(u68, pi1, cbu);
+                DisposeRoutineDescriptor(u68);
+                DisposePtr(c68);
+            }
+            DisposeRoutineDescriptor(cbu);
+            printf("%s callback: gaps over 1 ms %lu, the longest %lu us; "
+                   "stub entries %lu, in a call %lu, chain not ending at "
+                   "the base %lu, safe %lu, WaitNextEvent calls %lu\n",
+                   ch == 'C' ? "native" : "68k", g_cb.gaps,
+                   g_cb.max_gap * 1000 / per_ms, y->entered - e0,
+                   y->in_call - call0, y->broken - b0, y->safe - safe0,
+                   y->yielded - w0);
+            printf("the last chain (sp %08lX, base %08lX, %lu frames):",
+                   y->last_sp, y->last_base, y->last_n);
+            for (unsigned long i = 0; i <= y->last_n && i < 11; i++)
+                printf(" %08lX", y->chain[i]);
+            printf("\n");
             continue;
         }
         case 'm': {
