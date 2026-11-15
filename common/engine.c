@@ -1660,23 +1660,75 @@ static unsigned long pool_grow(State *s)
     /* Leave the Process Manager some temporary memory of its own. */
     if (slot < 0 || (unsigned long)TempFreeMem() < kOverReserve + kPoolBlock)
         return 0;
-    Handle h = sys_temp(s, kPoolBlock + kPage);
+    /* With virtual memory on the block is locked, so that the Virtual
+       Memory Manager leaves its page frames alone, and it is not one
+       physical range: each page's physical address is kept in a table
+       after the pages (PoolBlock.phys 0). */
+    Handle h = sys_temp(s, kPoolBlock + (s->vm ? 2 * kPage : kPage));
     if (!h)
         return 0;
     MoveHHi(h);
     HLock(h);
     unsigned long base = ((unsigned long)*h + kPage - 1) & kPageMask;
-    unsigned long phys = kcb_physical((void *)base, kPoolBlock);
-    if (!phys) { /* not one physical range */
-        DisposeHandle(h);
-        return 0;
+    unsigned long phys = 0;
+    if (s->vm) {
+        unsigned long *t = (unsigned long *)(base + kPoolBlock);
+        if (LockMemory((void *)base, kPoolBlock + kPage)) {
+            DisposeHandle(h);
+            return 0;
+        }
+        for (unsigned long i = 0; i < kPoolBlock / kPage; i++) {
+            t[i] = kcb_physical((void *)(base + i * kPage), kPage);
+            if (!t[i]) {
+                UnlockMemory((void *)base, kPoolBlock + kPage);
+                DisposeHandle(h);
+                return 0;
+            }
+        }
+        for (unsigned long i = 0; i < kPoolBlock / kPage; i++)
+            kcb_set(kKcbOpPoolPut, t[i]);
+    } else {
+        phys = kcb_physical((void *)base, kPoolBlock);
+        if (!phys) { /* not one physical range */
+            DisposeHandle(h);
+            return 0;
+        }
+        for (unsigned long o = 0; o < kPoolBlock; o += kPage)
+            kcb_set(kKcbOpPoolPut, phys + o);
     }
-    for (unsigned long o = 0; o < kPoolBlock; o += kPage)
-        kcb_set(kKcbOpPoolPut, phys + o);
     s->pool_blocks[slot].h = h;
     s->pool_blocks[slot].phys = phys;
     s->pool_grown++;
     return kPoolBlock / kPage;
+}
+
+/* kKcbOpPoolTake on one physical range: how many of its pages are in the
+   pool (count), or take them out. */
+static long pool_take(unsigned long lo, unsigned long hi, int count)
+{
+    KRegs k = {0};
+    k.r3 = kKcbOpPoolTake;
+    k.r4 = lo;
+    k.r5 = hi;
+    k.r6 = count;
+    return nk_call(kMPEnforcer, &k);
+}
+
+/* pool_shrink for a block of virtual memory: its pages one by one, from
+   the table pool_grow left. Returns 1 when the block is freed. */
+static int pool_shrink_paged(PoolBlock *b)
+{
+    unsigned long base = ((unsigned long)*b->h + kPage - 1) & kPageMask;
+    const unsigned long *t = (const unsigned long *)(base + kPoolBlock);
+    for (unsigned long i = 0; i < kPoolBlock / kPage; i++)
+        if (pool_take(t[i], t[i] + kPage, 1) != 1)
+            return 0;
+    for (unsigned long i = 0; i < kPoolBlock / kPage; i++)
+        pool_take(t[i], t[i] + kPage, 0);
+    UnlockMemory((void *)base, kPoolBlock + kPage);
+    DisposeHandle(b->h);
+    b->h = 0;
+    return 1;
 }
 
 /* Take back and free one block whose pages are all in the pool. Returns
@@ -1687,18 +1739,15 @@ static unsigned long pool_shrink(State *s)
         PoolBlock *b = &s->pool_blocks[i];
         if (!b->h)
             continue;
-        KRegs k = {0};
-        k.r3 = kKcbOpPoolTake;
-        k.r4 = b->phys;
-        k.r5 = b->phys + kPoolBlock;
-        k.r6 = 1; /* count */
-        if (nk_call(kMPEnforcer, &k) != kPoolBlock / kPage)
+        if (!b->phys) {
+            if (!pool_shrink_paged(b))
+                continue;
+            s->pool_shrunk++;
+            return kPoolBlock / kPage;
+        }
+        if (pool_take(b->phys, b->phys + kPoolBlock, 1) != kPoolBlock / kPage)
             continue;
-        k.r3 = kKcbOpPoolTake;
-        k.r4 = b->phys;
-        k.r5 = b->phys + kPoolBlock;
-        k.r6 = 0;
-        nk_call(kMPEnforcer, &k);
+        pool_take(b->phys, b->phys + kPoolBlock, 0);
         DisposeHandle(b->h);
         b->h = 0;
         s->pool_shrunk++;
@@ -1890,19 +1939,28 @@ static long pool_md(long sel, unsigned long a0, unsigned long a1)
 /* Make the range (engine_start, with the block registered and the stubs
    in): feed the kernel's free list for the area's page tables, from
    system heap pages it keeps, and create the area. Without kernel patch
-   7, with virtual memory on, or with no room above RAM, there is none. */
+   7, or with no room above RAM, there is none. */
 static void sparse_start(State *s)
 {
-    if (s->vm || !s->kcb || !s->pool || !s->sparse_want_hi ||
-        sparse_info(0) < 0)
+    if (!s->kcb || !s->pool || !s->sparse_want_hi || sparse_info(0) < 0)
         return;
     unsigned long lo = s->sparse_want_lo, hi = s->sparse_want_hi;
     unsigned long pages = (hi - lo) / kPage;
     unsigned long need = pages / 1024 + pages / 2048 + 8;
+    /* While there is no range, sparse_short says why: 1 no system heap, 2
+       not locked, or the kernel's error from MPCreateArea. */
     Ptr feed = NewPtrSysClear((need + 1) * kPage);
+    s->sparse_short = 1;
     if (!feed)
         return;
     unsigned long a = ((unsigned long)feed + kPage - 1) & kPageMask;
+    /* The kernel keeps these pages by physical address: with virtual
+       memory on they stay locked for good. */
+    if (s->vm && LockMemory((void *)a, need * kPage)) {
+        DisposePtr(feed);
+        s->sparse_short = 2;
+        return;
+    }
     for (unsigned long i = 0; i < need; i++, a += kPage) {
         KRegs k = {0};
         k.r3 = kcb_physical((void *)a, kPage);
@@ -1914,8 +1972,12 @@ static void sparse_start(State *s)
     k.r5 = hi - lo;
     k.r7 = 0x600C; /* at the base, 4 KB pages */
     k.r8 = lo;
-    if (nk_call(kcCreateArea, &k))
+    long err = nk_call(kcCreateArea, &k);
+    if (err) {
+        s->sparse_short = (unsigned long)err;
         return;
+    }
+    s->sparse_short = 0;
     kcb_set2(kKcbOpSparse, lo, hi);
     s->sparse_lo = lo;
     s->sparse_hi = hi;
@@ -3784,11 +3846,26 @@ static unsigned long *emit_base(unsigned long *c, unsigned reg,
     return c;
 }
 
-/* Hook the three sites (engine_start, after size_hook and sparse_start;
-   virtual memory off, where the fragment is in the system heap). */
+/* Replace the word old at a site with insn. In file-mapped code (virtual
+   memory on) the store goes through the kernel, on a page part_hook
+   holds, as for the size hook. Returns 0 when it is done. */
+static int part_put(State *s, volatile unsigned long *site,
+                    unsigned long old, unsigned long insn)
+{
+    if (s->size_mapped)
+        return *site != old || kcb_patch((unsigned long)site, old, insn);
+    *site = insn;
+    flush_code(site, 4);
+    return 0;
+}
+
+/* Hook the three sites: from engine_start, after size_hook and
+   sparse_start, with the fragment in the system heap (virtual memory
+   off); from pm_hook_mapped, once the size hook's site is found in the
+   file-mapped code (virtual memory on; task level, it reads code in). */
 static void part_hook(State *s)
 {
-    if (!s->size_site || s->size_mapped || !s->sparse_area)
+    if (!s->size_site || !s->sparse_area || s->part)
         return;
     volatile unsigned long *p1 =
         (volatile unsigned long *)(s->size_site - kP1Delta);
@@ -3796,16 +3873,34 @@ static void part_hook(State *s)
         (volatile unsigned long *)(s->size_site - kP2Delta);
     volatile unsigned long *p3 =
         (volatile unsigned long *)(s->size_site - kP3Delta);
+    /* Held from here on, so that the pages keep the change; a page with
+       nothing behind it cannot be held. */
+    if (s->size_mapped) {
+        if (HoldMemory((void *)(p1 - 1), 12))
+            return;
+        if (HoldMemory((void *)(p2 - 1), 12)) {
+            UnholdMemory((void *)(p1 - 1), 12);
+            return;
+        }
+        if (HoldMemory((void *)(p3 - 1), 12)) {
+            UnholdMemory((void *)(p1 - 1), 12);
+            UnholdMemory((void *)(p2 - 1), 12);
+            return;
+        }
+    }
+    int ok = 0;
+    unsigned long *b = 0;
     if (p1[0] != 0x4800E109 || p1[1] != 0x60000000 || p1[-1] != 0x807F03E2 ||
         p2[0] != 0x48014B45 || p2[-1] != 0x807F0030 || p2[1] != 0x80410014 ||
         p3[0] != 0x418200B0 || p3[-1] != 0x2C000000 || p3[1] != 0x809B0000)
-        return;
-    unsigned long *b = (unsigned long *)NewPtrSysClear(kPtLongs * 4);
+        goto out;
+    b = (unsigned long *)NewPtrSysClear(kPtLongs * 4);
     if (!b || (unsigned long)b + kPtLongs * 4 >= 0x2000000UL) {
         if (b)
             DisposePtr((Ptr)b);
-        return;
+        goto out;
     }
+    hold(s, b, kPtLongs * 4, 1);
     unsigned long base = (unsigned long)b;
     b[kPtLo] = s->sparse_lo;
     b[kPtHi] = s->sparse_hi;
@@ -3882,13 +3977,27 @@ static void part_hook(State *s)
     *c++ = 0x4E800420;                 /* bctr */
     flush_code(b + kPtCode, (unsigned long)(c - (b + kPtCode)) * 4);
 
+    /* P2 and P3 first: they change nothing until P1 makes a partition. */
+    if (part_put(s, p2, 0x48014B45, 0x48000003 | (unsigned long)s2) ||
+        part_put(s, p3, 0x418200B0, 0x48000002 | (unsigned long)s3) ||
+        part_put(s, p1, 0x4800E109, 0x48000003 | (unsigned long)s1)) {
+        /* Kernel errors only (mapped code): put back what went in. The
+           block stays, a site may still branch to it. */
+        if (*p2 != 0x48014B45)
+            kcb_patch((unsigned long)p2, *p2, 0x48014B45);
+        if (*p3 != 0x418200B0)
+            kcb_patch((unsigned long)p3, *p3, 0x418200B0);
+        s->c.kernel_errors++;
+        goto out;
+    }
     s->part = b;
-    *p1 = 0x48000003 | (unsigned long)s1; /* bla */
-    *p2 = 0x48000003 | (unsigned long)s2;
-    *p3 = 0x48000002 | (unsigned long)s3; /* ba */
-    flush_code(p1, 4);
-    flush_code(p2, 4);
-    flush_code(p3, 4);
+    ok = 1;
+out:
+    if (s->size_mapped && !ok) {
+        UnholdMemory((void *)(p1 - 1), 12);
+        UnholdMemory((void *)(p2 - 1), 12);
+        UnholdMemory((void *)(p3 - 1), 12);
+    }
 }
 
 /* The engine is stopping: P1 goes back to the Process Manager's
@@ -3911,12 +4020,13 @@ static void part_unhook(State *s)
             (volatile unsigned long *)(s->size_site - kP2Delta);
         volatile unsigned long *p3 =
             (volatile unsigned long *)(s->size_site - kP3Delta);
-        *p1 = 0x4800E109;
-        *p2 = 0x48014B45;
-        *p3 = 0x418200B0;
-        flush_code(p1, 4);
-        flush_code(p2, 4);
-        flush_code(p3, 4);
+        if (!part_put(s, p1, *p1, 0x4800E109) &&
+            !part_put(s, p2, *p2, 0x48014B45) &&
+            !part_put(s, p3, *p3, 0x418200B0) && s->size_mapped) {
+            UnholdMemory((void *)(p1 - 1), 12);
+            UnholdMemory((void *)(p2 - 1), 12);
+            UnholdMemory((void *)(p3 - 1), 12);
+        }
     }
     s->part = 0; /* the block stays */
 }
@@ -4000,8 +4110,11 @@ static void pm_hook_mapped(State *s)
             zsite = (unsigned long)w;
             nz++;
         }
-    if (nz == 1)
+    if (nz == 1) {
         size_hook_mapped(s, zsite);
+        if (s->size_mapped)
+            part_hook(s);
+    }
     if (n != 1)
         return;
     /* The stub engine_start made for B, before the system heap was
@@ -4262,19 +4375,41 @@ static void kcb_start(State *s)
         ram = ram < kSpanHi - kMappedSpan ? ram + kMappedSpan : kSpanHi;
     if (ram > kSpanHi)
         ram = kSpanHi;
-    /* Sparse memory (virtual memory off): the range starts at the next
-       256 MB above logical RAM and stays in the segments application
-       VSIDs cover (0-5). The owner table covers it. */
+    /* Sparse memory: the longest run of kSparseUnit pieces above logical
+       RAM, in the segments application VSIDs cover (0-5), where the
+       kernel has no area. With virtual memory on the logical area goes on
+       past logical RAM (mapped code files), and Mac OS keeps an area of
+       one page at 0x5FFFE000, so every page is asked about. The owner
+       table covers the range. */
     s->sparse_want_lo = s->sparse_want_hi = 0;
-    if (!s->vm) {
-        unsigned long lo = (ram + 0x0FFFFFFFUL) & 0xF0000000UL;
-        unsigned long hi = lo + (unsigned long)kSparseUnits * kSparseUnit;
-        if (hi > 0x60000000UL)
-            hi = 0x60000000UL;
-        if (lo < hi) {
-            s->sparse_want_lo = lo;
-            s->sparse_want_hi = hi;
-            ram = hi;
+    if (lram > 0) {
+        unsigned long best = 0, best_n = 0, run = 0, run_n = 0;
+        for (unsigned long u = ((unsigned long)lram + kSparseUnit - 1) &
+                               ~(unsigned long)(kSparseUnit - 1);
+             u < 0x60000000UL; u += kSparseUnit) {
+            int clear = 1;
+            for (unsigned long a = u; clear && a < u + kSparseUnit;
+                 a += kPage) {
+                unsigned long area = 0;
+                if (!nk_area_from_address(a, &area) && area)
+                    clear = 0;
+            }
+            if (!clear) {
+                run_n = 0;
+                continue;
+            }
+            if (!run_n)
+                run = u;
+            if (++run_n > best_n && run_n <= kSparseUnits) {
+                best = run;
+                best_n = run_n;
+            }
+        }
+        if (best_n) {
+            s->sparse_want_lo = best;
+            s->sparse_want_hi = best + best_n * kSparseUnit;
+            if (ram < s->sparse_want_hi)
+                ram = s->sparse_want_hi;
         }
     }
     unsigned long entries = (ram + kPage - 1) >> 12;

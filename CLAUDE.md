@@ -304,8 +304,10 @@ Scribble (`scribble/`) makes the stores the engine has to judge. Type a
 letter and Return. Each store writes the value already there, so an
 allowed store changes nothing. The build makes it twice: Scribble asks
 for 512 KB and keeps an ordinary partition (the overflow tests need a
-small one); ScribbleBig asks for 1 MB and, with virtual memory off, is
-launched into a sparse partition, where `o`, `Z`, `n` and `E` were run.
+small one); ScribbleBig asks for 1 MB and is launched into a sparse
+partition, where `o`, `Z`, `n` and `E` were run. `a` prints the kernel's
+areas (a megabyte at a time, then a page at a time from 0x40000000 to
+0x64000000) and its free page count.
 
 | Key | Store | Expected in enforce mode |
 |---|---|---|
@@ -697,8 +699,9 @@ Findings:
 ### Sparse memory (kernel patch 7)
 
 A range of addresses whose pages get memory when they are first touched,
-with virtual memory off. It is the kernel half of "Memory on demand"
-(Roadmap); nothing in the engine uses it yet, and Scribble `J` tests it.
+with virtual memory off or on. It is the kernel half of "Memory on
+demand" (Roadmap), which says how the engine uses it; Scribble `J` tests
+the kernel alone (virtual memory off, without the engine's range).
 
 What the stock kernel has (read in `refs/powermac-rom/NanoKernel`,
 `NKAddressSpaces.s`, `NKPaging.s`, `NKInterrupts.s`):
@@ -1147,7 +1150,7 @@ offsets from the size hook's site Z, 0x0117E258 there):
 - `GetProcessInformation` reads +44 and +72 and asks `FreeMem` in the
   application's zone; it does not use the handle.
 
-Built (2026-11-15), virtual memory off:
+Built (2026-11-15), first with virtual memory off:
 - The range and the pool (`sparse_start`, `pool_grow`, `pool_shrink`,
   `sparse_ensure`, `sparse_balance`): 0x20000000 to 0x40000000 on the
   512 MB machine (the next 256 MB above logical RAM, 512 MB long, inside
@@ -1186,6 +1189,40 @@ and ran, with 10 pool blocks (10 MB) behind the three; all quit, three
 partitions given back, 13 of 14 pool blocks freed. Scribble `I` (a read
 of 64 KB into touched, untouched and locked sparse pages) passes; `O`,
 `Z` and `n` pass.
+
+With virtual memory on (2026-11-15): the same range, pool and partitions.
+What differs:
+- The range. The logical area is one kernel area from 0 past logical RAM
+  (0 to 0x3FF00000 with 990 MB of virtual memory: mapped code files are
+  inside it), and Mac OS keeps an area of one page at 0x5FFFE000.
+  `MPCreateArea` at an exact base returns −29298
+  (`kMPInsufficientResourcesErr`) for any overlap, so `kcb_start` asks
+  the kernel about every page (`MPGetAreaFromAddress`) and takes the
+  longest run of free 16 MB pieces below 0x60000000: 0x40000000 to
+  0x5F000000 here. Scribble `a` prints the kernel's areas. With virtual
+  memory off the search finds 0x20000000 to 0x40000000, as before.
+- The pool's blocks and the pages fed to the kernel's free list are
+  locked (`LockMemory`), so the Virtual Memory Manager leaves their page
+  frames alone. A block is not one physical range: a table after its
+  pages holds each one's physical address, and `pool_shrink` takes the
+  pages back one by one. Sparse memory is therefore never paged out.
+- The hooks. P1, P2 and P3 are in file-mapped code: `part_hook` runs from
+  `pm_hook_mapped` once the size hook's site is found, holds the three
+  pages and patches through the kernel (`kcb_patch`), as the size hook
+  does. A launch before that (the first switch after startup has to
+  happen first) gets an ordinary partition.
+- The Process Manager's two virtual-memory-only uses of the partition's
+  handle caused no failure; they were not traced.
+
+Tested (VM on, 512 MB RAM, 990 MB virtual memory): ScribbleBig in a
+partition at 0x40001000: `E` twice (20 MB), `Z`, `n` denied and the
+partition given back; Scribble `O` (23 of 32 blocks in sparse chunks) and
+`I` pass; Apple System Profiler and Sherlock 2 launched into partitions
+at 0x40001000 and 0x42001000 and quit, 112 of 113 pool blocks freed;
+Scribble `P` (600 MB of temporary memory written and read back through
+the backing store) with a sparse partition live, 0 wrong, and `E` again
+after it. VM off, the same build: `E` twice, `Z`, `n` denied, 54 of 55
+blocks freed.
 
 Left:
 - A touch with the pool empty still faults as in the stock kernel. The

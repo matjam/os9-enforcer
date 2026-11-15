@@ -1055,6 +1055,41 @@ int main(void)
             pool_report();
             continue;
         }
+        case 'a': {
+            /* The kernel's areas, a megabyte at a time: where each run of
+               addresses with the same area (or none) starts. */
+            unsigned long last = 1, n = 0;
+            for (unsigned long mb = 0; mb < 4096; mb++) {
+                unsigned long area = 0;
+                if (nk_area_from_address(mb << 20, &area))
+                    area = 0;
+                if (area != last) {
+                    printf("%08lX %08lX%s", mb << 20, area,
+                           ++n % 4 ? "  " : "\n");
+                    last = area;
+                }
+            }
+            /* And a page at a time between the logical area and the
+               next 1.5 GB, where the engine wants its sparse range. */
+            printf("\nby page, 40000000-64000000:\n");
+            last = 1;
+            n = 0;
+            for (unsigned long a = 0x40000000UL; a < 0x64000000UL;
+                 a += 4096) {
+                unsigned long area = 0;
+                if (nk_area_from_address(a, &area))
+                    area = 0;
+                if (area != last) {
+                    printf("%08lX %08lX%s", a, area, ++n % 4 ? "  " : "\n");
+                    last = area;
+                }
+            }
+            KRegs fk;
+            memset(&fk, 0, sizeof fk);
+            nk_call(kcGetFreePageCount, &fk);
+            printf("\nkernel free pages %lu\n", fk.r4);
+            continue;
+        }
         case 'A': {
             /* An Appearance scroll bar with a thumb, in a window of this
                application's, shown for 3 s. The first thumb drawn in a

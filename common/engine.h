@@ -235,7 +235,8 @@ enum {
 
 typedef struct {
     Handle h;            /* 0: free */
-    unsigned long phys;  /* of its first whole page */
+    unsigned long phys;  /* of its first whole page; 0 with virtual memory
+                            on: a table after the pages has each one's */
 } PoolBlock;
 
 /* Sparse partitions: an application that asks for 640 KB or more is
@@ -631,13 +632,17 @@ typedef struct {
        the default, and protection is on. A control panel sets want_mem;
        engine_poll applies it. */
     volatile unsigned long mem_on, want_mem;
-    /* Sparse memory (kernel patch 7; virtual memory off only): the range
-       above logical RAM whose pages get memory when touched, its area, and
-       which kSparseUnit pieces of it are in use (bit n: piece n).
-       sparse_want_lo and sparse_want_hi are the range the owner table was
-       sized for. The kernel's pool gets its pages from pool_blocks:
-       temporary memory made in system mode (so it outlives the program
-       running the engine), locked, one physical range each. */
+    /* Sparse memory (kernel patch 7): the range above logical RAM whose
+       pages get memory when touched, its area, and which kSparseUnit
+       pieces of it are in use (bit n: piece n). sparse_want_lo and
+       sparse_want_hi are the range the owner table was sized for (kcb_start
+       looks for addresses with no kernel area). The kernel's pool gets its
+       pages from pool_blocks: temporary memory made in system mode (so it
+       outlives the program running the engine), locked; one physical
+       range each with virtual memory off, and with it on locked in
+       physical memory (LockMemory) with a table of each page's physical
+       address. While there is no area, sparse_short says why
+       (sparse_start). */
     unsigned long sparse_want_lo, sparse_want_hi;
     unsigned long sparse_lo, sparse_hi, sparse_area, sparse_used;
     unsigned long sparse_chunks; /* chunks made in the range */

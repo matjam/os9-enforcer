@@ -213,8 +213,12 @@ def print_kernel(k):
                   "at %08X" % k["part"] if k["part"] else "not installed",
                   k["part_made"], k["part_freed"], k["md_calls"]))
     else:
-        print("  sparse memory: none (planned %08X-%08X)" % (
-            k["sparse_want_lo"], k["sparse_want_hi"]))
+        why = k["sparse_short"]
+        print("  sparse memory: none (planned %08X-%08X%s)" % (
+            k["sparse_want_lo"], k["sparse_want_hi"],
+            "; no system heap" if why == 1 else
+            "; not locked" if why == 2 else
+            "; MPCreateArea error %d" % (why - (1 << 32)) if why else ""))
     if k["yield"]:
         print("  preemption: %s, slice %d ms (kernel %d ticks), stub %08X; "
               "redirects %d (pending %08X); stub entries %d, WaitNextEvent "

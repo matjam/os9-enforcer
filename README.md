@@ -95,10 +95,10 @@ To stop an application that does not respond, use Force Quit
   preferred size, but no more than a quarter of the free memory (an eighth
   with virtual memory off). When its
   partition is full, a new block comes from temporary memory that the
-  application owns, as long as 2 MB of temporary memory stays free. With
-  virtual memory off, the patched kernel also gives memory page by page:
-  a larger application gets a 29 MB partition that takes memory only
-  where it is touched and gives it back when the application quits.
+  application owns, as long as 2 MB of temporary memory stays free. The
+  patched kernel also gives memory page by page: a larger application
+  gets a 29 MB partition that takes memory only where it is touched and
+  gives it back when the application quits.
 - **Stopping.** When the current application writes into another
   application, the write is denied and the application is stopped with
   `ExitToShell` in its own context. The target's memory is not changed.
@@ -170,11 +170,15 @@ Preemption:
   out, other than turning Enforcer off.
 
 Memory sizes:
-- With virtual memory off, an application that asks for 640 KB or more
-  gets a 29 MB partition that uses memory only where it is touched (up to
-  16 such applications, on a Mac with room for it above its RAM: 512 MB
-  of addresses below 1.5 GB). Others, and all applications with virtual
-  memory on, get up to four times their size as described above.
+- An application that asks for 640 KB or more gets a 29 MB partition
+  that uses memory only where it is touched (up to 16 such applications,
+  on a Mac with room for it above its memory: up to 512 MB of addresses
+  below 1.5 GB). Others get up to four times their size as described
+  above. With virtual memory on, the first launch after startup can come
+  before Enforcer has found the Process Manager's code, and then gets
+  four times its size too.
+- With virtual memory on, the memory behind such a partition stays in
+  RAM: Mac OS does not page it out to disk.
 - Past the partition, growing an existing block (`SetHandleSize`,
   `SetPtrSize`) still fails: a block cannot move out of its heap. Only
   new blocks come from outside it.
