@@ -617,7 +617,7 @@ int main(void)
                "in a native/68k callback, H 20 s in a 68k callback, G "
                "temporary memory in system mode, A draw a scroll bar, O 8 MB in this small partition, J sparse "
                "memory, I read into sparse memory, E grow a block to 20 "
-               "MB, q "
+               "MB, w write and read a 4 MB file, a the kernel's areas, q "
                "quit; then Return\n");
         int ch = getchar();
         while (ch != '\n' && getchar() != '\n')
@@ -1053,6 +1053,63 @@ int main(void)
             if (sys)
                 DisposeHandle(sys);
             pool_report();
+            continue;
+        }
+        case 'w': {
+            /* Write a file from this application's heap and read it back:
+               64 KB, then 4 MB, each from a block allocated just before
+               (in a sparse partition: pages with no memory yet for the
+               read). In ScribbleBig it tests disk I/O straight to and
+               from sparse memory; the installer writes the 4 MB Mac OS
+               ROM file this way. */
+            static const unsigned char fname[] = "\pScribble write test";
+            static const long sizes[] = {0x10000, 0x400000};
+            FSSpec spec;
+            int bad = 0;
+            /* At the top of the startup disk: volume -1, directory 2. */
+            FSMakeFSSpec(-1, 2, fname, &spec);
+            for (int k = 0; k < 2; k++) {
+                long n = sizes[k];
+                Ptr out = NewPtr(n), in = NewPtr(n);
+                printf("%ld KB: buffers %08lX %08lX; ", n >> 10,
+                       (unsigned long)out, (unsigned long)in);
+                if (!out || !in) {
+                    printf("no memory\n");
+                    bad = 1;
+                    break;
+                }
+                for (long i = 0; i < n; i += 4)
+                    *(unsigned long *)(out + i) = 0x5C0000 ^ (unsigned long)i;
+                short ref = 0;
+                FSpDelete(&spec);
+                OSErr e1 = FSpCreate(&spec, 'ttxt', 'TEXT', smSystemScript);
+                OSErr e2 = e1 ? e1 : FSpOpenDF(&spec, fsRdWrPerm, &ref);
+                long len = n;
+                printf("writing... ");
+                OSErr e3 = e2 ? e2 : FSWrite(ref, &len, out);
+                long wrote = len;
+                if (!e2)
+                    SetFPos(ref, fsFromStart, 0);
+                len = n;
+                printf("reading... ");
+                OSErr e4 = e2 ? e2 : FSRead(ref, &len, in);
+                if (!e2)
+                    FSClose(ref);
+                FSpDelete(&spec);
+                long wrong = 0;
+                for (long i = 0; i < n && !e4; i += 4)
+                    if (*(unsigned long *)(in + i) !=
+                        (0x5C0000 ^ (unsigned long)i))
+                        wrong++;
+                printf("create %d open %d write %d (%ld) read %d (%ld), "
+                       "%ld words wrong\n", e1, e2, e3, wrote, e4, len,
+                       wrong);
+                if (e1 || e2 || e3 || e4 || wrong || wrote != n || len != n)
+                    bad = 1;
+                DisposePtr(out);
+                DisposePtr(in);
+            }
+            printf("%s\n", bad ? "FAIL" : "PASS");
             continue;
         }
         case 'a': {

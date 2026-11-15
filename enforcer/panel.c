@@ -34,6 +34,7 @@
 
 #include "engine.h"
 #include "enforcer.h"
+#include "version.h" /* ENFORCER_VERSION, from tools/make-vers.py */
 
 enum { kMenuApple = 128, kMenuFile, kMenuEdit };
 enum { kFileClose = 1, kFileQuit = 3 };
@@ -407,7 +408,9 @@ int main(void)
     setup_menus();
 
     Str255 s;
-    g_win = NewCWindow(NULL, &kWindowRect, pstr(s, "Enforcer"), true,
+    /* The title carries the version, for bug reports. */
+    g_win = NewCWindow(NULL, &kWindowRect,
+                       pstr(s, "Enforcer " ENFORCER_VERSION), true,
                        noGrowDocProc, (WindowPtr)-1, true, 0);
     SetPort(g_win);
     g_protect = NewControl(g_win, &kProtectRect,

@@ -61,7 +61,7 @@ KCB = ["magic", "version", "mode", "current", "entries", "denied_page",
        "deny_68k_page", "deny_68k_seq", "tables", "spaces", "rebuilt",
        "vswitch", "lazy", "lazy_pc", "slice", "next", "stub", "yield_pc",
        "preempts", "zone"]
-KCB_RING, KCB_RING_N, KCB_EVENTS = 0x300, 488, 12
+KCB_RING, KCB_RING_N, KCB_EVENTS = 0x300, 480, 12
 EVF = [(1, "68k"), (2, "task"), (4, "offense"), (8, "denied"),
        (16, "skipped")]
 STOPPER = ["magic", "old_vector", "zone"] + ["stops_" + s for s in

@@ -57,8 +57,10 @@ jobs:
           path: ~/.local/opt/retro68
           key: ${{ steps.cache.outputs.cache-primary-key }}
 
+      # The checkout has no tags, so the build is told its version: the
+      # release's, without a commit suffix (tools/make-vers.py).
       - name: Build the programs
-        run: ./build.sh
+        run: ENFORCER_VERSION=$(cat version.txt) ./build.sh
 
       - name: Collect Enforcer
         run: tools/make-dist.sh

@@ -5,8 +5,10 @@ project(EnforcerInstaller C CXX)
 # Build with the Retro68 PowerPC toolchain: ./build.sh installer
 # Produces "Enforcer Installer.bin". kpatch.h is written by
 # tools/make-kpatch.py; the icons are the control panel's.
+include(${CMAKE_CURRENT_SOURCE_DIR}/../common/version.cmake)
 add_application(EnforcerInstaller installer.c rompatch.c lzss.c installer.r
-                ../enforcer/icon-panel.r TYPE APPL CREATOR EnfI)
+                ../enforcer/icon-panel.r ${VERSION_R} TYPE APPL CREATOR EnfI)
+version_use(EnforcerInstaller)
 target_compile_options(EnforcerInstaller PRIVATE -O2 -Wall)
 
 # Repack with the name users see, and set the hasBundle and hasCustomIcon

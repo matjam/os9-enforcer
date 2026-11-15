@@ -27,12 +27,14 @@
 
 enum {
     kKcbMagic = 'ENFK',
-    kKcbVersion = 5,          /* 4: no application VSIDs;
+    kKcbVersion = 6,          /* 5: no stacks, 488 events;
+                                 4: no application VSIDs;
                                  3: writable by Mac OS, one denied page;
                                  2: no applzone; 1: 64 table pages and
                                  496 events */
     kKcbSize = 0x4000,
-    kKcbRing = 488,
+    kKcbRing = 480,
+    kKcbStacks = 32,          /* stack ranges, one per application slot */
     kKcbTablePages = 128,     /* 128 pages of 4096 entries: 2 GB */
     kKcbFrameLen = 0x70,
     kMPEnforcer = 109
@@ -85,9 +87,14 @@ enum {
                               returns how many it took */
     kKcbOpSparseInfo = 16, /* r4 0: pages in the pool; 1: pages given; 2:
                               faults with the pool empty */
-    kKcbOpPoolTake = 17    /* r4, r5 a physical range: its pages out of the
+    kKcbOpPoolTake = 17,   /* r4, r5 a physical range: its pages out of the
                               pool, or with r6 not 0 only counted; returns
                               how many */
+    kKcbOpSparseCount = 18, /* r4 an address, r5 pages: how many of them
+                               have memory. paramErr from a kernel before
+                               it. */
+    kKcbOpStack = 19        /* r4 a slot, r5 and r6 the start and end of
+                               that application's stack (0, 0: none) */
 };
 
 /* KEvent.info, low byte. */
@@ -156,6 +163,13 @@ typedef struct {
     volatile unsigned char yielded[128];
     unsigned long pages[kKcbTablePages]; /* physical */
     KEvent ring[kKcbRing];              /* event n at (n - 1) % kKcbRing */
+    /* Each application's stack, start and end (kKcbOpStack). In enforce
+       mode a store by another application's code into one is allowed and
+       recorded as an offense: Mac OS calls one application's routine for
+       another (a window's or menu's code, a callback) in the routine's
+       own context, and the routine puts its results on the caller's
+       stack. */
+    volatile unsigned long stacks[2 * kKcbStacks];
 } KernelCB;
 
 _Static_assert(offsetof(KernelCB, frame) == 0x1C, "CB_FRAME");
@@ -173,6 +187,7 @@ _Static_assert(offsetof(KernelCB, zone) == 0x78, "CB_ZONE");
 _Static_assert(offsetof(KernelCB, yielded) == 0x80, "CB_YIELDED");
 _Static_assert(offsetof(KernelCB, pages) == 0x100, "CB_PAGES");
 _Static_assert(offsetof(KernelCB, ring) == 0x300, "CB_RING");
+_Static_assert(offsetof(KernelCB, stacks) == 0x3F00, "CB_STACKS");
 _Static_assert(sizeof(KEvent) == 32, "event size");
 _Static_assert(sizeof(KernelCB) == kKcbSize, "block size");
 

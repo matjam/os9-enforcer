@@ -28,6 +28,7 @@
  * the open file until the restart.
  */
 
+#include "version.h" /* ENFORCER_VERSION, from tools/make-vers.py */
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -752,6 +753,12 @@ int main(void)
     g_dialog = GetNewDialog(kDialog, NULL, (WindowPtr)-1);
     if (!g_dialog)
         return 1;
+    {
+        /* The title carries the version, for bug reports. */
+        Str255 title;
+        SetWTitle((WindowPtr)g_dialog,
+                  pstr(title, "Enforcer Installer " ENFORCER_VERSION));
+    }
     SetPort((GrafPtr)g_dialog);
     SetDialogDefaultItem(g_dialog, kInstall);
     SetDialogCancelItem(g_dialog, kQuit);

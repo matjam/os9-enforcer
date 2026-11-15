@@ -231,9 +231,11 @@ trust, that application does something Enforcer does not allow.
 - **PowerPC and 68k applications are both protected.** Only PowerPC
   code is preempted.
 - **Applications that share memory by passing pointers** to each other
-  (and then write through them) are stopped in Enforce mode. Apple
-  events, the Clipboard, files and shared libraries are not affected:
-  the system does the copying.
+  (and then write through them) are stopped in Enforce mode, unless the
+  pointer is into the other application's stack, which is where the
+  results of calls between applications go. Apple events, the Clipboard,
+  files and shared libraries are not affected: the system does the
+  copying.
 - **A write by another application's code into the current application**
   is allowed and logged, because callbacks work that way.
 - **Applications that take all the memory they can find at launch** get
@@ -265,6 +267,11 @@ Crash containment:
 - An overrun inside an application's own memory is not caught. It can
   only damage that application.
 - Writes into the system heap are logged, not blocked.
+- Writes into another application's stack are logged, not blocked. Mac
+  OS itself has one application's code write there: when it calls a
+  routine of one application on behalf of another (Sherlock 2's window
+  does this when you click it from another application), the result goes
+  on the caller's stack.
 - Writes by device DMA do not go through the processor's memory
   protection and are not seen.
 - For a short time around an application's launch, quit, or the first
@@ -289,8 +296,9 @@ Preemption:
 Memory on demand:
 - With virtual memory on, the RAM behind a 29 MB partition is not paged
   out to disk.
-- About This Computer, `FreeMem` and `MaxMem` report the partition's
-  size, not the RAM in use behind it.
+- About This Computer shows the RAM a 29 MB partition has taken, not
+  29 MB. The application itself still sees the whole partition
+  (`FreeMem`, `MaxMem`).
 - Memory an application frees inside its partition goes back to the Mac
   only when the application quits.
 - If an application touches new memory faster than Enforcer can supply
@@ -306,65 +314,16 @@ Temporary memory:
 
 `CLAUDE.md` has the full list of known holes and how each part works.
 
-## Building
+## Contributing
 
-Enforcer builds with Retro68's PowerPC toolchain. The build needs no
-Apple files.
+Reports from real Macs are the most useful contribution: see
+[CONTRIBUTING.md](CONTRIBUTING.md) for what to report and how to send a
+fix. In a report, give the version: it is in the title bar of the
+Enforcer control panel and of Enforcer Installer, and in the Finder's Get
+Info window for each of Enforcer's files.
 
-To install the packages the toolchain needs on macOS, run:
-
-```bash
-brew install boost cmake ninja gmp mpfr libmpc bison texinfo
-```
-
-On Debian or Ubuntu, run:
-
-```bash
-sudo apt-get install cmake ninja-build g++ libgmp-dev libmpfr-dev libmpc-dev libboost-all-dev bison flex texinfo ruby python3
-```
-
-To build the toolchain, run this once. It installs Retro68 in
-`~/.local/opt/retro68`:
-
-```bash
-toolchain/build.sh
-```
-
-To use a Retro68 toolchain you already have, set `RETRO68` to its folder
-(the one that holds `bin/`).
-
-To build the programs, run:
-
-```bash
-./build.sh
-```
-
-To collect Enforcer Installer, the Enforcer Extension and the Enforcer
-control panel in `dist/`, run:
-
-```bash
-tools/make-dist.sh
-```
-
-`dist/` holds each program as a MacBinary `.bin` file, and all three on
-the HFS disk image `Enforcer.dsk`, for an emulator.
-
-To try Enforcer by hand in QEMU, set up the test machine as `CLAUDE.md`
-describes (it needs a Mac OS 9.2.2 install CD), then run:
-
-```bash
-./try.sh
-```
-
-To try it with virtual memory on, run:
-
-```bash
-./try.sh --vm
-```
-
-GitHub Actions builds every push and keeps `dist/` as the artifact
-"Enforcer". `CLAUDE.md` describes the source layout, the test machine,
-the tests and the kernel work.
+To build Enforcer from source and run it in QEMU, see
+[DEVELOPMENT.md](DEVELOPMENT.md).
 
 ## License
 

@@ -74,6 +74,9 @@ static InstallFn g_sys_install;
    chains to. */
 static UniversalProcPtr g_exit_rd, g_exit_old;
 
+static OSErr own_info(const ProcessSerialNumber *psn, ProcessInfoRec *info);
+static void stack_set(State *s, int d, unsigned long lo, unsigned long hi);
+
 static inline volatile void *lowmem(unsigned long addr)
 {
     __asm__("" : "+r"(addr));
@@ -455,6 +458,7 @@ static void drop_domain(State *s, int i, int quit)
     mark(s, d->lo, d->hi, kOwnerNone);
     own_first_page(s, i, 0);
     disown_code(s, i);
+    stack_set(s, i, 0, 0);
     d->quit = quit;
     d->live = 0;
     s->c.removed++;
@@ -519,6 +523,42 @@ static unsigned long domain_pages(State *s, int i)
             n += (c->hi - c->lo) >> 12;
     }
     return n;
+}
+
+/* Tell the kernel where the current application's stack is (KernelCB.
+   stacks): from ApplLimit to CurStackBase, read while the application is
+   current, at each tick, since an application can move ApplLimit. The
+   range stays while the application waits; drop_domain takes it out. */
+static unsigned long g_stack[kMaxDomains][2];
+
+static void stack_set(State *s, int d, unsigned long lo, unsigned long hi)
+{
+    if (!s->kcb || (g_stack[d][0] == lo && g_stack[d][1] == hi))
+        return;
+    KRegs k = {0};
+    k.r3 = kKcbOpStack;
+    k.r4 = (unsigned long)d;
+    k.r5 = lo;
+    k.r6 = hi;
+    if (nk_call(kMPEnforcer, &k) == 0) {
+        g_stack[d][0] = lo;
+        g_stack[d][1] = hi;
+    }
+}
+
+static void stack_follow(State *s)
+{
+    int d = s->cur;
+    if (d < 0 || d == s->sys_dom)
+        return;
+    Domain *dom = &s->domains[d];
+    if (!dom->live || dom->dying || current_zone() != dom->location)
+        return;
+    unsigned long lo = lowmem_long(0x130); /* ApplLimit */
+    unsigned long hi = lowmem_long(0x908); /* CurStackBase */
+    if (lo >= hi || lo < dom->location || hi > dom->location + dom->size)
+        return;
+    stack_set(s, d, lo, hi);
 }
 
 /* On a process switch, protect the previous application's domain. With
@@ -1400,6 +1440,7 @@ static void timer_proc(TMTask *tm)
             sweep(s);
         pool_keep(s);
         check_switch(s);
+        stack_follow(s);
         if (s->sys_dom >= 0)
             s->sys->tick++;
         drain_all(s);
@@ -1513,7 +1554,7 @@ static void refresh_domains(State *s)
         info.processInfoLength = sizeof info;
         info.processName = name;
         name[0] = 0;
-        int ok = GetProcessInformation(&psn, &info) == noErr;
+        int ok = own_info(&psn, &info) == noErr;
         unsigned long loc = (unsigned long)info.processLocation;
 
         int found = -1, free_slot = -1, quitting = 0;
@@ -1576,7 +1617,7 @@ static int add_current(State *s)
     info.processInfoLength = sizeof info;
     info.processName = name;
     name[0] = 0;
-    if (GetProcessInformation(&psn, &info))
+    if (own_info(&psn, &info))
         return -1;
     int free_slot = -1;
     for (int i = 0; i < kMaxDomains; i++) {
@@ -1633,6 +1674,40 @@ static void put32(unsigned char *p, unsigned long v)
 static long sparse_info(unsigned long which)
 {
     return kcb_set(kKcbOpSparseInfo, which);
+}
+
+/* The pages with memory in [lo, hi) of the sparse range, for
+   GetProcessInformation (pool_info), or -1 from a kernel without the
+   count. The kernel walks the range, so the answer for each partition
+   (slot 0 to kMaxParts - 1) and each chunk (after those) is kept for a
+   second: the Finder asks about every process again and again while
+   About This Computer is open. */
+static unsigned long g_backed[kMaxParts + kMaxChunks];
+static unsigned long g_backed_at[kMaxParts + kMaxChunks]; /* ticks; 0: none */
+
+static long sparse_backed(int slot, unsigned long lo, unsigned long hi)
+{
+    unsigned long now = lowmem_long(0x16A) | 1; /* Ticks */
+    if (!g_backed_at[slot] || now - g_backed_at[slot] >= 60) {
+        long n = kcb_set2(kKcbOpSparseCount, lo, (hi - lo) / kPage);
+        if (n < 0)
+            return -1;
+        g_backed[slot] = (unsigned long)n;
+        g_backed_at[slot] = now;
+    }
+    return (long)g_backed[slot];
+}
+
+/* The engine's own GetProcessInformation calls want the partition as the
+   Process Manager has it: pool_info leaves the record alone. */
+static int g_own_info;
+
+static OSErr own_info(const ProcessSerialNumber *psn, ProcessInfoRec *info)
+{
+    g_own_info++;
+    OSErr err = GetProcessInformation((ProcessSerialNumber *)psn, info);
+    g_own_info--;
+    return err;
 }
 
 /* Temporary memory that outlives this program: made in system mode, the
@@ -1858,9 +1933,13 @@ static int chunk_is_sparse(const Chunk *c)
 
 /* _MemoryDispatch for an address in the sparse range (engine.h), from its
    stub: sel 0 HoldMemory, 1 UnholdMemory, 2 LockMemory, 3
-   LockMemoryContiguous, 4 UnlockMemory (a0 the address, a1 the length),
-   5 GetPhysical (a0 the table: a logical address and length, then
-   physical address and length pairs; a1 how many pairs it holds).
+   LockMemoryContiguous, 4 UnlockMemory, 10 LockMemoryForOutput (a0 the
+   address, a1 the length), 5 GetPhysical (a0 the table: a logical address
+   and length, then physical address and length pairs; a1 how many pairs
+   it holds). With virtual memory on, the disk driver locks a write's
+   buffer with LockMemoryForOutput: without it here, FSWrite from sparse
+   memory returned ioErr (Scribble w), and the installer, in a sparse
+   partition, stopped while writing the Mac OS ROM file.
    Returns the error in the low word and, for GetPhysical, the pairs
    filled in the high word. Holding and locking give the pages memory;
    nothing takes it away before the chunk or partition is given back. */
@@ -2253,14 +2332,45 @@ static long pool_over(long trap, long size, int ptr)
 }
 
 /* GetProcessInformation has filled the record at info (engine.h): add the
-   process's chunks to its size and their free bytes to its free memory. */
+   process's chunks to its size and their free bytes to its free memory.
+
+   When another process asks (the Finder, for About This Computer), a
+   sparse partition and a sparse chunk count as the memory behind them:
+   the size is the pages the kernel has given, and the free memory is
+   what of those the heap does not use. A process that asks about itself
+   gets the partition as it is, so that one which sizes its work from the
+   record does not see a few hundred KB. */
 static void pool_info(unsigned long info, long psn)
 {
     State *s = g_state;
     ProcessInfoRec *r = (ProcessInfoRec *)info;
     (void)psn; /* can be a constant; the record holds the number */
-    if (!s || !s->running || !s->pool || !r || r->processInfoLength < 40)
+    if (!s || !s->running || !s->pool || !r || r->processInfoLength < 40 ||
+        g_own_info)
         return;
+    unsigned long loc = (unsigned long)r->processLocation;
+    int other = current_zone() != loc;
+    for (int i = 0; other && i < kMaxParts; i++) {
+        SparsePart *p = &s->parts[i];
+        if (!p->units || loc != p->lo + kPage)
+            continue;
+        long n = sparse_backed(i, p->lo, p->lo + p->units * kSparseUnit);
+        if (n < 0)
+            break;
+        /* In use: the heap up to its end, less its free bytes. (The
+           record's free memory counts only the zone's, and the zone ends
+           far below the partition's top, so size less free memory would
+           call the untouched rest used.) The stack is not counted. */
+        unsigned long backed = (unsigned long)n * kPage;
+        THz z = (THz)loc;
+        unsigned long end = (unsigned long)z->bkLim;
+        unsigned long heap = end > loc ? end - loc : 0;
+        unsigned long zfree = (unsigned long)z->zcbFree;
+        unsigned long used = heap > zfree ? heap - zfree : 0;
+        r->processSize = backed;
+        r->processFreeMem = backed > used ? backed - used : 0;
+        break;
+    }
     for (int d = 0; d < kMaxDomains; d++) {
         Domain *dom = &s->domains[d];
         if (!dom->live || dom->dying || d == s->sys_dom ||
@@ -2271,8 +2381,18 @@ static void pool_info(unsigned long info, long psn)
             Chunk *c = &s->chunks[i];
             if (!c->live || c->domain != d)
                 continue;
-            size += c->hi - c->lo;
-            free += (unsigned long)((THz)c->zone)->zcbFree;
+            unsigned long csize = c->hi - c->lo;
+            unsigned long cfree = (unsigned long)((THz)c->zone)->zcbFree;
+            long n = other && chunk_is_sparse(c)
+                         ? sparse_backed(kMaxParts + i, c->lo, c->hi) : -1;
+            if (n >= 0) {
+                unsigned long backed = (unsigned long)n * kPage;
+                unsigned long used = csize > cfree ? csize - cfree : 0;
+                csize = backed;
+                cfree = backed > used ? backed - used : 0;
+            }
+            size += csize;
+            free += cfree;
         }
         r->processSize += size;
         r->processFreeMem += free;
@@ -2706,7 +2826,7 @@ static void find_code(State *s, int i)
     memset(&info, 0, sizeof info);
     info.processInfoLength = sizeof info;
     info.processAppSpec = &spec;
-    if (GetProcessInformation(&d->psn, &info))
+    if (own_info(&d->psn, &info))
         return;
     unsigned long off, len;
     unsigned char name[64];
@@ -3086,35 +3206,37 @@ static PoolStubs *pool_install(void)
     /* _MemoryDispatch (D0 the selector, A0 and A1 its arguments; D0 the
        result, A0 the pairs GetPhysical filled):
          00 tst.w   enabled
-         06 beq.s   4E
-         08 cmpi.w  #5,d0            ; selectors 0-5 only
-         0C bhi.s   4E
-         0E move.l  d1,-(sp)
-         10 move.l  a0,d1            ; the address,
-         12 cmpi.w  #5,d0
-         16 bne.s   1A
-         18 move.l  (a0),d1          ; or GetPhysical's table's
-         1A cmp.l   sparse_lo,d1
-         20 bcs.s   4C
-         22 cmp.l   sparse_hi,d1
-         28 bcc.s   4C
-         2A move.l  a1,-(sp)         ; pool_md(selector, a0, a1)
-         2C move.l  a0,-(sp)
-         2E ext.l   d0
-         30 move.l  d0,-(sp)
-         32 movea.l #rd_md,a0
-         38 jsr     (a0)
-         3A lea     12(sp),sp
-         3E move.l  d0,d1
-         40 swap    d1
-         42 movea.w d1,a0            ; the pairs
-         44 ext.l   d0               ; the error
-         46 move.l  (sp)+,d1
-         48 tst.w   d0
-         4A rts
+         06 beq.s   54
+         08 cmpi.w  #10,d0           ; LockMemoryForOutput, which the disk
+         0C beq.s   14               ; driver calls for a write with
+         0E cmpi.w  #5,d0            ; virtual memory on; else selectors
+         12 bhi.s   54               ; 0-5 only
+         14 move.l  d1,-(sp)
+         16 move.l  a0,d1            ; the address,
+         18 cmpi.w  #5,d0
+         1C bne.s   20
+         1E move.l  (a0),d1          ; or GetPhysical's table's
+         20 cmp.l   sparse_lo,d1
+         26 bcs.s   52
+         28 cmp.l   sparse_hi,d1
+         2E bcc.s   52
+         30 move.l  a1,-(sp)         ; pool_md(selector, a0, a1)
+         32 move.l  a0,-(sp)
+         34 ext.l   d0
+         36 move.l  d0,-(sp)
+         38 movea.l #rd_md,a0
+         3E jsr     (a0)
+         40 lea     12(sp),sp
+         44 move.l  d0,d1
+         46 swap    d1
+         48 movea.w d1,a0            ; the pairs
+         4A ext.l   d0               ; the error
          4C move.l  (sp)+,d1
-         4E move.l  md_old,-(sp)
-         54 rts */
+         4E tst.w   d0
+         50 rts
+         52 move.l  (sp)+,d1
+         54 move.l  md_old,-(sp)
+         5A rts */
     UniversalProcPtr um = NewRoutineDescriptor((ProcPtr)pool_md, 0xFF1,
                                                kPowerPCISA);
     if (um) {
@@ -3130,7 +3252,8 @@ static PoolStubs *pool_install(void)
         unsigned long rm = (unsigned long)&p->rd_md;
         unsigned long mo = (unsigned long)&p->md_old;
         const unsigned short md[kPoolMd] = {
-            0x4A79, HI16(en), LO16(en), 0x6746,
+            0x4A79, HI16(en), LO16(en), 0x674C,
+            0x0C40, 0x000A, 0x6706,
             0x0C40, 0x0005, 0x6240,
             0x2F01, 0x2208, 0x0C40, 0x0005, 0x6602, 0x2210,
             0xB2B9, HI16(lo), LO16(lo), 0x652A,

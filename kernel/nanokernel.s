@@ -89,8 +89,8 @@ kernel:
 # registers with MP call 109, by its physical address. Keep common/kcb.h in
 # step.
         .set    CB_MAGIC, 0x000                 # 'ENFK'
-        .set    CB_VERSION, 0x004               # 5
-        .set    VERSION, 5                      # the layout below
+        .set    CB_VERSION, 0x004               # 6
+        .set    VERSION, 6                      # the layout below
         .set    CB_MODE, 0x008                  # MODE_*
         .set    CB_CURRENT, 0x00C               # the current application's owner
         .set    CB_ENTRIES, 0x010               # pages the owner table covers
@@ -132,7 +132,11 @@ kernel:
         .set    CB_PAGES, 0x100                 # owner table pages, physical
                                                 # (128 of them: 2 GB)
         .set    CB_RING, 0x300                  # RING_N events of 32 bytes
-        .set    RING_N, 488                     # to the block's end
+        .set    RING_N, 480
+        .set    CB_STACKS, 0x3F00               # STACK_N ranges (start, end)
+        .set    STACK_N, 32                     # to the block's end: each
+                                                # application's stack
+                                                # (OP_STACK)
         .set    FRAME_LEN, 0x70                 # as common/hook.h kHookFrameLen
         .set    EV_SEQ, 0x00
         .set    EV_PC, 0x04
@@ -172,6 +176,8 @@ kernel:
         .set    OP_SPARSE_FREE, 15
         .set    OP_SPARSE_INFO, 16
         .set    OP_POOL_TAKE, 17
+        .set    OP_SPARSE_COUNT, 18
+        .set    OP_STACK, 19
         .set    VSID_APP, 0xFFF00               # application VSIDs: segment
                                                 # << 20 | VSID_APP + owner
         .set    CTX_MSR, 0x0A4                  # ContextBlock: MSR,
@@ -498,6 +504,21 @@ check:  lwz     9, CB_APPLZONE(31)              # who is current: the owner
         lwz     9, CB_CURRENT(31)
         cmpw    9, 18
         beq     record                          # into the current application
+        addi    17, 31, CB_STACKS               # into an application's
+        li      8, STACK_N                      # stack: allowed and marked.
+stk_look:                                       # Mac OS calls a routine of
+        lwz     9, 0(17)                        # one application for another
+        cmplw   27, 9                           # (a window's or a menu's
+        blt     stk_next                        # code, a callback) in the
+        lwz     9, 4(17)                        # routine's own context, and
+        cmplw   27, 9                           # its results go to the
+        blt     record                          # caller's stack
+stk_next:
+        addi    17, 17, 8
+        addi    8, 8, -1
+        cmpwi   8, 0
+        bne     stk_look
+        lwz     9, CB_CURRENT(31)
         andi.   17, 16, EVF_TASK
         bne     8f                              # another task
         cmpw    9, 19
@@ -1241,6 +1262,10 @@ enf_op:
         beq     eo_sparse_info
         cmpwi   3, OP_POOL_TAKE
         beq     eo_pool_take
+        cmpwi   3, OP_SPARSE_COUNT
+        beq     eo_sparse_count
+        cmpwi   3, OP_STACK
+        beq     eo_stack
 eo_bad: li      3, -50
         b       MPReturn
 eo_ok:  li      3, 0
@@ -1254,6 +1279,21 @@ eo_mode:
 
 eo_current:
         stw     4, CB_CURRENT(31)
+        b       eo_ok
+
+# r4 a slot (0 to STACK_N - 1), r5 and r6 the start and end of that
+# application's stack, or 0 and 0 for none.
+eo_stack:
+        cmplwi  4, STACK_N
+        bge     eo_bad
+        slwi    9, 4, 3
+        addi    9, 9, CB_STACKS
+        add     9, 9, 31
+        lwz     17, CTX_R6(6)
+        li      8, 0
+        stw     8, 4(9)                         # no range while it changes
+        stw     5, 0(9)
+        stw     17, 4(9)
         b       eo_ok
 
 eo_owners:
@@ -1520,8 +1560,14 @@ eo_sparse_info:                                 # r4: 0 pages in the pool, 1
 # r4 an address, r5 a number of pages: take the pages in the sparse range
 # back into the pool (their PTEs dropped, their PLEs empty again). Returns
 # how many it took.
+# OP_SPARSE_COUNT, with the same arguments, only counts the pages that have
+# memory.
+eo_sparse_count:
+        li      26, 1
+        b       1f
 eo_sparse_free:
-        mr      22, 4
+        li      26, 0
+1:      mr      22, 4
         mr      23, 5
         li      24, 0
         addi    8, 1, KDP_HTABLock
@@ -1554,7 +1600,14 @@ eo_sparse_free:
         mr      8, 22
         bl      SpaceGetPagePLE                 # uses r16-r18
         beq     6f
-        lwz     16, 0(30)
+        cmpwi   26, 0
+        beq     8f
+        lwz     16, 0(30)                       # counting: a page, in the
+        andi.   16, 16, PLE_HasPage | PLE_InHTAB # PLE or in a PTE
+        beq     6f
+        addi    24, 24, 1
+        b       6f
+8:      lwz     16, 0(30)
         andi.   16, 16, PLE_InHTAB
         beq     3f
         bl      GetPTEFromPLE

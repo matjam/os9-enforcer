@@ -8,15 +8,18 @@ project(Enforcer C CXX)
 # panel, file type 'APPC', for the Control Panels folder).
 set(COMMON ${CMAKE_CURRENT_SOURCE_DIR}/../common)
 include(${COMMON}/hooks.cmake)
+include(${COMMON}/version.cmake)
 
 # icon-extension.r and icon-panel.r are written by tools/make-icons.py.
 add_application(EnforcerExt extension.c ${COMMON}/engine.c extension.r
-                icon-extension.r TYPE appe CREATOR EnfX)
+                icon-extension.r ${VERSION_R} TYPE appe CREATOR EnfX)
 hooks_embed(EnforcerExt)
+version_use(EnforcerExt)
 target_compile_options(EnforcerExt PRIVATE -O2 -Wall)
 
-add_application(EnforcerPanel panel.c panel.r icon-panel.r
+add_application(EnforcerPanel panel.c panel.r icon-panel.r ${VERSION_R}
                 TYPE APPC CREATOR Enfr)
+version_use(EnforcerPanel)
 target_include_directories(EnforcerPanel PRIVATE ${COMMON})
 target_compile_options(EnforcerPanel PRIVATE -O2 -Wall)
 

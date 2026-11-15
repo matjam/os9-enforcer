@@ -34,6 +34,14 @@ release-please makes the releases (`.github/workflows/release.yml`,
 `release-please-config.json`, `.release-please-manifest.json`). The
 action is pinned to a commit.
 
+Each build carries its version (`tools/make-vers.py`, run by
+`common/version.cmake` when CMake configures): a `vers` resource in
+Enforcer Installer, Enforcer Extension and the control panel, and the
+title bars of the control panel and the installer. A build of the commit
+tagged `vVERSION` has the plain version; any other has the commit added
+(`0.1.0+1a2b3c4`). The release workflow's checkout has no tags, so it
+sets `ENFORCER_VERSION` from `version.txt`.
+
 - On each push to `main`, the workflow opens or updates a pull request
   "chore(main): release X.Y.Z" when there are `feat:` or `fix:` commits
   since the last release. It changes `version.txt`, `CHANGELOG.md` and
@@ -375,6 +383,7 @@ areas (a megabyte at a time, then a page at a time from 0x40000000 to
 | `m`, `M` | 64 KB kept, 1 MB freed, of temporary memory | in Scribble's own chunks |
 | `T` | native code into the Finder's temporary memory | denied, Scribble stopped |
 | `P` | write and read back 600 MB of temporary memory | pages out other applications (VM on) |
+| `w` | write 64 KB and 4 MB from the heap to a file and read them back | PASS; in ScribbleBig it is disk I/O from and to sparse memory |
 | `Y` | an MP task into the Finder | dropped by the kernel, Scribble goes on |
 | `V` | a Time Manager task into a background-only application, 5 s later; make the Finder current | dropped by the kernel |
 | `D` | a deferred task into the Finder, Scribble current | skipped by the engine, Scribble goes on |
@@ -798,9 +807,11 @@ The patch:
   `OP_POOL_PUT` (a physical page the caller owns), `OP_POOL_GET` (one
   back), `OP_SPARSE_FREE` (an address and a number of pages: their PTEs
   dropped, their pages back in the pool; returns how many), and
-  `OP_SPARSE_INFO` (the pool's size, pages given, faults with it empty).
-  A kernel without the patch returns paramErr, and the control block's
-  version is unchanged.
+  `OP_SPARSE_INFO` (the pool's size, pages given, faults with it empty),
+  `OP_POOL_TAKE` (pages of a physical range out of the pool, or only
+  counted) and `OP_SPARSE_COUNT` (how many pages of a range have memory,
+  for About This Computer). A kernel without an operation returns
+  paramErr.
 
 Scribble `J` (2026-11-15, VM off): 48 system heap pages to the kernel's
 free list, a 64 MB area at 0x40000000, a pool of 64 system heap pages.
@@ -935,10 +946,11 @@ Worst first. Keep in step with Limits in `README.md`.
     more) moves that limit to 29 MB: Scribble `E` grows a 1 MB handle to
     20 MB there. With virtual memory on, and for smaller applications,
     the limit is the partition from launch sizes.
-21. `FreeMem`, `MaxMem`, `PurgeSpace` and `GetProcessInformation` count
-    only the partition. An application that asks for all it sees gets
-    less than there is; About This Computer does not show an
-    application's chunks.
+21. `FreeMem`, `MaxMem` and `PurgeSpace` count only the partition. An
+    application that asks for all it sees gets less than there is.
+    `GetProcessInformation` adds the chunks, and for another process's
+    sparse partition or chunk reports the memory behind it (Memory on
+    demand, "About This Computer").
 22. An application that tests for memory by asking for a huge block and
     expects it to fail can now get it, down to the 2 MB reserve.
 23. With virtual memory off, a partition raised at launch reserves RAM the
@@ -946,6 +958,31 @@ Worst first. Keep in step with Limits in `README.md`.
     Apple System Profiler, Sherlock 2, Scrapbook and Stickies running, the
     nine heaps held 30 MB, 81% of it free, against 10.6 MB without launch
     sizes.
+
+24. A store by one application's code into another application's stack
+    is allowed and recorded as an offense (2026-11-15, control block
+    version 6, `KernelCB.stacks`, `kKcbOpStack`). The engine gives the
+    kernel each application's stack (ApplLimit to CurStackBase, read at
+    its tick while the application is current), and the kernel's decision
+    lets such a store through before it would deny it. A stray store
+    that lands in another application's stack is no longer caught.
+
+    Why: Mac OS calls a routine of one application for another, in the
+    routine's own context (ApplZone and the stack are the routine's
+    application's), and the routine puts its result through a pointer
+    into the caller's stack. Sherlock 2 has one (in its code at partition
+    + 0x4616C: `f(x, short *out)`, stores the result, returns 0), called
+    when its window is clicked while another application is in front.
+    Enforcer denied the store and stopped Sherlock in the middle of that
+    call; the Process Manager then looped in its process list (in the
+    code that builds the Application menu) and the Mac hung. Found when
+    a test first clicked Sherlock's window from the Finder; Apple System
+    Profiler's window does not do it. To see it again: launch Sherlock 2,
+    click the desktop, click Sherlock's window. The log then shows one
+    allowed offense into the Finder's stack.
+
+    Not done: refusing to stop an application that is inside such a
+    call for any other offense. A stop there can hang the same way.
 
 Compatibility review (2026-11-13) also noted: programs that write-protect
 their own pages lose those faults to the kernel and the hooks; the engine
@@ -1265,6 +1302,18 @@ What differs:
   happen first) gets an ordinary partition.
 - The Process Manager's two virtual-memory-only uses of the partition's
   handle caused no failure; they were not traced.
+- Writes. With virtual memory on, the disk driver locks a write's buffer
+  with `LockMemoryForOutput` (`_MemoryDispatch` selector 10), which the
+  stub did not take: `FSWrite` from sparse memory returned ioErr (−36)
+  while `FSRead` worked. Enforcer Installer, which asks for 24 MB and so
+  runs in a sparse partition, stopped while writing the Mac OS ROM file
+  and the Mac hung: with Enforcer 0.1.0 running and virtual memory on, an
+  update could not be installed. The stub takes selector 10 as a lock
+  (2026-11-15). Scribble `w` writes and reads back 64 KB and 4 MB from
+  blocks in the application's heap; run it in ScribbleBig. To install
+  over a build with this fault, turn "Give applications more memory than
+  Get Info sets" off first (the installer then gets an ordinary
+  partition), or start up with extensions off.
 
 Tested (VM on, 512 MB RAM, 990 MB virtual memory): ScribbleBig in a
 partition at 0x40001000: `E` twice (20 MB), `Z`, `n` denied and the
@@ -1297,8 +1346,21 @@ Left:
   application quits, so the pool can hold more than is needed (34 MB
   after two runs of `E`).
 - Freed heap pages do not go back until the partition does (reclaim).
-- `GetProcessInformation` reports the partition's 29 MB as its size, not
-  the pages behind it, and a sparse chunk by its pieces.
+- About This Computer (built 2026-11-15). The Finder asks
+  `GetProcessInformation` for each process. For a sparse partition or
+  chunk, `pool_info` reports the memory behind it: the size is the pages
+  the kernel has given (`kKcbOpSparseCount`, which walks the range's
+  PLEs; kept for a second for each partition and chunk), and the free
+  memory is what of those the heap does not use (the heap's end less its
+  free bytes; the stack is not counted). Only when another process asks:
+  a process that asks about itself gets the partition as the Process
+  Manager has it, so one that sizes its work from the record does not
+  see a few hundred KB. The engine's own calls (`own_info`) are left
+  alone too: its domains are the whole partitions. With Apple System
+  Profiler and Sherlock 2 running, About This Computer showed 3.4 MB and
+  1.9 MB (VM off) and 1.8 MB and 672 K (VM on), where both were 29 MB;
+  with virtual memory on the "Mac OS" line was 3.98 GB before (the sizes
+  added up to more than there is) and 42.6 MB after.
 - Launching with the pieces or the partition slots (16) used up falls
   back to the Process Manager's heap with the raised size.
 - The Finder and the applications launched before the engine is up keep
