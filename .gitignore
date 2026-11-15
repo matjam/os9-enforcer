@@ -1,16 +1,32 @@
-# Only our own sources and scripts are tracked. Retro68 is a submodule
-# (toolchain/Retro68); QEMU and the test machine's disks live in
-# os9-protect.
+# Only our own sources, scripts and patches are tracked. Retro68 is a
+# submodule (toolchain/Retro68); QEMU is fetched and built by qemu/build.sh;
+# the reference sources are cloned (CLAUDE.md, "Reference sources"); Apple's
+# software (the install image, the disk images) stays local.
 
-# Build output (./build.sh builds each program in PROGRAM/build, and
-# toolchain/build.sh the toolchain in toolchain/build).
+# Build output (./build.sh builds each program in PROGRAM/build,
+# toolchain/build.sh the toolchain in toolchain/build, qemu/build.sh QEMU in
+# qemu/build, and each tools/PLUGIN/build.sh its plugin in tools/PLUGIN/build).
 /*/build/
 /*/build-*/
+/tools/*/build/
 # tools/make-dist.sh
 /dist/
 
 # Apple's Mac OS ROM file and the kernel taken from it (kernel/extract.sh).
 /kernel/stock/
+
+# The test machine: disk images, the Mac OS install image, and run/ (guest
+# logs, screenshots, sockets and memory dumps).
+/disks/
+/media/
+/run/
+# qemu/build.sh downloads the release tarball and unpacks and patches it in
+# qemu/src.
+/qemu/src/
+/qemu/src.part/
+/qemu/*.tar.*
+# Reference sources and tbxi's Python environment.
+/refs/
 
 __pycache__/
 
@@ -18,9 +34,14 @@ __pycache__/
 *.bin
 *.img
 *.dsk
+*.iso
+*.dmg
+*.qcow2
 *.o
 *.a
 *.xcoff
 *.pef
 *.png
+*.tar.*
+*.part
 .DS_Store
