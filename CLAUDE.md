@@ -1083,7 +1083,31 @@ is left is using it:
    caller stores the preferred size and calls one routine that makes the
    process, retrying smaller on `memFullErr` down to the minimum) has the
    partition as a block of the Process Manager's heap, with its size,
-   lock and disposal going through that heap. Trace that routine first.
+   lock and disposal going through that heap.
+
+Traced so far (2026-11-15, a VM-off dump; addresses of that boot):
+- The Process Manager's native fragment has its TOC at 0x010CC17C (206
+  transition vectors in RAM name it).
+- The routine launch calls to make the process (0x0117F4FC) is a thunk:
+  `CallUniversalProc(*(0x103C), 942, 16, argument)`. Low memory 0x103C
+  holds the 68k Process Manager's dispatcher, and selector 16 makes the
+  process. So the partition is allocated in 68k code, not in the native
+  fragment; its neighbours are selectors 28 (0x0117F538) and 4
+  (0x0117F56C).
+- The fragment calls the Resource Manager, `BlockMoveData` and the like
+  through InterfaceLib transition vectors straight into the ROM
+  (`Get1Resource` at 0xFFD13780), not through the trap table. A trap
+  patch does not see those calls; that is why stubs on `_GetResource` and
+  `_Get1Resource` saw no `SIZE` read at launch. The Memory Manager calls
+  of native applications do go through the trap table (the overflow stubs
+  see Scribble's).
+
+Next for 3: disassemble the 68k dispatcher's selector 16 from a dump
+(`capstone`, as for the ROM's `SIZE` library), find the partition's
+allocation and every use of its handle (size, lock, the zone set up in
+it, disposal at quit), and decide between a handle the engine makes for
+a sparse area and a hook at the allocation. 68k code in RAM can be
+patched with `BlockMove`, which flushes the emulator's code cache.
 
 ### Switch cost
 
