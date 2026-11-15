@@ -76,6 +76,8 @@
  *      native code (CallUniversalProc);
  *   U  and in one called from 68k code in this application's heap. A call
  *      is in progress below both: preemption must leave them alone.
+ *   H  U for 20 s. Command-Option-Escape during it must bring up Force
+ *      Quit, and its buttons must work before the 20 s are up.
  */
 
 #include <stdio.h>
@@ -561,7 +563,8 @@ int main(void)
                "right after a switch, K into the control block and the "
                "owner table, X make the Enforcer Extension quit "
                "as in a crash, Z run 5 s without yielding, C/U the same "
-               "in a native/68k callback, q quit; then Return\n");
+               "in a native/68k callback, H 20 s in a 68k callback, q "
+               "quit; then Return\n");
         int ch = getchar();
         while (ch != '\n' && getchar() != '\n')
             ;
@@ -882,13 +885,15 @@ int main(void)
             continue;
         }
         case 'C':
-        case 'U': {
+        case 'U':
+        case 'H': {
             /* Spin 2.5 s in a callback: called by Mixed Mode from native
                code (C), or from 68k code in this application's heap (U).
                A Toolbox call is in progress below it, so preemption must
-               not call WaitNextEvent: every check says "in a call". */
+               not call WaitNextEvent: every check says "in a call". H is
+               U for 20 s, to try Force Quit (Command-Option-Escape). */
             unsigned long per_ms;
-            g_cb_rounds = spin_rounds(2500, &per_ms);
+            g_cb_rounds = spin_rounds(ch == 'H' ? 20000 : 2500, &per_ms);
             g_cb_gap = per_ms;
             State *s = engine_state();
             volatile YieldData *y = s ? s->yield : 0;
@@ -898,7 +903,7 @@ int main(void)
             }
             unsigned long safe0 = y->safe, call0 = y->in_call,
                           w0 = y->yielded, e0 = y->entered,
-                          b0 = y->broken;
+                          b0 = y->broken, f0 = y->forced;
             UniversalProcPtr cbu = NewRoutineDescriptor(
                 (ProcPtr)cb_spin, kCStackBased, kPowerPCISA);
             if (ch == 'C') {
@@ -915,16 +920,18 @@ int main(void)
                 DisposePtr(c68);
             }
             DisposeRoutineDescriptor(cbu);
-            printf("%s callback: gaps over 1 ms %lu, the longest %lu us; "
-                   "stub entries %lu, in a call %lu, chain not ending at "
-                   "the base %lu, safe %lu, WaitNextEvent calls %lu\n",
-                   ch == 'C' ? "native" : "68k", g_cb.gaps,
-                   g_cb.max_gap * 1000 / per_ms, y->entered - e0,
+            printf("%s callback: %lu ms, gaps over 1 ms %lu, the longest "
+                   "%lu us; stub entries %lu, in a call %lu, chain not "
+                   "ending at the base %lu, safe %lu, for Force Quit %lu, "
+                   "WaitNextEvent calls %lu\n",
+                   ch == 'C' ? "native" : "68k", g_cb.ticks / per_ms,
+                   g_cb.gaps, g_cb.max_gap * 1000 / per_ms, y->entered - e0,
                    y->in_call - call0, y->broken - b0, y->safe - safe0,
-                   y->yielded - w0);
+                   y->forced - f0, y->yielded - w0);
             printf("the last chain (sp %08lX, base %08lX, %lu frames):",
                    y->last_sp, y->last_base, y->last_n);
-            for (unsigned long i = 0; i <= y->last_n && i < 11; i++)
+            for (unsigned long i = 0; i <= y->last_n && i < kYieldChain;
+                 i++)
                 printf(" %08lX", y->chain[i]);
             printf("\n");
             continue;

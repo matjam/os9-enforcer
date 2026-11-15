@@ -47,11 +47,13 @@ SPACES = ["skips", "spaces", "vsid_mask", "spaces_on", "pm_site", "pm_stub",
           "pm_mapped", "pm_tried", "pm_tries", "yield", "preempt_on",
           "slice_ms"]
 # The yield stub's data (common/hyield.h).
+YIELD_CHAIN = 8
 YIELD = (["magic", "entry", "vecbr", "check", "wne", "entered", "yielded",
           "lost", "starting", "not_task", "in_call", "other_stack",
-          "low_stack", "broken", "safe", "last_sp", "last_pc", "last_lr",
-          "last_owner", "last_base", "last_n"] +
-         ["chain%d" % i for i in range(11)])
+          "low_stack", "broken", "safe", "forced", "force_until",
+          "forced_at", "last_sp", "last_pc", "last_lr", "last_owner",
+          "last_base", "last_n"] +
+         ["chain%d" % i for i in range(YIELD_CHAIN)])
 KCB = ["magic", "version", "mode", "current", "entries", "denied_page",
        "seq", "frame", "allowed", "logged", "denied", "bail", "self",
        "skipped", "applzone", "deny_native_page", "deny_native_seq",
@@ -201,15 +203,17 @@ def print_kernel(k):
         n = k["y_last_n"]
         print("    checks: starting %d, not task %d, in a call %d, other "
               "stack %d, low stack %d, chain not ending at the base %d, safe "
-              "%d; the last: sp %08X pc %08X lr %08X owner %d stack base "
-              "%08X, %d frames: %s%s" % (
+              "%d, for Force Quit %d; the last: sp %08X pc %08X lr %08X "
+              "owner %d stack base %08X, %d frames: %s%s" % (
                   k["y_starting"], k["y_not_task"], k["y_in_call"],
                   k["y_other_stack"], k["y_low_stack"], k["y_broken"],
-                  k["y_safe"], k["y_last_sp"], k["y_last_pc"],
-                  k["y_last_lr"], k["y_last_owner"], k["y_last_base"], n,
+                  k["y_safe"], k["y_forced"], k["y_last_sp"],
+                  k["y_last_pc"], k["y_last_lr"], k["y_last_owner"],
+                  k["y_last_base"], n,
                   " ".join("%08X" % k["y_chain%d" % i]
-                           for i in range(min(11, n))),
-                  ", ended at %08X" % k["y_chain%d" % n] if n < 11 else ""))
+                           for i in range(min(YIELD_CHAIN, n))),
+                  ", ended at %08X" % k["y_chain%d" % n]
+                  if n < YIELD_CHAIN else ""))
     else:
         print("  preemption: no yield stub")
     if k["events"]:

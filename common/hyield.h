@@ -11,11 +11,11 @@
 
 #include <stddef.h>
 
-enum { kYieldMagic = 'YLD1' };
+enum { kYieldMagic = 'YLD1', kYieldChain = 8 };
 
 /* The stub calls check(sp, pc, lr, data) with the preempted code's r1, PC
    and LR, at its level; a result other than 0 makes it call
-   WaitNextEvent. */
+   WaitNextEvent, with the result less 1 as the event mask. */
 typedef struct YieldData YieldData;
 typedef long (*YieldCheck)(unsigned long sp, unsigned long pc,
                            unsigned long lr, volatile YieldData *y);
@@ -33,15 +33,20 @@ struct YieldData {
        yet; above task level; a return address on the stack not the
        application's code below one that is (a Toolbox call in progress);
        r1 outside the application's stack, or too close to its limit; a
-       chain that does not end at the stack's base; safe. */
+       chain that does not end at the stack's base; safe; and calls made
+       although a Toolbox call was in progress (in_call or broken), for a
+       Force Quit request. */
     volatile unsigned long starting, not_task, in_call, other_stack,
-        low_stack, broken, safe;
+        low_stack, broken, safe, forced;
+    /* While a Force Quit request is served: the timebase until which calls
+       are made for it (0 when none is), and when the last one was. */
+    volatile unsigned long force_until, forced_at;
     /* The last check: r1, PC, LR, the current application's owner byte,
        the stack's base, frames followed, and the first return addresses
        on the chain, then the link it ended on. */
     volatile unsigned long last_sp, last_pc, last_lr, last_owner, last_base,
         last_n;
-    volatile unsigned long chain[11];
+    volatile unsigned long chain[kYieldChain];
 };
 
 _Static_assert(offsetof(YieldData, check) == 0x0C, "D_CHECK");

@@ -1371,6 +1371,18 @@ static long handler(ExceptionInfo *e)
 
 static void pool_keep(State *s);
 
+/* Command-Option-Escape going down records a Force Quit request for
+   yield_check. KeyMap (low memory 0x174) has key k at bit k & 7 of byte
+   k >> 3: Escape 0x35 and Command 0x37 in byte 6, Option 0x3A in byte 7. */
+static void force_quit_poll(State *s)
+{
+    volatile unsigned char *km = lowmem(0x174);
+    int down = (km[6] & 0xA0) == 0xA0 && (km[7] & 0x04);
+    if (down && !s->force_quit_down && s->pool && s->preempt_on)
+        s->pool->force_quit = timebase() | 1;
+    s->force_quit_down = down;
+}
+
 static void timer_proc(TMTask *tm)
 {
     State *s = g_state;
@@ -1379,6 +1391,7 @@ static void timer_proc(TMTask *tm)
         if (!s->vm)
             sweep(s);
         pool_keep(s);
+        force_quit_poll(s);
         check_switch(s);
         if (s->sys_dom >= 0)
             s->sys->tick++;
@@ -2357,7 +2370,9 @@ static PoolStubs *pool_install(void)
     unsigned long last = (unsigned long)&p->last;
     unsigned long rl = (unsigned long)&p->rd_launch;
     unsigned long go = (unsigned long)&p->gne_old;
+    unsigned long fq = (unsigned long)&p->force_quit;
     const unsigned short gne[kPoolGne] = {
+        0x42B9, HI16(fq), LO16(fq),
         0x4A79, HI16(en), LO16(en), 0x671C,
         0x48E7, 0xE0C0,
         0x2038, 0x02AA,
@@ -2733,7 +2748,17 @@ enum {
     kSliceMs = 20,
     kYieldRetryMs = 2,        /* the next try after a check that said no */
     kYieldStack = 0x8000,     /* free stack WaitNextEvent is given */
-    kYieldFrames = 1024       /* the longest chain followed */
+    kYieldFrames = 1024,      /* the longest chain followed */
+    /* A Force Quit request is honoured from kForceQuitMs after the keys
+       went down (the Process Manager has seen them by then) and dropped
+       after kForceQuitMaxMs. The Process Manager puts its dialog up in
+       one event call and runs it in the next, so calls go on for up to
+       kForceQuitForMs, until one takes kForceQuitAnswerMs or more (the
+       dialog was answered). */
+    kForceQuitMs = 500,
+    kForceQuitMaxMs = 20000,
+    kForceQuitForMs = 3000,
+    kForceQuitAnswerMs = 300
 };
 
 #ifndef gestaltPowerPCProcessorFeatures
@@ -2755,7 +2780,8 @@ static unsigned owner_at(State *s, unsigned long addr)
 
 /* From the yield stub, in the preempted application's context and at the
    level it was preempted at, with r1 below the application's frames.
-   Returns 1 when the application can call WaitNextEvent now:
+   Returns 0, or the event mask plus 1 when the application can call
+   WaitNextEvent now (1 for a mask of 0, which takes no event):
    - it has given up the processor before (KernelCB.yielded), so it has
      set up the Toolbox;
    - at task level (not a deferred task or an interrupt handler);
@@ -2773,14 +2799,55 @@ static unsigned owner_at(State *s, unsigned long addr)
      left out (a function that has called nothing yet has not written
      it), and so is the LR, which compilers use as a scratch register
      once they have saved it.
-   Writes only the stub's block: the program running the engine may be
-   another application's memory here. */
+   A Force Quit request (force_quit_due, force_quit_call) overrides the
+   Toolbox call test: the Process Manager shows Force Quit only in an
+   event call, and an application that is hung inside a callback makes
+   none.
+   Writes only the stub's block and the pool stubs' block (force_quit):
+   the program running the engine may be another application's memory
+   here. */
+static int force_quit_due(State *s)
+{
+    PoolStubs *p = s->pool;
+    unsigned long t = p ? p->force_quit : 0;
+    if (!t)
+        return 0;
+    unsigned long age = timebase() - t;
+    if (age > kForceQuitMaxMs * s->c.tb_per_ms) {
+        p->force_quit = 0;
+        return 0;
+    }
+    return age >= kForceQuitMs * s->c.tb_per_ms;
+}
+
+/* Whether to call WaitNextEvent for a Force Quit request although a
+   Toolbox call is in progress. */
+static int force_quit_call(State *s, volatile YieldData *y)
+{
+    unsigned long now = timebase(), ms = s->c.tb_per_ms;
+    if (y->force_until) {
+        if (now - y->forced_at >= kForceQuitAnswerMs * ms ||
+            (long)(now - y->force_until) >= 0) {
+            y->force_until = 0;
+            return 0;
+        }
+    } else if (force_quit_due(s)) {
+        s->pool->force_quit = 0;
+        y->force_until = (now + kForceQuitForMs * ms) | 1;
+    } else
+        return 0;
+    y->forced_at = now;
+    y->forced++;
+    return 1;
+}
+
 static long yield_check(unsigned long sp, unsigned long pc, unsigned long lr,
                         volatile YieldData *y)
 {
     State *s = g_state;
     long ok = 0;
     unsigned long n = 0;
+    volatile unsigned long *call = 0; /* a Toolbox call in progress */
     y->last_sp = sp;
     y->last_pc = pc;
     y->last_lr = lr;
@@ -2798,10 +2865,8 @@ static long yield_check(unsigned long sp, unsigned long pc, unsigned long lr,
         y->starting++;
         goto no;
     }
-    if (owner_at(s, pc) != owner) {
-        y->in_call++;
-        goto no;
-    }
+    if (owner_at(s, pc) != owner)
+        call = &y->in_call;
     unsigned long base = lowmem_long(0x908);  /* CurStackBase */
     unsigned long limit = lowmem_long(0x130); /* ApplLimit */
     y->last_base = base;
@@ -2818,32 +2883,40 @@ static long yield_check(unsigned long sp, unsigned long pc, unsigned long lr,
         int sys = 0;
         while (f > prev && f < base && !(f & 3)) {
             unsigned long ret = ((volatile unsigned long *)f)[2];
-            if (n < 11)
+            if (n < kYieldChain)
                 y->chain[n] = ret;
             n++;
             if (owner_at(s, ret) != owner)
                 sys = 1;
             else if (sys) {
-                y->in_call++;
-                goto no;
+                if (!call)
+                    call = &y->in_call;
+                break;
             }
             if (n >= kYieldFrames)
                 break;
             prev = f;
             f = *(volatile unsigned long *)f;
         }
-        if (n < 11)
+        if (n < kYieldChain)
             y->chain[n] = f; /* where it ended */
         /* It must end at the stack's base. A chain that ends on another
            link (a Mixed Mode switch frame, where 68k code called the
            native code above it) hides who called. */
-        if (f && f < base) {
-            y->broken++;
-            goto no;
-        }
+        if (!call && f && f < base)
+            call = &y->broken;
     }
-    y->safe++;
-    ok = 1;
+    if (call) {
+        (*call)++;
+        if (!force_quit_call(s, y))
+            goto no;
+        /* The dialog takes its clicks only from an event call that asks
+           for them; a click elsewhere is lost to the application. */
+        ok = 1 + (mDownMask | mUpMask);
+    } else {
+        y->safe++;
+        ok = 1; /* mask 0: no event taken */
+    }
 no:
     y->last_n = n;
     if (!ok)

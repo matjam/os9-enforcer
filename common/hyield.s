@@ -11,10 +11,11 @@
 #      0);
 #   2. takes the code's PC from the kernel (OP_YIELD);
 #   3. calls the engine's check (the TVector at D_CHECK), which returns
-#      whether the code can call WaitNextEvent now: task level, and only
-#      the application's own code on its stack;
-#   4. if so, calls WaitNextEvent(0, &event, 0, nil): no event is taken,
-#      and the Process Manager can run other applications;
+#      whether the code can call WaitNextEvent now (task level, and only
+#      the application's own code on its stack), as 0 or the event mask
+#      plus 1;
+#   4. if so, calls WaitNextEvent(mask, &event, 0, nil): with mask 0 no
+#      event is taken, and the Process Manager can run other applications;
 #   5. restores everything it can and returns to the PC with OP_RESUME,
 #      which loads PC, LR, CTR, CR, XER, r0, r1, r3 and r4 from the
 #      register block at F_RB.
@@ -192,11 +193,11 @@ vecbr:  b       1f                      # a nop with AltiVec
         cmpwi   3,0
         beq     resume
 
-        lwz     12,D_WNE(31)            # WaitNextEvent(0, &event, 0, nil)
-        lwz     0,0(12)
-        lwz     2,4(12)
+        lwz     12,D_WNE(31)            # WaitNextEvent(mask, &event, 0,
+        lwz     0,0(12)                 # nil), the mask the check's
+        lwz     2,4(12)                 # result less 1
         mtctr   0
-        li      3,0
+        addi    3,3,-1
         addi    4,1,F_EVENT
         li      5,0
         li      6,0
