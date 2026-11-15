@@ -1580,7 +1580,8 @@ enum {
     kPoolNewInfo = 0xF1,       /* long (long frame) */
     kPoolDisposedInfo = 0x3C1, /* void (long zone, long err) */
     kPoolQuitInfo = 0x01,      /* void (void) */
-    kPoolClientInfo = 0xF1     /* long (ProcessSerialNumber *), 68k */
+    kPoolClientInfo = 0xF1,    /* long (ProcessSerialNumber *), 68k */
+    kPoolOverInfo = 0x3F1      /* long (long trap, long size) */
 };
 
 /* A trap's entry in the trap table: OS traps (0xA0xx) at 0x400, Toolbox
@@ -1620,10 +1621,25 @@ static Handle chunk_alloc(Chunk *c, unsigned long size)
     return h;
 }
 
+/* A pointer of size bytes in chunk c, or 0. */
+static Ptr chunk_alloc_ptr(Chunk *c, unsigned long size)
+{
+    THz z = (THz)c->zone;
+    if ((unsigned long)z->zcbFree < size)
+        return 0;
+    THz old = GetZone();
+    SetZone(z);
+    Ptr p = NewPtr(size);
+    SetZone(old);
+    return p;
+}
+
 /* A new chunk for domain d with room for a handle of size bytes, or 0.
    Called by d's application, in TempNewHandle, so the Process Manager
-   makes the chunk that application's temporary memory. */
-static Chunk *new_chunk(State *s, int d, unsigned long size)
+   makes the chunk that application's temporary memory. With reserve, only
+   if that much temporary memory stays free. */
+static Chunk *new_chunk(State *s, int d, unsigned long size,
+                        unsigned long reserve)
 {
     int slot = -1, kept = 0;
     for (int i = 0; i < kMaxChunks; i++) {
@@ -1638,6 +1654,15 @@ static Chunk *new_chunk(State *s, int d, unsigned long size)
         return 0;
     if (csize < kChunkMin)
         csize = kChunkMin;
+    if (reserve) {
+        /* An overflow chunk is at least kOverChunk when there is room, so
+           later blocks share it (there are kMaxChunks chunks in all). */
+        unsigned long avail = (unsigned long)TempFreeMem();
+        if (avail < reserve || avail - reserve < csize + kPage)
+            return 0;
+        if (csize < kOverChunk && avail - reserve >= kOverChunk + kPage)
+            csize = kOverChunk;
+    }
     OSErr err = noErr;
     s->pool->inside = 1; /* the stub passes this one on */
     Handle h = TempNewHandle(csize + kPage, &err);
@@ -1727,7 +1752,7 @@ static long pool_new(unsigned long frame)
             h = chunk_alloc(c, size);
     }
     if (!h) {
-        c = new_chunk(s, d, size);
+        c = new_chunk(s, d, size, 0);
         if (c)
             h = chunk_alloc(c, size);
     }
@@ -1741,6 +1766,71 @@ static long pool_new(unsigned long frame)
     if (res)
         *res = noErr;
     return 0;
+}
+
+/* Overflow (engine.h): NewHandle (ptr 0) or NewPtr (ptr 1) has failed;
+   trap is the trap word, size the request. Returns the block from one of
+   the current application's chunks, or 0. Only for a request in the
+   application's own zone: one made with another zone current (a chunk's,
+   by the engine itself) fails as before. */
+static long pool_over(long trap, long size, int ptr)
+{
+    State *s = g_state;
+    if (!s || !s->running || !s->kcb || !s->pool || !s->pool->overflow ||
+        s->pool->inside)
+        return 0;
+    unsigned long zone = current_zone();
+    if (lowmem_long(0x118) != zone || size <= 0) /* TheZone */
+        return 0;
+    sweep(s);
+    int d = domain_of_zone(s, zone);
+    if (d < 0)
+        d = add_current(s);
+    if (d < 0 || d == s->sys_dom || s->domains[d].dying) {
+        s->pc.over_none++;
+        return 0;
+    }
+    /* A handle's master pointer, or a pointer's header, comes out of the
+       chunk too. */
+    unsigned long need = (unsigned long)size + 64;
+    unsigned long b = 0;
+    Chunk *c = 0;
+    for (int i = 0; i <= kMaxChunks && !b; i++) {
+        if (i == kMaxChunks) {
+            c = new_chunk(s, d, need, kOverReserve);
+            if (!c)
+                break;
+        } else {
+            c = &s->chunks[i];
+            if (!c->live || c->domain != d)
+                continue;
+        }
+        b = ptr ? (unsigned long)chunk_alloc_ptr(c, size)
+                : (unsigned long)chunk_alloc(c, size);
+    }
+    if (!b) {
+        s->pc.over_none++;
+        return 0;
+    }
+    c->handles++;
+    if (trap & 0x0200) /* NewHandleClear, NewPtrClear */
+        memset(ptr ? (void *)b : (void *)*(Handle)b, 0, size);
+    if (ptr)
+        s->pc.over_ptrs++;
+    else
+        s->pc.over_handles++;
+    *(volatile short *)lowmem(0x220) = noErr; /* MemErr */
+    return (long)b;
+}
+
+static long pool_overh(long trap, long size)
+{
+    return pool_over(trap, size, 0);
+}
+
+static long pool_overp(long trap, long size)
+{
+    return pool_over(trap, size, 1);
 }
 
 /* After DisposeHandle of a handle in a chunk (the zone at zone), from its
@@ -2290,8 +2380,81 @@ static void pool_launch(void)
      2C move.l  gne_old,-(sp)
      32 rts
      34 rts
+
+   NewHandle and NewPtr (D0 the size, D1 the trap word; the result in A0
+   and D0), with old the trap's routine and rd pool_overh or pool_overp:
+     00 tst.w   enabled
+     06 beq.s   38
+     08 btst    #10,d1           ; in the system heap: pass
+     0C bne.s   38
+     0E move.l  d0,-(sp)         ; the size and the trap word
+     10 move.l  d1,-(sp)
+     12 movea.l old,a1
+     18 jsr     (a1)
+     1A tst.w   d0               ; it worked
+     1C beq.s   32
+     1E movea.l #rd,a1           ; pool_over(trap, size)
+     24 jsr     (a1)
+     26 movea.l d0,a0
+     28 tst.l   d0
+     2A bne.s   30
+     2C moveq   #-108,d0         ; memFullErr
+     2E bra.s   32
+     30 moveq   #0,d0
+     32 addq.l  #8,sp
+     34 tst.w   d0
+     36 rts
+     38 move.l  old,-(sp)
+     3E rts
+
+   DisposePtr (A0 the pointer), as DisposeHandle; a nonrelocatable block's
+   header holds its zone at -4:
+     00 tst.w   enabled
+     06 beq.s   48
+     08 move.l  a0,d2
+     0A beq.s   48
+     0C movea.l d2,a1
+     0E movea.l -4(a1),a1
+     12 move.l  a1,d2
+     14 beq.s   48
+     16 cmpi.l  #'EnfT',-16(a1)
+     1E bne.s   48
+     20 cmpa.l  -12(a1),a1
+     24 bne.s   48
+     26 move.l  a1,-(sp)
+     28 movea.l dp_old,a1
+     2E jsr     (a1)
+     30 move.l  d0,-(sp)
+     32 move.l  4(sp),-(sp)
+     36 movea.l #rd_disposed,a1
+     3C jsr     (a1)
+     3E addq.l  #4,sp
+     40 move.l  (sp)+,d0
+     42 addq.l  #4,sp
+     44 tst.w   d0
+     46 rts
+     48 move.l  dp_old,-(sp)
+     4E rts
 */
 enum { kGNEFilter = 0x29A };
+
+static void alloc_stub(unsigned short *dst, unsigned long en,
+                       unsigned long old, unsigned long rd)
+{
+    const unsigned short code[kPoolAlloc] = {
+        0x4A79, HI16(en), LO16(en), 0x6730,
+        0x0801, 0x000A, 0x662A,
+        0x2F00, 0x2F01,
+        0x2279, HI16(old), LO16(old), 0x4E91,
+        0x4A40, 0x6714,
+        0x227C, HI16(rd), LO16(rd), 0x4E91,
+        0x2040, 0x4A80, 0x6604,
+        0x7094, 0x6002,
+        0x7000,
+        0x508F, 0x4A40, 0x4E75,
+        0x2F39, HI16(old), LO16(old), 0x4E75};
+    memcpy(dst, code, sizeof code);
+}
 
 static PoolStubs *pool_install(void)
 {
@@ -2308,7 +2471,11 @@ static PoolStubs *pool_install(void)
         p ? NewRoutineDescriptor((ProcPtr)p->client, kPoolClientInfo,
                                  kM68kISA)
           : 0;
-    if (!p || !un || !ud || !uq || !ul || !uc) {
+    UniversalProcPtr uoh = NewRoutineDescriptor((ProcPtr)pool_overh,
+                                                kPoolOverInfo, kPowerPCISA);
+    UniversalProcPtr uop = NewRoutineDescriptor((ProcPtr)pool_overp,
+                                                kPoolOverInfo, kPowerPCISA);
+    if (!p || !un || !ud || !uq || !ul || !uc || !uoh || !uop) {
         if (p)
             DisposePtr((Ptr)p);
         return 0;
@@ -2321,6 +2488,11 @@ static PoolStubs *pool_install(void)
     BlockMoveData(uq, &t.rd_quit, sizeof(RoutineDescriptor));
     BlockMoveData(ul, &t.rd_launch, sizeof(RoutineDescriptor));
     BlockMoveData(uc, &t.rd_client, sizeof(RoutineDescriptor));
+    BlockMoveData(uoh, &t.rd_overh, sizeof(RoutineDescriptor));
+    BlockMoveData(uop, &t.rd_overp, sizeof(RoutineDescriptor));
+    DisposeRoutineDescriptor(uoh);
+    DisposeRoutineDescriptor(uop);
+    t.overflow = 1;
     DisposeRoutineDescriptor(un);
     DisposeRoutineDescriptor(ud);
     DisposeRoutineDescriptor(uq);
@@ -2342,7 +2514,17 @@ static PoolStubs *pool_install(void)
     t.dh_old = *dh_e;
     t.ets_old = *ets_e;
     t.gne_old = *gne_e;
-    if (t.osd_old != (unsigned long)NGetTrapAddress(_OSDispatch,
+    volatile unsigned long *nh_e = trap_entry(_NewHandle);
+    volatile unsigned long *np_e = trap_entry(_NewPtr);
+    volatile unsigned long *dp_e = trap_entry(_DisposePtr);
+    t.nh_old = *nh_e;
+    t.np_old = *np_e;
+    t.dp_old = *dp_e;
+    if (t.nh_old != (unsigned long)NGetTrapAddress(_NewHandle, kOSTrapType) ||
+        t.np_old != (unsigned long)NGetTrapAddress(_NewPtr, kOSTrapType) ||
+        t.dp_old != (unsigned long)NGetTrapAddress(_DisposePtr,
+                                                   kOSTrapType) ||
+        t.osd_old != (unsigned long)NGetTrapAddress(_OSDispatch,
                                                     kToolboxTrapType) ||
         t.dh_old != (unsigned long)NGetTrapAddress(_DisposeHandle,
                                                    kOSTrapType) ||
@@ -2401,7 +2583,26 @@ static PoolStubs *pool_install(void)
         0x2F39, HI16(go), LO16(go), 0x4E75,
         0x4E75};
     memcpy(t.gne, gne, sizeof gne);
+    alloc_stub(t.nh, en, (unsigned long)&p->nh_old,
+               (unsigned long)&p->rd_overh);
+    alloc_stub(t.np, en, (unsigned long)&p->np_old,
+               (unsigned long)&p->rd_overp);
+    unsigned long po = (unsigned long)&p->dp_old;
+    const unsigned short dp[kPoolDp] = {
+        0x4A79, HI16(en), LO16(en), 0x6740,
+        0x2408, 0x673C, 0x2242, 0x2269, 0xFFFC,
+        0x2409, 0x6732,
+        0x0CA9, 0x456E, 0x6654, 0xFFF0, 0x6628,
+        0xB3E9, 0xFFF4, 0x6622,
+        0x2F09, 0x2279, HI16(po), LO16(po), 0x4E91,
+        0x2F00, 0x2F2F, 0x0004, 0x227C, HI16(rd), LO16(rd), 0x4E91,
+        0x588F, 0x201F, 0x588F, 0x4A40, 0x4E75,
+        0x2F39, HI16(po), LO16(po), 0x4E75};
+    memcpy(t.dp, dp, sizeof dp);
     BlockMove(&t, p, sizeof t); /* flushes the code caches */
+    *nh_e = (unsigned long)p->nh;
+    *np_e = (unsigned long)p->np;
+    *dp_e = (unsigned long)p->dp;
     *osd_e = (unsigned long)p->osd;
     *dh_e = (unsigned long)p->dh;
     *ets_e = (unsigned long)p->ets;
@@ -2438,6 +2639,9 @@ static void pool_keep(State *s)
     keep_one(s, trap_entry(_OSDispatch), p->osd_old, p->osd);
     keep_one(s, trap_entry(_DisposeHandle), p->dh_old, p->dh);
     keep_one(s, trap_entry(_ExitToShell), p->ets_old, p->ets);
+    keep_one(s, trap_entry(_NewHandle), p->nh_old, p->nh);
+    keep_one(s, trap_entry(_NewPtr), p->np_old, p->np);
+    keep_one(s, trap_entry(_DisposePtr), p->dp_old, p->dp);
 }
 
 /* Disable the stubs and take out those still first in their traps. The
@@ -2450,6 +2654,9 @@ static void pool_remove(State *s)
     p->enabled = 0;
     p->quit_hook = 0;
     s->pool = 0;
+    remove_one(trap_entry(_DisposePtr), p->dp_old, p->dp);
+    remove_one(trap_entry(_NewPtr), p->np_old, p->np);
+    remove_one(trap_entry(_NewHandle), p->nh_old, p->nh);
     remove_one(lowmem(kGNEFilter), p->gne_old, p->gne);
     remove_one(trap_entry(_ExitToShell), p->ets_old, p->ets);
     remove_one(trap_entry(_DisposeHandle), p->dh_old, p->dh);

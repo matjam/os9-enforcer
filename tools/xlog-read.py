@@ -33,7 +33,8 @@ KERNEL = ["kcb", "kcb_err", "owners", "kcb_raw", "owners_raw", "kseen",
 # vm, pm_zone), then the Chunk table.
 POOL = ["pool", "news", "passed", "disposed", "chunks_made", "chunks_freed",
         "chunks_dropped", "quits", "gone", "reinstalled", "launched",
-        "system", "vm", "pm_zone", "owners_size"]
+        "system", "over_handles", "over_ptrs", "over_none", "vm", "pm_zone",
+        "owners_size"]
 POOL_STUBS = ["magic", "enabled_inside", "osd_old", "dh_old", "ets_old"]
 CHUNK = ["live", "domain", "handle", "block", "lo", "hi", "zone", "handles",
          "keep"]
@@ -238,6 +239,8 @@ def print_pool(k):
               k["news"], k["passed"], k["system"], k["disposed"],
               k["chunks_made"], k["chunks_freed"], k["chunks_dropped"],
               k["quits"], k["gone"], k["reinstalled"], k["launched"]))
+    print("  overflow: failed NewHandle calls served %d, NewPtr %d, not "
+          "served %d" % (k["over_handles"], k["over_ptrs"], k["over_none"]))
     for c in k["chunks"]:
         print("  chunk [%3d] domain %d: %08X-%08X zone %08X, handle %08X -> "
               "%08X, %d handles%s" % (

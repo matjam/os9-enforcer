@@ -238,8 +238,23 @@ enum {
     kPoolDh = 43,
     kPoolEts = 12,
     kPoolGne = 27,
-    kPoolClient = 9
+    kPoolClient = 9,
+    kPoolAlloc = 32,
+    kPoolDp = 40
 };
+
+/* Overflow: when NewHandle or NewPtr fails in the current application's
+ * own zone (after its grow zone procedure has run), the stub on the trap
+ * serves the request from one of the application's chunks, making one
+ * from temporary memory if needed, so the application runs out of memory
+ * only when the machine has no more than kOverReserve left. The block is
+ * in the application's domain like its temporary memory, and the chunk is
+ * freed with its last block (the DisposeHandle and DisposePtr stubs) or
+ * when the application quits. Requests with the system-heap bit pass.
+ * What does not overflow: growing a block (SetHandleSize, SetPtrSize,
+ * ReallocateHandle) and the Memory Manager's own master pointer blocks;
+ * FreeMem and MaxMem count only the partition. */
+enum { kOverReserve = 0x200000, kOverChunk = 0x100000 };
 
 /* The GetNextEvent filter (jGNEFilter, low memory 0x29A, which every
  * application shares; WaitNextEvent and GetNextEvent call it in the
@@ -273,6 +288,11 @@ typedef struct {
        application, while the caller is in system mode (BeginSystemMode). */
     unsigned short client[kPoolClient];
     RoutineDescriptor rd_client;
+    /* Overflow (above): stubs on _NewHandle, _NewPtr and _DisposePtr. */
+    volatile unsigned short overflow; /* 0 turns overflow off */
+    unsigned long nh_old, np_old, dp_old;
+    RoutineDescriptor rd_overh, rd_overp;
+    unsigned short nh[kPoolAlloc], np[kPoolAlloc], dp[kPoolDp];
 } PoolStubs;
 
 typedef struct {
@@ -285,6 +305,9 @@ typedef struct {
     unsigned long reinstalled; /* stubs the timer put back in the table */
     unsigned long launched; /* domains added at an event call */
     unsigned long system; /* passed on: made in system mode */
+    unsigned long over_handles; /* failed NewHandle calls served by a chunk */
+    unsigned long over_ptrs;    /* failed NewPtr calls served by a chunk */
+    unsigned long over_none;    /* failed calls the chunks could not serve */
 } PoolCounters;
 
 /* A cross-domain writer: a store site, the application current at the

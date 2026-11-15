@@ -88,6 +88,8 @@
  *   A  draw an Appearance scroll bar with a thumb. The first thumb of a
  *      boot makes the theme keep its image in temporary memory, made in
  *      system mode; quit, launch again and A: the thumb must be clean.
+ *   O  overflow: 8 MB of handles and pointers in this 1 MB partition;
+ *      what the partition cannot hold must come from chunks.
  */
 
 #include <stdio.h>
@@ -613,7 +615,7 @@ int main(void)
                "owner table, X make the Enforcer Extension quit "
                "as in a crash, Z run 5 s without yielding, C/U the same "
                "in a native/68k callback, H 20 s in a 68k callback, G "
-               "temporary memory in system mode, A draw a scroll bar, q "
+               "temporary memory in system mode, A draw a scroll bar, O 8 MB in this 1 MB partition, q "
                "quit; then Return\n");
         int ch = getchar();
         while (ch != '\n' && getchar() != '\n')
@@ -1156,6 +1158,84 @@ int main(void)
                    "memory\n", v, (unsigned long)t, name);
             *t = v;
             break;
+        }
+        case 'O': {
+            /* Overflow: ask for 6 MB of handles and 2 MB of pointers in
+               256 KB blocks, far more than this 1 MB partition holds.
+               Each request the partition cannot take must come from a
+               chunk; every block is written, read back and disposed, and
+               the chunks are freed with their last block. */
+            enum { kN = 32, kBlock = 0x40000 };
+            static Handle hs[kN];
+            static Ptr ps[kN];
+            State *s = engine_state();
+            int chunks0 = s ? engine_live_chunks(s) : 0;
+            int got = 0, over = 0, bad = 0, dirty = 0;
+            for (int i = 0; i < kN; i++) {
+                int ptr = i >= 24, clear = i & 1;
+                unsigned long *b;
+                if (ptr) {
+                    ps[i] = clear ? NewPtrClear(kBlock) : NewPtr(kBlock);
+                    b = (unsigned long *)ps[i];
+                } else {
+                    hs[i] = clear ? NewHandleClear(kBlock) : NewHandle(kBlock);
+                    b = hs[i] ? (unsigned long *)*hs[i] : 0;
+                }
+                if (!b) {
+                    printf("block %d: error %d\n", i, MemError());
+                    continue;
+                }
+                got++;
+                unsigned long z = ptr ? (unsigned long)PtrZone(ps[i])
+                                      : (unsigned long)HandleZone(hs[i]);
+                if (z > 16 && long_at(z - 16) == kChunkSig &&
+                    long_at(z - 12) == z)
+                    over++;
+                if (!ptr)
+                    HLock(hs[i]);
+                for (unsigned long k = 0; k < kBlock / 4; k++) {
+                    if (clear && b[k])
+                        dirty++;
+                    b[k] = 0x4F000000UL | (unsigned long)i << 16 | (k & 0xFFFF);
+                }
+            }
+            for (int i = 0; i < kN; i++) {
+                unsigned long *b = i >= 24 ? (unsigned long *)ps[i]
+                                   : hs[i] ? (unsigned long *)*hs[i] : 0;
+                if (!b)
+                    continue;
+                for (unsigned long k = 0; k < kBlock / 4; k++)
+                    if (b[k] !=
+                        (0x4F000000UL | (unsigned long)i << 16 | (k & 0xFFFF)))
+                        bad++;
+            }
+            int chunks1 = s ? engine_live_chunks(s) : 0;
+            for (int i = 0; i < kN; i++) {
+                if (i >= 24 && ps[i])
+                    DisposePtr(ps[i]);
+                else if (i < 24 && hs[i])
+                    DisposeHandle(hs[i]);
+                hs[i] = 0;
+                ps[i] = 0;
+            }
+            int chunks2 = s ? engine_live_chunks(s) : 0;
+            Handle after = NewHandle(0x8000);
+            int home = after && !in_chunk(after);
+            if (after)
+                DisposeHandle(after);
+            printf("%d of %d blocks, %d in chunks; %d words wrong, %d not "
+                   "cleared; chunks %d, then %d, then %d after disposing; a "
+                   "32 KB handle afterwards is %s\n",
+                   got, kN, over, bad, dirty, chunks0, chunks1, chunks2,
+                   home ? "in the partition" : "NOT in the partition");
+            if (s)
+                printf("overflow: handles %lu, pointers %lu, not served "
+                       "%lu\n", s->pc.over_handles, s->pc.over_ptrs,
+                       s->pc.over_none);
+            printf("%s\n", got == kN && over > 0 && !bad && !dirty && home &&
+                               chunks2 <= chunks0 + 1
+                               ? "PASS" : "FAIL");
+            continue;
         }
         case 'q':
             return 0;
