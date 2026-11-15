@@ -3100,7 +3100,7 @@ static void size_follow(State *s)
     if (!p)
         return;
     unsigned long cap = 0;
-    if (s->mode != kModeOff && s->pm_zone)
+    if (s->mode != kModeOff && s->mem_on && s->pm_zone)
         cap = ((unsigned long)((THz)s->pm_zone)->zcbFree / kSizeShare) &
               ~0xFFFUL;
     p[kSzCap] = cap;
@@ -3108,6 +3108,14 @@ static void size_follow(State *s)
     s->size_raised = p[kSzRaised];
     s->size_from = p[kSzFrom];
     s->size_to = p[kSzTo];
+}
+
+void engine_set_mem(State *s, int on)
+{
+    s->mem_on = s->want_mem = on != 0;
+    if (s->pool)
+        s->pool->overflow = on != 0;
+    size_follow(s);
 }
 
 /* Whether the page at addr is in the kernel area area and can be read:
@@ -3576,6 +3584,7 @@ long engine_start(State **out, unsigned long mode, const char *name)
     s->off_sys = offsetof(State, sys_dom);
     s->off_kernel = offsetof(State, kcb);
     s->mode = s->want_mode = kModeOff;
+    s->mem_on = s->want_mem = 1;
     copy_name(s->name, name);
     s->bitmap = bitmap;
     s->cur = -1;
@@ -3717,6 +3726,8 @@ void engine_poll(State *s)
         engine_set_mode(s, s->want_mode);
     if (s->want_sys != s->sys_on)
         engine_set_sys(s, s->want_sys);
+    if (s->want_mem != s->mem_on)
+        engine_set_mem(s, s->want_mem);
     sys_follow(s);
     size_follow(s);
     if (s->pm_stub && !s->pm_site && s->kcb && s->kcb->lazy_pc &&

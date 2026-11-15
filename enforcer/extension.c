@@ -62,9 +62,10 @@ static void publish(long value)
 
 /* Preferences -------------------------------------------------------- */
 
-/* Version 1 had only magic and mode; sys is then 0. */
+/* Version 1 had only magic and mode (sys is then 0); version 2 added sys
+   (mem is then 1). */
 typedef struct {
-    unsigned long magic, mode, sys;
+    unsigned long magic, mode, sys, mem;
 } Prefs;
 
 static OSErr prefs_spec(FSSpec *spec)
@@ -81,7 +82,7 @@ static OSErr prefs_spec(FSSpec *spec)
 
 static Prefs load_prefs(void)
 {
-    static const Prefs defaults = {kEnforcerPrefsMagic, kModeEnforce, 0};
+    static const Prefs defaults = {kEnforcerPrefsMagic, kModeEnforce, 0, 1};
     FSSpec spec;
     int16_t ref;
     Prefs p = defaults;
@@ -90,21 +91,27 @@ static Prefs load_prefs(void)
         return defaults;
     OSErr err = FSRead(ref, &n, &p);
     FSClose(ref);
-    if (err == eofErr && n == 8)
+    if (err == eofErr && n == 8) {
         p.sys = 0;
-    else if (err || n != sizeof p)
+        p.mem = 1;
+    } else if (err == eofErr && n == 12) {
+        p.mem = 1;
+    } else if (err || n != sizeof p) {
         return defaults;
+    }
     if (p.magic != kEnforcerPrefsMagic || p.mode > kModeEnforce)
         return defaults;
     p.sys = p.sys != 0;
+    p.mem = p.mem != 0;
     return p;
 }
 
-static void save_prefs(unsigned long mode, unsigned long sys)
+static void save_prefs(unsigned long mode, unsigned long sys,
+                       unsigned long mem)
 {
     FSSpec spec;
     int16_t ref;
-    Prefs p = {kEnforcerPrefsMagic, mode, sys};
+    Prefs p = {kEnforcerPrefsMagic, mode, sys, mem};
     LONGINT n = sizeof p;
     if (prefs_spec(&spec))
         return;
@@ -255,10 +262,12 @@ int main(void)
     if (prefs.sys)
         engine_set_sys(s, 1);
     s->want_sys = prefs.sys;
+    engine_set_mem(s, prefs.mem);
     publish((long)s);
 
     unsigned long last_poll = TickCount(), shown = 0, stops_shown = 0;
     unsigned long saved_mode = prefs.mode, saved_sys = prefs.sys;
+    unsigned long saved_mem = prefs.mem;
     /* The last blocked write told about: code that keeps writing (a VBL
        task) is told about once a minute. */
     char blocked_w[16] = "", blocked_t[16] = "";
@@ -271,10 +280,12 @@ int main(void)
         unsigned long now = TickCount();
         if (now - last_poll >= kPollTicks) {
             engine_poll(s);
-            if (s->mode != saved_mode || s->sys_on != saved_sys) {
+            if (s->mode != saved_mode || s->sys_on != saved_sys ||
+                s->mem_on != saved_mem) {
                 saved_mode = s->mode;
                 saved_sys = s->sys_on;
-                save_prefs(saved_mode, saved_sys);
+                saved_mem = s->mem_on;
+                save_prefs(saved_mode, saved_sys, saved_mem);
             }
             last_poll = now;
         }

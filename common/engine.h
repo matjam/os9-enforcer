@@ -554,6 +554,10 @@ typedef struct {
     unsigned long size_site;
     unsigned long *size_stub;
     unsigned long size_mapped, size_cap, size_raised, size_from, size_to;
+    /* Memory sizes (launch sizes and overflow) are on while mem_on is 1,
+       the default, and protection is on. A control panel sets want_mem;
+       engine_poll applies it. */
+    volatile unsigned long mem_on, want_mem;
 } State;
 
 enum { kSizeFactor = 4, kSizeShare = 4 };
@@ -573,6 +577,8 @@ void engine_set_mode(State *s, unsigned long mode);
 /* Start or stop watching the system heap now (event loop only). Starting
    can fail (no free domain or no memory); sys_on says what happened. */
 void engine_set_sys(State *s, int on);
+/* Turn launch sizes and overflow on or off (State.mem_on). */
+void engine_set_mem(State *s, int on);
 
 /* Stop protecting, remove the timer and the fallback handler, and remove
    the hooks if this engine installed them. The state stays allocated. */

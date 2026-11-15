@@ -11,11 +11,13 @@
  *     enforce, off is log only;
  *   - "Also log writes into the system heap": the system heap watch (log
  *     only), available with the patched NanoKernel;
+ *   - "Give applications more memory than Get Info sets": launch sizes
+ *     and overflow (engine.h);
  *   - the last stores it caught, newest first;
  *   - counters, updated every second, and whether the NanoKernel's owner
  *     check is on.
- * A change sets the state's want_mode or want_sys; the extension applies
- * it within half a second and saves it in its preferences.
+ * A change sets the state's want_mode, want_sys or want_mem; the extension
+ * applies it within half a second and saves it in its preferences.
  */
 
 #include <string.h>
@@ -38,16 +40,17 @@ enum { kFileClose = 1, kFileQuit = 3 };
 enum { kRefreshTicks = 30, kShownOffenses = 6 };
 
 /* Window layout, in window coordinates. */
-static const Rect kWindowRect = {60, 100, 394, 540};
+static const Rect kWindowRect = {60, 100, 416, 540};
 static const Rect kStatusRect = {6, 14, 28, 426};
 static const Rect kProtectRect = {34, 14, 52, 426};
 static const Rect kStopRect = {56, 30, 74, 426};
 static const Rect kSysRect = {78, 30, 96, 426};
-static const Rect kListRect = {124, 14, 286, 426};
-static const Rect kFooterRect = {292, 14, 330, 426};
+static const Rect kMemRect = {100, 30, 118, 426};
+static const Rect kListRect = {146, 14, 308, 426};
+static const Rect kFooterRect = {314, 14, 352, 426};
 
 static WindowPtr g_win;
-static ControlHandle g_protect, g_stop, g_sys;
+static ControlHandle g_protect, g_stop, g_sys, g_mem;
 static Boolean g_quit;
 static Boolean g_stop_pref = true; /* the stop box, while protection is off */
 
@@ -167,10 +170,12 @@ static void sync_controls(const Engine *e)
         HiliteControl(g_protect, 255);
         HiliteControl(g_stop, 255);
         HiliteControl(g_sys, 255);
+        HiliteControl(g_mem, 255);
         if (e->kind != kRunning) {
             SetControlValue(g_protect, 0);
             SetControlValue(g_stop, 0);
             SetControlValue(g_sys, 0);
+            SetControlValue(g_mem, 0);
         }
         return;
     }
@@ -182,6 +187,9 @@ static void sync_controls(const Engine *e)
     HiliteControl(g_stop, m == kModeOff ? 255 : 0);
     /* The system heap watch needs the patched NanoKernel. */
     HiliteControl(g_sys, m == kModeOff || !e->s->kcb ? 255 : 0);
+    /* Memory sizes need the temporary memory pools, which need the same. */
+    SetControlValue(g_mem, e->s->want_mem != 0);
+    HiliteControl(g_mem, m == kModeOff || !e->s->pool ? 255 : 0);
 }
 
 /* Drawing ------------------------------------------------------------ */
@@ -327,6 +335,8 @@ static void click_content(Point where)
         g_stop_pref = m == kModeEnforce;
     } else if (c == g_sys && m != kModeOff && e.s->kcb) {
         e.s->want_sys = !e.s->want_sys;
+    } else if (c == g_mem && m != kModeOff && e.s->pool) {
+        e.s->want_mem = !e.s->want_mem;
     }
     e.s->want_mode = m;
     sync_controls(&e);
@@ -411,6 +421,10 @@ int main(void)
     g_sys = NewControl(g_win, &kSysRect,
                        pstr(s, "Also log writes into the system heap"), true,
                        0, 0, 1, checkBoxProc, 0);
+    g_mem = NewControl(g_win, &kMemRect,
+                       pstr(s, "Give applications more memory than Get "
+                               "Info sets"),
+                       true, 0, 0, 1, checkBoxProc, 0);
 
     unsigned long last = 0, signature = 0;
     EventRecord ev;
@@ -470,7 +484,8 @@ int main(void)
             unsigned long sig = e.kind ^ e.value;
             if (e.s)
                 sig ^= e.s->mode << 4 ^ e.s->want_mode << 6 ^
-                       e.s->want_sys << 7 ^ e.s->n_offenses << 8 ^
+                       e.s->want_sys << 7 ^ e.s->want_mem << 3 ^
+                       e.s->n_offenses << 8 ^
                        engine_live_domains(e.s) << 20;
             SetPort(g_win);
             if (sig != signature) {
