@@ -13,7 +13,13 @@ learned on the way.
   `~/.local/opt/qemu-os9` (`toolchain/build.sh`, `qemu/build.sh`). Nothing
   here is for another project, and other projects keep their own.
 - Commit each working step to `main`. The remote, `origin`, is the
-  private GitHub repository matjam/os9-enforcer.
+  GitHub repository matjam/os9-enforcer.
+- To have a change appear in the next release's changelog, start its
+  commit subject with a Conventional Commits type: `feat:` (a new
+  feature; raises the minor version), `fix:` (a fix; raises the patch
+  version), or `feat!:` / `fix!:` for a change users must act on. Other
+  commits (`docs:`, `chore:`, or no type) are not listed and do not
+  cause a release. See "Releases".
 - Commit only our own sources, scripts and patches. Apple's files stay out
   of git: `kernel/stock/` and `kernel/build/` are ignored, and the
   installer carries only the bytes that differ from the stock kernel
@@ -21,6 +27,33 @@ learned on the way.
 - Write docs instruction first ("To X, use Y"), in plain technical prose.
 - When a hole is fixed or found, update both the Known holes list here and
   the Limits section of `README.md`.
+
+## Releases
+
+release-please makes the releases (`.github/workflows/release.yml`,
+`release-please-config.json`, `.release-please-manifest.json`). The
+action is pinned to a commit.
+
+- On each push to `main`, the workflow opens or updates a pull request
+  "chore(main): release X.Y.Z" when there are `feat:` or `fix:` commits
+  since the last release. It changes `version.txt`, `CHANGELOG.md` and
+  the manifest.
+- To release, merge that pull request. The workflow then makes the tag
+  `vX.Y.Z` and the GitHub release, builds Enforcer, and adds
+  `Enforcer-X.Y.Z.sit.hqx` to the release.
+- To make the release file by hand, run `tools/make-dist.sh` and then
+  `tools/make-release.py [VERSION]`. It writes
+  `dist/Enforcer-VERSION.sit.hqx`: a StuffIt 1.5.1 archive (nothing
+  compressed) in BinHex 4.0, written by the script itself, with no
+  StuffIt software on the host. StuffIt Expander 5.5 on the test machine
+  expands it to the folder "Enforcer VERSION" with Enforcer Installer,
+  Enforcer Extension, Enforcer, Read Me (`README.md` as plain text) and
+  License. The archive's creator is `SITx` (StuffIt Expander): with
+  `SIT!` the Finder asks for DropStuff on a double-click (seen; the
+  double-click with `SITx` was not tried again).
+- To check the file on the test machine, push it with `tools/push.sh`
+  (hcopy decodes the BinHex), drag the `.sit` to the desktop (the pushed
+  disc is locked) and open it.
 
 ## Source layout
 

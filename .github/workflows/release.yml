@@ -1,0 +1,73 @@
+# Releases, with release-please. On every push to main it opens or updates
+# the release pull request (the next version in version.txt and the
+# changelog, from the Conventional Commits since the last release). Merging
+# that pull request makes the tag and the GitHub release, and the package
+# job then builds Enforcer and adds Enforcer-VERSION.sit.hqx to the
+# release (tools/make-release.py).
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-24.04
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      # Pinned to a commit: main on 2026-05-28, after v5.0.0.
+      - uses: googleapis/release-please-action@0b6b3fc0186a2f7118bfd88fab9ea481e1839504
+        id: release
+
+  package:
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      # As in build.yml.
+      - name: Install packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build g++ libgmp-dev \
+            libmpfr-dev libmpc-dev libboost-all-dev bison flex texinfo ruby
+
+      - name: Restore the toolchain
+        id: cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/.local/opt/retro68
+          key: retro68-ppc-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('toolchain/build.sh') }}
+
+      - name: Build the toolchain
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: toolchain/build.sh
+
+      - name: Save the toolchain
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ~/.local/opt/retro68
+          key: ${{ steps.cache.outputs.cache-primary-key }}
+
+      - name: Build the programs
+        run: ./build.sh
+
+      - name: Collect Enforcer
+        run: tools/make-dist.sh
+
+      - name: Make the release file
+        run: tools/make-release.py
+
+      - name: Add it to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+        run: gh release upload "$TAG" dist/Enforcer-*.sit.hqx --clobber

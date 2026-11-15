@@ -96,6 +96,19 @@ from each other. Enforcer adds that.
   2.28). Enforcer Installer checks the file and refuses any other.
 - Virtual memory can be on or off.
 
+## Download
+
+1. Download `Enforcer-VERSION.sit.hqx` from the
+   [latest release](https://github.com/matjam/os9-enforcer/releases/latest)
+   and copy it to the Mac.
+2. Drop the file on StuffIt Expander, which a Mac OS 9 installation
+   includes. It makes the folder
+   "Enforcer VERSION", with Enforcer Installer, Enforcer Extension, the
+   Enforcer control panel, Read Me and License.
+
+The file is text (BinHex), so you can transfer it by any means: a web
+browser, FTP, or a disk from another kind of computer.
+
 ## Install
 
 1. Open Enforcer Installer and click Install.
