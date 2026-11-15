@@ -7,6 +7,33 @@ Mac OS kernel, an extension and a control panel.
 Enforcer has been tested only on QEMU's `mac99` machine, not on real
 hardware.
 
+## AI use disclosure
+
+Enforcer was written almost entirely with AI (Anthropic's Claude),
+working under my direction. I am not doing all of this by hand: that
+would be crazy. Mac OS 9's internals are ancient, mostly undocumented,
+and hardly anyone remembers how they work, so the kernel patches come
+from reading disassembly and reconstructed NanoKernel sources, and then
+testing until things held up.
+
+Does it work? It seems to. Every feature here was tested in an emulator
+(QEMU), with test programs written to misbehave on purpose and with the
+applications that come with Mac OS 9.2.2. What has not happened yet:
+
+- It has not run on a real Mac.
+- It has not been used day to day for any length of time.
+- No third-party extension or application has been tried with it.
+
+So yes, it is vibecoded, or whatever other name you like. I am fine with
+that as long as it works and breaks nothing. But it patches the kernel
+of your operating system, so treat it accordingly: back up first, and
+keep a Mac OS 9 CD at hand in case the Mac does not start up (see
+Remove). It may eat your dog, copy your homework or burn your house
+down. No warranty; see `LICENSE`.
+
+If you try it on real hardware, I would like to hear how it went, good
+or bad: please open an issue.
+
 ## Why
 
 Mac OS 9 has three limits that later systems removed. Enforcer addresses
