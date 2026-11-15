@@ -83,6 +83,9 @@
  *      makes memory that outlives the current application: the handle
  *      must be the Process Manager's, not in one of this application's
  *      chunks (issue 1).
+ *   A  draw an Appearance scroll bar with a thumb. The first thumb of a
+ *      boot makes the theme keep its image in temporary memory, made in
+ *      system mode; quit, launch again and A: the thumb must be clean.
  */
 
 #include <stdio.h>
@@ -608,7 +611,8 @@ int main(void)
                "owner table, X make the Enforcer Extension quit "
                "as in a crash, Z run 5 s without yielding, C/U the same "
                "in a native/68k callback, H 20 s in a 68k callback, G "
-               "temporary memory in system mode, q quit; then Return\n");
+               "temporary memory in system mode, A draw a scroll bar, q "
+               "quit; then Return\n");
         int ch = getchar();
         while (ch != '\n' && getchar() != '\n')
             ;
@@ -1044,6 +1048,46 @@ int main(void)
             if (sys)
                 DisposeHandle(sys);
             pool_report();
+            continue;
+        }
+        case 'A': {
+            /* An Appearance scroll bar with a thumb, in a window of this
+               application's, shown for 3 s. The first thumb drawn in a
+               boot makes the theme keep its image in temporary memory,
+               for every application after (issue 1). Prints the
+               TempNewHandle calls taken into chunks, and passed on in
+               system mode, while it draws. */
+            static const unsigned char title[] = {8, 'S', 'c', 'r', 'i',
+                                                  'b', 'b', 'l', 'e'};
+            static const unsigned char none[] = {0};
+            State *s = engine_state();
+            unsigned long n0 = s ? s->pc.news : 0;
+            unsigned long y0 = s ? s->pc.system : 0;
+            Rect wr = {80, 80, 280, 200};
+            WindowPtr w = NewCWindow(0, &wr, title, true, documentProc,
+                                     (WindowPtr)-1, false, 0);
+            if (!w) {
+                printf("NewCWindow failed\n");
+                continue;
+            }
+            GrafPtr old;
+            GetPort(&old);
+            SetPort(w);
+            Rect cr = {-1, 105, 186, 121};
+            ControlHandle c = NewControl(w, &cr, none, true, 30, 0, 100,
+                                         scrollBarProc, 0);
+            if (c)
+                Draw1Control(c);
+            s = engine_state();
+            printf("scroll bar %s; TempNewHandle into chunks %lu, passed "
+                   "on in system mode %lu\n",
+                   c ? "drawn" : "not made", s ? s->pc.news - n0 : 0,
+                   s ? s->pc.system - y0 : 0);
+            unsigned long t = TickCount();
+            while (TickCount() - t < 180)
+                ;
+            DisposeWindow(w);
+            SetPort(old);
             continue;
         }
         case 'M': {

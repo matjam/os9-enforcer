@@ -136,6 +136,7 @@ allowed store changes nothing.
 | `U` | the same loop in a callback called from 68k code | not preempted: every check "chain not ending at the base" |
 | `H` | `U` for 20 s; press Command-Option-Escape during it | Force Quit comes up, and Cancel or Force Quit works before the 20 s end |
 | `G` | `TempNewHandle` in system mode (`BeginSystemMode`) | PASS: the handle is the Process Manager's, not in a chunk |
+| `A` | draw an Appearance scroll bar with a thumb for 3 s; first in a fresh boot, then again after `q`, a launch and `m` | the first passes 1 request on in system mode (the theme's thumb image); the second thumb is the same as the first |
 
 `Y`, `V` and `D` flip the word, read it back and restore it, and print
 whether the store landed.
