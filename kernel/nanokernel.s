@@ -32,6 +32,19 @@ kernel:
         .set    SAA_pageloop, kernel + 0x10B68  # MPSetAreaAccess: @pageloop
         .set    SAA_done, kernel + 0x10BFC      # after the loop: unlock, return
         .set    GetPTEFromPLE, kernel + 0x124F8 # r30 PLE -> r16/r17 PTE, r18 &PTE
+        .set    PF1_paged, kernel + 0x4D78      # PagingFunc1 @_154 + 4
+        .set    PF1_paged_rest, kernel + 0x4DB8 # its PLE is not "present, no PTE"
+        .set    PF1_build, kernel + 0x4E28      # @_208: hash, build the PTE
+        .set    PF1_list, kernel + 0x4F98       # @_368 + 0x10, after its lwz r31
+        .set    PF1_list_rest, kernel + 0x4FD0
+        .set    FindAreaAbove, kernel + 0x103EC # r8 space, r9 address -> r8
+                                                # area; uses r16, r17
+        .set    SpaceGetPagePLE, kernel + 0x1242C # r8 address, r31 area -> r30
+                                                # &PLE, cr0.eq none; r16-r18
+        .set    InvalPTE, kernel + 0x12528      # r8 page, r16/r17 PTE, r18
+                                                # &PTE, r30 &PLE; uses r14
+        .set    DeletePTE, kernel + 0x12590     # r17 PTE lower, r18 &PTE, r30
+                                                # &PLE; uses r14, r16
 
 # Kernel structures.
         .set    EWA_CoherenceGroup, -0x338      # EWA.CPUBase + CPU.LLL.Freeform
@@ -49,6 +62,14 @@ kernel:
         .set    EWA_SavedR19, -0x0CC
         .set    EWA_SavedCR, -0x0C8
         .set    KDP_HTABLock, -0xB90            # PSA.HTABLock
+        .set    KDP_PageAttributeInit, 0x688    # a new PTE's lower word
+        .set    KDP_HTABORG, 0x6A4
+        .set    EWA_PA_CurAddressSpace, -0x01C  # physical
+        .set    Space_SRs, 0x030                # AddressSpace.SRs[16]
+        .set    Area_Flags, 0x020               # 0x8000: contiguous, no PLEs
+        .set    Area_LogicalBase, 0x024
+        .set    Area_LogicalEnd, 0x028          # its last byte
+        .set    PLE_InHTAB, 0x800               # bits 0-19 then index the PTE
         .set    FLAG_EMU, 0x0080                # EWA.kFlagEmu (bit 8), oris
         .set    FLAG_BLUE, 0x0020               # EWA.kFlagBlue (bit 10), oris
         .set    FLAG_SIGP, 0x8000               # EWA.kFlagSIGP (bit 16), ori
@@ -65,8 +86,8 @@ kernel:
 # registers with MP call 109, by its physical address. Keep common/kcb.h in
 # step.
         .set    CB_MAGIC, 0x000                 # 'ENFK'
-        .set    CB_VERSION, 0x004               # 4
-        .set    VERSION, 4                      # the layout below
+        .set    CB_VERSION, 0x004               # 5
+        .set    VERSION, 5                      # the layout below
         .set    CB_MODE, 0x008                  # MODE_*
         .set    CB_CURRENT, 0x00C               # the current application's owner
         .set    CB_ENTRIES, 0x010               # pages the owner table covers
@@ -86,6 +107,12 @@ kernel:
         .set    CB_DENY_68K, 0x044              # the same for a 68k store
         .set    CB_TABLES, 0x04C                # stores into the tables,
                                                 # dropped
+        .set    CB_SPACES, 0x050                # 1: a VSID for each
+                                                # application (patch 5)
+        .set    CB_REBUILT, 0x054               # PTEs built again for
+                                                # another VSID
+        .set    CB_VSWITCH, 0x058               # VSID switches (OP_SWITCH)
+        .set    CB_LAZY, 0x05C                  # VSID switches at a store
         .set    CB_PAGES, 0x100                 # owner table pages, physical
                                                 # (128 of them: 2 GB)
         .set    CB_RING, 0x300                  # RING_N events of 32 bytes
@@ -109,11 +136,17 @@ kernel:
         .set    MODE_ENFORCE, 2
         .set    OWNER_SYSTEM, 1                 # 0 none,
         .set    OWNER_TABLES, 2                 # the block and its table,
-        .set    OWNER_APP, 3                    # 3 and up applications
+        .set    OWNER_APP, 3                    # 3 and up applications;
+        .set    OWNER_CODE, 0x80                # with this, its code only
         .set    MP_ENFORCER, 109                # an unused MP call
         .set    OP_OWNERS, 1                    # its operations (r3)
         .set    OP_MODE, 2
         .set    OP_CURRENT, 3
+        .set    OP_SPACES, 4
+        .set    OP_SWITCH, 5
+        .set    OP_FLUSH, 6
+        .set    VSID_APP, 0xFFF00               # application VSIDs: segment
+                                                # << 20 | VSID_APP + owner
         .set    CTX_R6, 0x134                   # ContextBlock.r6 and .r7: an
         .set    CTX_R7, 0x13C                   # MP call's 4th and 5th arguments
 
@@ -121,6 +154,15 @@ kernel:
 
         stock   0x3630                          # MemRetryDSI, read-only page
         b       task_write                      # was: beq cr7,MRD_fault
+
+        stock   0x4D74                          # PagingFunc1 @_154 (patch 5)
+        b       pf1_paged                       # was: lwz r31,0x688(r1)
+        stock   0x4DB4                          # a PTE to build
+        b       pf1_paged_pp                    # was: beq @_208
+        stock   0x4F94                          # @_368, page-list PMDTs
+        b       pf1_list                        # was: lwz r31,0x688(r1)
+        stock   0x4FCC
+        b       pf1_list_pp                     # was: beq @_208
 
         stock   0x5EC8                          # FDP_06c0, after its stwcx.
         b       stwcx_probe                     # was: isync
@@ -300,6 +342,8 @@ cpup_keep_writable:
 
 task_write:
         beq     cr7, 1f                         # read-only page
+        bl      ro_by_owner                     # or read-only in this VSID
+        beq     cr6, 1f                         # (patch 5)
         b       MRD_next
 1:      mfsprg  29, 0                           # EWA
         lwz     28, EWA_SavedR16(29)            # the flags
@@ -337,11 +381,29 @@ check:  lwz     9, CB_APPLZONE(31)              # who is current: the owner
         lhz     9, 2(9)
         rlwimi  9, 8, 16, 0, 15
         mr      8, 9
-        bl      owner_of
-        cmplwi  8, OWNER_APP
+        bl      code_of                         # its first page can be
+        cmplwi  8, OWNER_APP                    # OWNER_CODE's
         bge     1f
         li      8, 0                            # not an application's
 1:      stw     8, CB_CURRENT(31)
+        lwz     9, CB_SPACES(31)                # patch 5: the blue task's
+        cmpwi   9, 0                            # VSIDs follow ApplZone; a
+        beq     2f                              # switch the hook did not
+        andis.  9, 28, FLAG_BLUE                # see is made here, and the
+        beq     2f                              # store runs again
+        lwz     9, vsid_mask - tw_base(26)
+        rlwinm  16, 27, 4, 28, 31               # the store's segment
+        srw     9, 9, 16
+        andi.   9, 9, 1
+        beq     2f                              # no application VSIDs there
+        mfsrin  9, 27
+        bl      vsid_owner
+        cmpw    8, 9
+        beq     2f
+        bl      space_switch
+        li      8, CB_LAZY
+        bl      count
+        b       retry
 2:      mr      8, 27                           # the page's owner
         bl      owner_of
         mr.     18, 8
@@ -363,7 +425,7 @@ check:  lwz     9, CB_APPLZONE(31)              # who is current: the owner
         blt     5f
         lwz     8, EWA_R24(29)
         addi    8, 8, -2
-4:      bl      owner_of
+4:      bl      code_of
 5:      cmpwi   8, 0
         bne     6f
         li      8, OWNER_SYSTEM                 # nobody's: the system's
@@ -452,7 +514,14 @@ record: lwz     9, CB_SEQ(31)
         stw     17, 4(8)
         li      8, CB_DENIED
         bl      count
-        b       fault
+        lwz     9, 0(30)                        # patch 5: a page read-only
+        rlwinm  8, 9, 0, 29, 30                 # by owner only gets a
+        cmpwi   8, 4                            # read-only PLE (PLE & 6 = 4),
+        beq     fault                           # so that the fault reads as
+        rlwinm  9, 9, 0, 31, 28                 # a write-protect fault to the
+        ori     9, 9, 4                         # VM Manager, which otherwise
+        stw     9, 0(30)                        # retries the store; the
+        b       fault                           # engine opens it again
 6:      andi.   9, 16, EVF_SKIPPED
         beq     7f
         li      8, CB_SKIPPED
@@ -532,7 +601,11 @@ count:  lwzx    9, 31, 8
         blr
 
 # owner_of: r8 an address -> r8 its page's owner, from the table of the
-# control block at r31 (0 past the table's end). Uses r9.
+# control block at r31 (0 past the table's end). A byte with OWNER_CODE
+# marks a page where an application's code lies but which is not its
+# memory (the partly used first page of a partition, code outside it):
+# owner_of gives 0 for it, and code_of gives the application, for the
+# owner of a store's code and of ApplZone. Use r9 and cr0.
 owner_of:
         srwi    8, 8, 12                        # the page number
         lwz     9, CB_ENTRIES(31)
@@ -543,8 +616,344 @@ owner_of:
         lwzx    9, 31, 9                        # that table page, physical
         rlwinm  8, 8, 0, 20, 31                 # page & 0xFFF
         lbzx    8, 9, 8
+        rlwinm  9, 8, 25, 31, 31                # OWNER_CODE: 1
+        addi    9, 9, -1                        # then 0, else all ones
+        and     8, 8, 9
         blr
 1:      li      8, 0
+        blr
+
+code_of:
+        srwi    8, 8, 12
+        lwz     9, CB_ENTRIES(31)
+        cmplw   8, 9
+        bge     1f
+        rlwinm  9, 8, 22, 10, 29
+        addi    9, 9, CB_PAGES
+        lwzx    9, 31, 9
+        rlwinm  8, 8, 0, 20, 31
+        lbzx    8, 9, 8
+        clrlwi  8, 8, 25                        # without OWNER_CODE
+        blr
+1:      li      8, 0
+        blr
+
+# Patch 5: a VSID for each application.
+#
+# Every application runs in the blue task, in the system's address space.
+# With OP_SPACES on, that space's segment registers for the segments in
+# vsid_mask (those holding the Process Manager's heap, where partitions and
+# temporary memory lie) carry the current application's own VSIDs: segment
+# << 20 | VSID_APP + its owner byte. OP_SWITCH, from the hook in the
+# Process Manager's switch, writes them into the AddressSpace and loads
+# them; the scheduler loads them from there after another space ran, and
+# MP tasks, which share the space, see the same. A store that finds the
+# VSIDs behind ApplZone switches them itself (CB_LAZY, in task_write).
+#
+# A page keeps one PTE: its PLE records one HTAB slot, and the kernel's VM
+# and area code relies on that. When the PTE was built for another VSID,
+# PagingFunc1 now drops it (InvalPTE folds its R and C bits into the PLE,
+# DeletePTE points the PLE at the page again) and builds one for this VSID
+# (CB_REBUILT). A PTE for a page another application owns is read-only for
+# every key (PP 11; the kernel retries a user store in supervisor mode
+# when only PP 01 stops it); otherwise PP comes from the PLE as before. So
+# a switch re-protects nothing: each page touched after a switch is built
+# again once, in the kernel, and an application's own pages are writable
+# in its VSID.
+#
+# A store into a page that is read-only by owner (its PLE says read/write)
+# comes to task_write like one into a write-protected page (ro_by_owner),
+# and is decided the same way. When it is denied, the PLE is made
+# read-only too (record): with virtual memory on, the 68k emulator asks the
+# VM Manager about a write fault first, and it retries a store into a page
+# its PLE says is writable, forever. The engine makes the PLE writable
+# again when it takes the event. A page whose owner byte changes loses its
+# PTE (OP_OWNERS), so its next access builds it for the new owner.
+
+pf1_paged:
+        bl      vsid_fix
+        lwz     31, KDP_PageAttributeInit(1)    # as at the site
+        b       PF1_paged
+pf1_list:
+        bl      vsid_fix
+        lwz     31, KDP_PageAttributeInit(1)
+        b       PF1_list
+pf1_paged_pp:
+        bne     1f                              # as at the site: build only
+        bl      pp_owner                        # for "present, no PTE"
+        b       PF1_build
+1:      b       PF1_paged_rest
+pf1_list_pp:
+        bne     1f
+        bl      pp_owner
+        b       PF1_build
+1:      b       PF1_list_rest
+
+# vsid_fix: at PagingFunc1's PLE (r26 &PLE, r28 the PLE, r27 the address),
+# when the PLE's PTE has another VSID than this segment's, drop the PTE
+# and reload r28. Keeps r8, r9, r26, r27; uses r14-r22, r30, cr0, cr5-7.
+vsid_fix:
+        andi.   14, 28, PLE_InHTAB
+        beqlr                                   # no PTE
+        lwz     15, KDP_HTABORG(1)
+        rlwinm  16, 28, 23, 9, 28               # its offset, as GetPTEFromPLE
+        lwzx    16, 15, 16                      # its upper word
+        mfsrin  17, 27
+        rlwinm  16, 16, 25, 8, 31               # its VSID
+        clrlwi  17, 17, 8                       # this segment's
+        cmpw    16, 17
+        beqlr
+        mflr    22
+        mr      20, 8
+        mr      21, 9
+        mr      30, 26
+        bl      GetPTEFromPLE                   # r16/r17, r18; uses r19
+        rlwinm  8, 27, 0, 0, 19
+        bl      InvalPTE                        # its R and C into the PLE
+        bl      DeletePTE                       # the PLE points at the page
+        lwz     28, 0(26)
+        bl      1f
+1:      mflr    15
+        lwz     14, enf_cb - 1b(15)
+        cmpwi   14, 0
+        beq     2f
+        lwz     15, CB_REBUILT(14)
+        addi    15, 15, 1
+        stw     15, CB_REBUILT(14)
+2:      mr      8, 20
+        mr      9, 21
+        mtlr    22
+        blr
+
+# pp_owner: before PagingFunc1 builds the PTE for address r27 with lower
+# word r31, set PP 11 when application VSIDs are on in its segment and an
+# application owns the page that is not this VSID's. Keeps r26-r28; uses
+# r8, r9, r14-r16, r22, cr0, cr1.
+pp_owner:
+        mflr    22
+        bl      1f
+1:      mflr    14
+        lwz     15, vsid_mask - 1b(14)
+        lwz     14, enf_cb - 1b(14)
+        cmpwi   14, 0
+        beq     9f                              # no block
+        lwz     16, CB_SPACES(14)
+        cmpwi   16, 0
+        beq     9f                              # no application VSIDs
+        rlwinm  16, 27, 4, 28, 31               # the segment
+        srw     16, 15, 16
+        andi.   16, 16, 1
+        beq     9f                              # none in this segment
+        mr      16, 31
+        mr      31, 14
+        mr      8, 27
+        bl      owner_of                        # uses r9
+        mr      31, 16
+        cmplwi  8, OWNER_APP
+        blt     9f                              # not an application's page
+        mfsrin  9, 27
+        bl      vsid_owner
+        cmpw    8, 9
+        beq     9f                              # this VSID's application's
+        ori     31, 31, 3                       # PP 11: read-only
+9:      mtlr    22
+        blr
+
+# vsid_owner: r9 a segment register's value -> r9 the owner byte whose
+# application VSID it holds, or 0. Uses cr1.
+vsid_owner:
+        clrlwi  9, 9, 12                        # the VSID's low 20 bits
+        addis   9, 9, -0x10                     # - VSID_APP
+        addi    9, 9, 0x100
+        cmpwi   cr1, 9, 0
+        bgelr   cr1
+        li      9, 0                            # a kernel space's
+        blr
+
+# ro_by_owner: at task_write's site (r27 the address), cr6.eq when the page
+# is read-only in this VSID because another application owns it. Keeps
+# cr0, r16, r27, r31; uses r8, r9, r17, r18, r26, r28, r29, cr1, LR.
+ro_by_owner:
+        mfcr    29
+        mflr    28
+        li      18, 0                           # not read-only by owner
+        bl      1f
+1:      mflr    17
+        lwz     9, vsid_mask - 1b(17)
+        lwz     17, enf_cb - 1b(17)
+        cmpwi   cr1, 17, 0
+        beq     cr1, 9f
+        lwz     8, CB_SPACES(17)
+        cmpwi   cr1, 8, 0
+        beq     cr1, 9f
+        rlwinm  8, 27, 4, 28, 31
+        srw     9, 9, 8
+        andi.   9, 9, 1
+        beq     9f
+        mr      26, 31
+        mr      31, 17
+        mr      8, 27
+        bl      owner_of
+        mr      31, 26
+        cmplwi  cr1, 8, OWNER_APP
+        blt     cr1, 9f
+        mfsrin  9, 27
+        bl      vsid_owner
+        cmpw    cr1, 8, 9
+        beq     cr1, 9f
+        li      18, 1
+9:      mtcrf   0x80, 29                        # cr0 as it was
+        cmpwi   cr6, 18, 1
+        mtlr    28
+        blr
+
+# space_switch: give the system space, the blue task's, the VSIDs of
+# application r8 (0: the system's own) in the segments of vsid_mask, and
+# load them when it is the current space. Keeps r8; uses r9, r16-r19,
+# cr0, cr1.
+space_switch:
+        mflr    19
+        bl      1f
+1:      mflr    17
+        mtlr    19
+        lwz     16, sys_space - 1b(17)
+        cmpwi   16, 0
+        beqlr                                   # never turned on
+        lwz     9, vsid_mask - 1b(17)
+        stw     8, vsid_cur - 1b(17)
+        mfsprg  18, 0
+        lwz     18, EWA_PA_CurAddressSpace(18)
+        cmpw    cr1, 18, 16                     # is it loaded?
+        li      17, 0
+        cmpwi   8, 0
+        beq     2f
+        lis     17, VSID_APP >> 16
+        ori     17, 17, VSID_APP & 0xFFFF
+        add     17, 17, 8                       # VSID_APP + owner
+2:      oris    17, 17, 0x2000                  # Kp 1, Ks 0, as the kernel's
+        addi    16, 16, Space_SRs
+        li      19, 0                           # the segment
+3:      andi.   18, 9, 1
+        beq     4f
+        rlwinm  18, 19, 20, 8, 11               # segment << 20
+        or      18, 18, 17
+        stw     18, 0(16)
+4:      srwi    9, 9, 1
+        addi    16, 16, 4
+        addi    19, 19, 1
+        cmpwi   19, 16
+        blt     3b
+        bnelr   cr1                             # loaded at its next switch
+        addi    16, 16, -64
+        isync
+        lwz     17, 0(16)
+        lwz     18, 4(16)
+        mtsr    0, 17
+        mtsr    1, 18
+        lwz     17, 8(16)
+        lwz     18, 12(16)
+        mtsr    2, 17
+        mtsr    3, 18
+        lwz     17, 16(16)
+        lwz     18, 20(16)
+        mtsr    4, 17
+        mtsr    5, 18
+        lwz     17, 24(16)
+        lwz     18, 28(16)
+        mtsr    6, 17
+        mtsr    7, 18
+        lwz     17, 32(16)
+        lwz     18, 36(16)
+        mtsr    8, 17
+        mtsr    9, 18
+        lwz     17, 40(16)
+        lwz     18, 44(16)
+        mtsr    10, 17
+        mtsr    11, 18
+        lwz     17, 48(16)
+        lwz     18, 52(16)
+        mtsr    12, 17
+        mtsr    13, 18
+        lwz     17, 56(16)
+        lwz     18, 60(16)
+        mtsr    14, 17
+        mtsr    15, 18
+        isync
+        blr
+
+# flush_page: drop the PTE of the page at r8, so that its next access
+# builds it again. The caller holds the HTAB lock. Keeps r22-r29, r31;
+# uses r8, r9, r14-r21, r30, cr0, cr1, cr5-7.
+flush_page:
+        mflr    20
+        mr      21, 31
+        mr      15, 8                           # the page
+        bl      1f
+1:      mflr    9
+        lwz     8, sys_space - 1b(9)
+        cmpwi   8, 0
+        bne     2f
+        mfsprg  8, 0                            # before OP_SPACES: the
+        lwz     8, EWA_PA_CurAddressSpace(8)    # caller's
+2:      mr      9, 15
+        bl      FindAreaAbove                   # uses r16, r17
+        lwz     16, Area_LogicalBase(8)
+        lwz     17, Area_LogicalEnd(8)
+        cmplw   15, 16
+        blt     8f                              # in no area
+        cmplw   15, 17
+        bgt     8f
+        lwz     17, Area_Flags(8)
+        andi.   17, 17, 0x8000
+        bne     8f                              # contiguous: no PLEs
+        mr      31, 8
+        mr      8, 15
+        bl      SpaceGetPagePLE                 # uses r16-r18
+        beq     8f
+        lwz     16, 0(30)
+        andi.   16, 16, PLE_InHTAB
+        beq     8f                              # no PTE
+        bl      GetPTEFromPLE
+        mr      8, 15
+        bl      InvalPTE
+        bl      DeletePTE
+8:      mr      31, 21
+        mtlr    20
+        blr
+
+# flush_owned: drop the PTE of every application page (owner 3 and up,
+# without OWNER_CODE) in the segments of vsid_mask. r31 the block; the caller holds the HTAB
+# lock. Uses r8, r9, r14-r22, r25, r27, r29, r30.
+flush_owned:
+        mflr    29
+        bl      1f
+1:      mflr    9
+        lwz     25, vsid_mask - 1b(9)
+        lwz     27, CB_ENTRIES(31)
+        li      22, 0                           # the page
+2:      cmplw   22, 27
+        bge     7f
+        srwi    9, 22, 16                       # its segment
+        srw     9, 25, 9
+        andi.   9, 9, 1
+        bne     3f
+        addis   22, 22, 1                       # on to the next segment
+        rlwinm  22, 22, 0, 0, 15
+        b       2b
+3:      rlwinm  9, 22, 22, 10, 29               # (page >> 12) * 4
+        addi    9, 9, CB_PAGES
+        lwzx    9, 31, 9                        # its table page
+        rlwinm  8, 22, 0, 20, 31
+        lbzx    8, 9, 8
+        cmplwi  8, OWNER_APP
+        blt     4f
+        cmplwi  8, OWNER_CODE
+        bge     4f                              # not its memory
+        slwi    8, 22, 12
+        bl      flush_page
+4:      addi    22, 22, 1
+        b       2b
+7:      mtlr    29
         blr
 
 # MP call 109 (patch 4): r3 the control block's physical address, page
@@ -552,13 +961,14 @@ owner_of:
 # operation (OP_*, below). Returns 0, or -50 (paramErr) for a block it
 # does not take. The kernel uses the block (16 KB, physically contiguous)
 # and the table pages it names with translation off, so they must stay
-# where they are while registered.
+# where they are while registered. Unregistering turns application VSIDs
+# off first (patch 5).
 #
 # At entry: r3-r5 the arguments, r6 the ContextBlock (the caller's r6 and
 # r7 at CTX_R6 and CTX_R7), r1 the KDP; r14-r31 and LR are free.
 enf_register:
         cmpwi   3, 0
-        beq     2f
+        beq     0f
         andi.   16, 3, 0xFFF
         bne     enf_op                          # not page aligned
         lwz     16, CB_MAGIC(3)
@@ -571,6 +981,16 @@ enf_register:
         beq     2f
 1:      li      3, -50
         b       MPReturn
+0:      bl      3f
+3:      mflr    16
+        lwz     31, enf_cb - 3b(16)
+        cmpwi   31, 0
+        beq     2f
+        lwz     9, CB_SPACES(31)
+        cmpwi   9, 0
+        beq     2f
+        bl      spaces_off
+        li      3, 0
 2:      bl      3f
 3:      mflr    16
         stw     3, enf_cb - 3b(16)
@@ -582,58 +1002,172 @@ enf_register:
 #   OP_OWNERS: r4 the first page, r5 the number of pages, r6 the owner
 #     byte to set, r7 the byte it replaces (-1: any but OWNER_TABLES, so
 #     that marking a range of the system heap leaves the tables'
-#     protection alone). Pages past the table's end are left out.
+#     protection alone). Pages past the table's end are left out. With
+#     application VSIDs on, a page whose byte changes loses its PTE.
 #   OP_MODE: r4 MODE_*.
 #   OP_CURRENT: r4 the current application's owner (used without
 #     CB_APPLZONE).
+#   OP_SPACES (patch 5): r4 1 to give applications VSIDs of their own in
+#     the segments of mask r5 (bit n: segment n; 0-5 only), 0 to stop.
+#   OP_SWITCH: r4 a zone (ApplZone): load the VSIDs of the application
+#     that owns it, or the system's.
+#   OP_FLUSH: r4 the first page, r5 the number of pages: drop their PTEs.
 enf_op:
         bl      1f
 1:      mflr    16
         lwz     31, enf_cb - 1b(16)
         cmpwi   31, 0
-        beq     9f                              # no block
+        beq     eo_bad                          # no block
         cmpwi   3, OP_MODE
-        bne     2f
+        beq     eo_mode
+        cmpwi   3, OP_CURRENT
+        beq     eo_current
+        cmpwi   3, OP_OWNERS
+        beq     eo_owners
+        cmpwi   3, OP_SPACES
+        beq     eo_spaces
+        cmpwi   3, OP_SWITCH
+        beq     eo_switch
+        cmpwi   3, OP_FLUSH
+        beq     eo_flush
+eo_bad: li      3, -50
+        b       MPReturn
+eo_ok:  li      3, 0
+        b       MPReturn
+
+eo_mode:
         cmplwi  4, MODE_ENFORCE
-        bgt     9f
+        bgt     eo_bad
         stw     4, CB_MODE(31)
-        b       8f
-2:      cmpwi   3, OP_CURRENT
-        bne     3f
+        b       eo_ok
+
+eo_current:
         stw     4, CB_CURRENT(31)
-        b       8f
-3:      cmpwi   3, OP_OWNERS
-        bne     9f
-        lwz     19, CTX_R6(6)                   # the owner byte
-        lwz     20, CTX_R7(6)                   # the byte it replaces, or -1
+        b       eo_ok
+
+eo_owners:
+        lwz     24, CTX_R6(6)                   # the owner byte
+        lwz     25, CTX_R7(6)                   # the byte it replaces, or -1
+        mr      22, 4                           # the page
+        mr      23, 5                           # pages left
         lwz     17, CB_ENTRIES(31)
-        cmplw   4, 17
-        bge     8f                              # past the table
-        subf    17, 4, 17                       # pages left in the table
-        cmplw   5, 17
-        ble     4f
-        mr      5, 17
-4:      cmpwi   5, 0
-        beq     8f
-5:      rlwinm  17, 4, 22, 10, 29               # (page >> 12) * 4
+        cmplw   22, 17
+        bge     eo_ok                           # past the table
+        subf    17, 22, 17                      # pages left in the table
+        cmplw   23, 17
+        ble     1f
+        mr      23, 17
+1:      cmpwi   23, 0
+        beq     eo_ok
+        lwz     26, CB_SPACES(31)
+        cmpwi   26, 0
+        beq     2f
+        addi    8, 1, KDP_HTABLock
+        bl      AcquireLock
+2:      rlwinm  17, 22, 22, 10, 29              # (page >> 12) * 4
         addi    17, 17, CB_PAGES
-        lwzx    17, 31, 17                      # that table page, physical
-        rlwinm  18, 4, 0, 20, 31                # page & 0xFFF
-        lbzx    21, 17, 18
-        cmpw    21, 20
-        beq     6f                              # the byte to replace
-        cmpwi   20, -1
-        bne     7f                              # not the byte to replace
-        cmpwi   21, OWNER_TABLES
-        beq     7f                              # any byte but the tables'
-6:      stbx    19, 17, 18
-7:      addi    4, 4, 1
-        addic.  5, 5, -1
-        bne     5b
-8:      li      3, 0
-        b       MPReturn
-9:      li      3, -50
-        b       MPReturn
+        lwzx    27, 31, 17                      # that table page, physical
+        rlwinm  28, 22, 0, 20, 31               # page & 0xFFF
+        lbzx    29, 27, 28
+        cmpw    29, 25
+        beq     3f                              # the byte to replace
+        cmpwi   25, -1
+        bne     4f                              # not the byte to replace
+        cmpwi   29, OWNER_TABLES
+        beq     4f                              # any byte but the tables'
+3:      cmpw    29, 24
+        beq     4f                              # no change
+        stbx    24, 27, 28
+        cmpwi   26, 0
+        beq     4f
+        slwi    8, 22, 12
+        bl      flush_page                      # built again for its owner
+4:      addi    22, 22, 1
+        addic.  23, 23, -1
+        bne     2b
+        cmpwi   26, 0
+        beq     eo_ok
+        li      9, 0
+        stw     9, KDP_HTABLock(1)
+        b       eo_ok
+
+eo_spaces:
+        cmpwi   4, 0
+        bne     1f
+        lwz     9, CB_SPACES(31)
+        cmpwi   9, 0
+        beq     eo_ok
+        bl      spaces_off
+        b       eo_ok
+1:      addi    8, 1, KDP_HTABLock
+        bl      AcquireLock
+        li      8, 0
+        bl      space_switch                    # an old mask's segments back
+        bl      2f                              # to the system's VSIDs
+2:      mflr    16
+        rlwinm  5, 5, 0, 26, 31                 # segments 0-5 only
+        stw     5, vsid_mask - 2b(16)
+        mfsprg  17, 0
+        lwz     17, EWA_PA_CurAddressSpace(17)  # the caller's, the blue task's
+        stw     17, sys_space - 2b(16)
+        li      9, 1
+        stw     9, CB_SPACES(31)
+        bl      flush_owned                     # built again by owner
+        li      9, 0
+        stw     9, KDP_HTABLock(1)
+        b       eo_ok
+
+eo_switch:
+        lwz     9, CB_SPACES(31)
+        cmpwi   9, 0
+        beq     eo_ok
+        mr      8, 4
+        bl      code_of
+        cmplwi  8, OWNER_APP
+        bge     1f
+        li      8, 0                            # not an application's zone
+1:      bl      2f
+2:      mflr    16
+        lwz     9, vsid_cur - 2b(16)
+        cmpw    8, 9
+        beq     eo_ok                           # loaded already
+        bl      space_switch
+        li      8, CB_VSWITCH
+        bl      count
+        b       eo_ok
+
+eo_flush:
+        mr      22, 4
+        mr      23, 5
+        cmpwi   23, 0
+        beq     eo_ok
+        addi    8, 1, KDP_HTABLock
+        bl      AcquireLock
+1:      slwi    8, 22, 12
+        bl      flush_page
+        addi    22, 22, 1
+        addic.  23, 23, -1
+        bne     1b
+        li      9, 0
+        stw     9, KDP_HTABLock(1)
+        b       eo_ok
+
+# spaces_off: the system's VSIDs again, CB_SPACES 0, and every application
+# page's PTE dropped, to be built again from its PLE. r31 the block; uses
+# r8, r9, r14-r30.
+spaces_off:
+        mflr    26
+        addi    8, 1, KDP_HTABLock
+        bl      AcquireLock
+        li      8, 0
+        bl      space_switch
+        li      9, 0
+        stw     9, CB_SPACES(31)
+        bl      flush_owned
+        li      9, 0
+        stw     9, KDP_HTABLock(1)
+        mtlr    26
+        blr
 
         .globl  task_log                        # for build.sh's nm
 task_log:
@@ -643,3 +1177,12 @@ task_log:
         .endr
         .globl  enf_cb
 enf_cb: .long   0                               # the control block, physical
+vsid_mask:
+        .long   0                               # patch 5: segments with
+                                                # application VSIDs
+sys_space:
+        .long   0                               # the blue task's address
+                                                # space, physical
+vsid_cur:
+        .long   0                               # the owner whose VSIDs it
+                                                # holds (0: the system's)

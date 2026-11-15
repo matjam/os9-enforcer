@@ -24,6 +24,18 @@
 
 enum { kTimerMs = 16, kBusErrorVector = 0x08 };
 
+/* The hook in the Process Manager's switch (pm_hook): an instruction its
+   site S has, and the stub's layout in longs (a save area, the count of
+   its calls, the instruction it replaced, then code). */
+enum {
+    kPmSite = 0x807F002C, /* lwz r3,0x2C(r31) */
+    kStubSave = 0,
+    kStubCalls = 14,
+    kStubInsn = 15,
+    kStubCode = 16,
+    kStubLongs = 72
+};
+
 /* SysPages.flags */
 enum { kPageExcluded = 1, kPageHot = 2, kPageCooled = 4 };
 
@@ -173,6 +185,40 @@ static void set_owners(State *s, unsigned long lo, unsigned long hi,
         s->c.kernel_errors++;
 }
 
+/* The segments of [lo, hi), bit n for segment n: those up to 5, which
+   application VSIDs can cover (6 and up hold the kernel, the emulator,
+   I/O and the ROM). */
+static unsigned long segments(unsigned long lo, unsigned long hi)
+{
+    unsigned long mask = 0;
+    for (unsigned long g = lo >> 28; hi > lo && g <= (hi - 1) >> 28 && g < 6;
+         g++)
+        mask |= 1UL << g;
+    return mask;
+}
+
+/* [lo, hi) is read-only to other applications by its VSIDs, with no page
+   protection: application VSIDs are on and cover all of it. */
+static int by_vsid(State *s, unsigned long lo, unsigned long hi)
+{
+    return s->spaces_on && hi > lo && (hi - 1) >> 28 < 6 &&
+           (segments(lo, hi) & ~s->vsid_mask) == 0;
+}
+
+/* Application memory in [lo, hi) is marked: cover its segments with
+   application VSIDs. A new segment turns them on again with the larger
+   mask, which drops every application page's PTE. */
+static void spaces_cover(State *s, unsigned long lo, unsigned long hi)
+{
+    unsigned long mask = s->vsid_mask | segments(lo, hi);
+    if (!s->spaces || mask == s->vsid_mask)
+        return;
+    s->vsid_mask = mask;
+    if (s->spaces_on && (kcb_set2(kKcbOpSpaces, 1, mask) ||
+                         kcb_set(kKcbOpSwitch, current_zone())))
+        s->c.kernel_errors++;
+}
+
 /* Manage the pages in [lo, hi) for owner (bitmap bits and owner bytes), or
    stop managing them (owner 0). */
 static void mark(State *s, unsigned long lo, unsigned long hi,
@@ -180,6 +226,8 @@ static void mark(State *s, unsigned long lo, unsigned long hi,
 {
     set_bits(s, lo, hi, owner != kOwnerNone);
     set_owners(s, lo, hi, owner, -1);
+    if (owner >= kOwnerApp)
+        spaces_cover(s, lo, hi);
 }
 
 /* Give application domain i the owner bytes of its code's pages in
@@ -188,7 +236,7 @@ static void mark(State *s, unsigned long lo, unsigned long hi,
 static void own_code(State *s, int i, unsigned long lo, unsigned long hi)
 {
     Domain *d = &s->domains[i];
-    unsigned char code = owner_code(s, i);
+    unsigned char code = owner_code(s, i) | kOwnerCode;
     lo &= kPageMask;
     hi = (hi + kPage - 1) & kPageMask;
     set_owners(s, lo, hi < d->lo ? hi : d->lo, code, kOwnerNone);
@@ -208,7 +256,7 @@ static void own_first_page(State *s, int i, int on)
     if (!s->kcb || i == s->sys_dom || (d->location & (kPage - 1)) == 0)
         return;
     unsigned long a = d->location & kPageMask;
-    unsigned char code = owner_code(s, i);
+    unsigned char code = owner_code(s, i) | kOwnerCode;
     if (a >= d->lo)
         return;
     if (on)
@@ -224,18 +272,26 @@ static void disown_code(State *s, int i)
     Domain *d = &s->domains[i];
     if (d->code_state != kCodeOwned || !s->kcb)
         return;
-    set_owners(s, d->code_lo, d->code_hi, kOwnerNone, owner_code(s, i));
+    set_owners(s, d->code_lo, d->code_hi, kOwnerNone,
+               owner_code(s, i) | kOwnerCode);
     d->code_state = kCodeUnknown;
 }
 
 /* Protect pages of application domain i, unless protection is off or the
    domain is going away. The system heap's pages go through sys_protect_*
-   instead, which leave out its excluded and hot pages. */
+   instead, which leave out its excluded and hot pages. Pages covered by
+   application VSIDs are read-only by owner already: what is left to do
+   is to drop the PTEs that stores the kernel allowed made writable. */
 static void protect(State *s, int i, unsigned long lo, unsigned long len)
 {
     Domain *d = &s->domains[i];
     if (s->mode == kModeOff || !d->live || d->dying || i == s->sys_dom)
         return;
+    if (by_vsid(s, lo, lo + len)) {
+        if (kcb_set2(kKcbOpFlush, lo >> 12, len >> 12))
+            s->c.kernel_errors++;
+        return;
+    }
     if (nk_protect(s->area, lo, len))
         s->c.kernel_errors++;
 }
@@ -244,16 +300,21 @@ static void sys_protect_all(State *s);
 static void sys_runs(State *s, unsigned long from, unsigned long to,
                      unsigned char skip, int on);
 
+/* Protect domain i's pages, at a switch away from it or when the engine
+   lost track of which are open. Pages covered by application VSIDs need
+   nothing. */
 static void protect_domain(State *s, int i)
 {
+    Domain *d = &s->domains[i];
     if (i == s->sys_dom) {
         sys_protect_all(s);
         return;
     }
-    protect(s, i, s->domains[i].lo, s->domains[i].hi - s->domains[i].lo);
+    if (!by_vsid(s, d->lo, d->hi))
+        protect(s, i, d->lo, d->hi - d->lo);
     for (int j = 0; j < kMaxChunks; j++) {
         Chunk *c = &s->chunks[j];
-        if (c->live && c->domain == i)
+        if (c->live && c->domain == i && !by_vsid(s, c->lo, c->hi))
             protect(s, i, c->lo, c->hi - c->lo);
     }
 }
@@ -280,6 +341,42 @@ static void protect_others(State *s)
     for (int i = 0; i < kMaxDomains; i++)
         if (i != s->cur)
             protect_domain(s, i);
+}
+
+/* Turn the kernel's application VSIDs on (with protection) or off. On,
+   load the current application's at once; the hook in the Process
+   Manager's switch loads them from then on. If the kernel refuses, the
+   engine protects pages as before. */
+static void spaces_set(State *s, int on)
+{
+    if (!s->spaces || !s->kcb || s->spaces_on == (unsigned long)on)
+        return;
+    if (on) {
+        if (kcb_set2(kKcbOpSpaces, 1, s->vsid_mask)) {
+            s->c.kernel_errors++;
+            return;
+        }
+        s->spaces_on = 1;
+        if (kcb_set(kKcbOpSwitch, current_zone()))
+            s->c.kernel_errors++;
+    } else {
+        s->spaces_on = 0;
+        if (kcb_set2(kKcbOpSpaces, 0, 0))
+            s->c.kernel_errors++;
+    }
+}
+
+/* Stores the engine no longer has events for opened pages it does not
+   know: protect every page again. With application VSIDs, turning them on
+   again drops every application page's PTE. */
+static void protect_lost(State *s)
+{
+    if (s->spaces_on && s->mode != kModeOff) {
+        if (kcb_set2(kKcbOpSpaces, 1, s->vsid_mask) ||
+            kcb_set(kKcbOpSwitch, current_zone()))
+            s->c.kernel_errors++;
+    }
+    protect_others(s);
 }
 
 /* Point both hooks' current range at domain i (-1: none): its whole
@@ -402,13 +499,20 @@ static unsigned long domain_pages(State *s, int i)
     return n;
 }
 
-/* On a process switch, protect the previous application's domain. */
+/* On a process switch, protect the previous application's domain. With
+   application VSIDs, there is nothing to protect: load the new
+   application's VSIDs, in case the hook in the Process Manager's switch
+   did not (the kernel returns at once when it did). */
 static void check_switch(State *s)
 {
+    if (s->pm_stub)
+        s->c.pm_switches = s->pm_stub[kStubCalls];
     unsigned long zone = current_zone();
     if (zone == s->cur_zone)
         return;
     s->cur_zone = zone;
+    if (s->spaces_on && kcb_set(kKcbOpSwitch, zone))
+        s->c.kernel_errors++;
     int d = domain_of_zone(s, zone);
     if (d >= 0 && s->domains[d].dying)
         d = -1;
@@ -424,7 +528,7 @@ static void check_switch(State *s)
         s->c.switch_tb += t;
         if (t > s->c.switch_tb_max)
             s->c.switch_tb_max = t;
-        if (old != s->sys_dom)
+        if (old != s->sys_dom && !s->spaces_on)
             s->c.switch_pages += domain_pages(s, old);
     }
 }
@@ -795,6 +899,8 @@ static void sys_start(State *s)
         sys_exclude_block(s, s->kcb_raw, GetPtrSize(s->kcb_raw));
         sys_exclude_block(s, s->owners_raw, GetPtrSize(s->owners_raw));
     }
+    /* The hook's stub stores into its save area at every switch. */
+    sys_exclude_block(s, s->pm_stub, s->pm_stub ? kStubLongs * 4 : 0);
     unsigned long hi = sys_heap_hi(s, lo, sp->cap), n = (hi - lo) / kPage;
     sys_check_access(s, 0, n);
 
@@ -913,7 +1019,7 @@ static void drain(State *s, int src, volatile HookEvent *ring, unsigned long n,
         s->c.lost[src] += handled - seen - n;
         if (sys_live(s))
             s->sys->c.resweeps++;
-        protect_others(s);
+        protect_lost(s);
     }
     for (unsigned long i = 0; i < n; i++) {
         volatile HookEvent *e = &ring[i];
@@ -945,7 +1051,9 @@ static void drain(State *s, int src, volatile HookEvent *ring, unsigned long n,
                                    ? kOffenseBlocked
                                    : hook_denied(s, src, addr));
         }
-        if (t != s->cur)
+        /* Under application VSIDs the open PTE is the writer's VSID's,
+           whichever application is current now. */
+        if (t != s->cur || by_vsid(s, addr, addr + 1))
             protect(s, t, addr & kPageMask, kPage);
     }
     s->seen[src] = handled;
@@ -1009,7 +1117,7 @@ static void kernel_event(State *s, const KEvent *e)
             record_offense(s, src, pc, h.zone, t, addr,
                            skipped ? kOffenseBlocked : kOffenseAllowed);
     }
-    if (t != s->cur && !skipped)
+    if ((t != s->cur || by_vsid(s, addr, addr + 1)) && !skipped)
         protect(s, t, addr & kPageMask, kPage);
 }
 
@@ -1028,7 +1136,7 @@ static void kernel_drain(State *s)
         s->klost += last - seen - kKcbRing;
         if (sys_live(s))
             s->sys->c.resweeps++;
-        protect_others(s);
+        protect_lost(s);
         seen = last - kKcbRing;
     }
     for (unsigned long n = seen + 1; n - seen <= last - seen; n++) {
@@ -1045,13 +1153,21 @@ static void kernel_drain(State *s)
         if (e.seq != n || v->seq != n) {
             /* Overwritten while being read (a task's store). */
             s->klost++;
-            protect_others(s);
+            protect_lost(s);
             continue;
         }
         s->kevents++;
-        if (kev_flags(e.info) & kEvfDenied)
+        if (kev_flags(e.info) & kEvfDenied) {
             s->kdenied++;
-        else
+            /* The kernel made the page's PLE read-only for the denial
+               (kernel/nanokernel.s, patch 5): open it again, and drop its
+               PTE, which MPSetAreaAccess made writable in whichever VSID
+               it was built for. */
+            if (by_vsid(s, e.addr, e.addr + 1) &&
+                (nk_unprotect(s->area, e.addr & kPageMask, kPage) ||
+                 kcb_set2(kKcbOpFlush, e.addr >> 12, 1)))
+                s->c.kernel_errors++;
+        } else
             kernel_event(s, &e);
     }
     s->kseen = last;
@@ -1545,9 +1661,10 @@ static Chunk *new_chunk(State *s, int d, unsigned long size)
     c->zone = (unsigned long)z;
     c->handles = 0;
     c->keep = !kept && csize == kChunkMin;
-    mark(s, lo, hi, owner_code(s, d));
+    mark(s, lo, hi, owner_code(s, d)); /* with application VSIDs, also
+                                          read-only to the others */
     c->live = 1;
-    if (d != s->cur)
+    if (d != s->cur && !by_vsid(s, lo, hi))
         protect(s, d, lo, hi - lo);
     s->pc.chunks_made++;
     return c;
@@ -2312,8 +2429,11 @@ void engine_set_mode(State *s, unsigned long mode)
     if (s->pool)
         s->pool->enabled = mode != kModeOff;
     if (mode == kModeOff) {
-        /* After mode is off, the timer protects nothing, so every page
-           opened here stays open. */
+        /* Application VSIDs off before the kernel's mode, so that no store
+           meets a page read-only by owner in kKcbPass. After mode is off,
+           the timer protects nothing, so every page opened here stays
+           open. */
+        spaces_set(s, 0);
         set_deny(s, kModeOff);
         s->mode = kModeOff;
         for (int i = 0; i < kMaxDomains; i++)
@@ -2323,8 +2443,188 @@ void engine_set_mode(State *s, unsigned long mode)
     }
     set_deny(s, mode);
     s->mode = mode;
-    if (old == kModeOff)
+    if (old == kModeOff) {
+        spaces_set(s, 1);
         protect_others(s);
+    }
+}
+
+/* Make code written at [p, p + len) the code the CPU runs. */
+static void flush_code(volatile void *p, unsigned long len)
+{
+    unsigned long a = (unsigned long)p & ~31UL, end = (unsigned long)p + len;
+    for (unsigned long x = a; x < end; x += 32)
+        __asm__ volatile("dcbst 0,%0" : : "r"(x) : "memory");
+    __asm__ volatile("sync");
+    for (unsigned long x = a; x < end; x += 32)
+        __asm__ volatile("icbi 0,%0" : : "r"(x) : "memory");
+    __asm__ volatile("sync\n\tisync");
+}
+
+/* Where the Process Manager switches processes, in 9.2.2. The code moves
+   with each boot, so look for it in the system heap.
+
+   The switch first loads the next process's low memory from its PCB
+   (r31), still on the previous process's stack:
+       stw  r29,0x2AA(0)     ; ApplZone, on one path
+       ...
+       stw  r29,0x110(0)
+       lwz  r3,0x30(r31)     ; on the other
+       stw  r3,0x2AA(0)
+   S:  lwz  r3,0x2C(r31)     ; both paths go on here
+       stw  r3,0x130(0)      ; ApplLimit
+   Then its native context switch loads the next process's registers from
+   the context at r4:
+       lwz  r1,524(r4)
+       lwz  r0,516(r4)
+       mtlr r0
+       lwz  r2,520(r4)
+       lmw  r13,388(r4)
+       ...                   ; FPSCR, XER, f14-f31
+       lfd  f31,168(r4)
+   B:  blr
+   At B the next process's stack and ApplZone are both in place, so B is
+   the better site: at S the Process Manager still stores into the
+   previous process's stack, which would fault. r0 is dead at both. */
+static int pm_site_at(const volatile unsigned long *w)
+{
+    return w[0] == kPmSite && w[-1] == 0x906002AA && w[-2] == 0x807F0030 &&
+           w[1] == 0x90600130 && w[-3] == 0x93A00110 && w[-8] == 0x93A002AA;
+}
+
+static int pm_switch_at(const volatile unsigned long *w)
+{
+    return w[0] == 0x4E800020 && w[-1] == 0xCBE400A8 &&
+           w[-27] == 0x8024020C && w[-26] == 0x80040204 &&
+           w[-24] == 0x80440208 && w[-23] == 0xB9A40184;
+}
+
+/* B, or else S; 0 when neither is found exactly once. */
+static unsigned long pm_find(void)
+{
+    unsigned long lo = lowmem_long(0x2A6); /* SysZone */
+    unsigned long hi = *(volatile unsigned long *)lo;
+    unsigned long site = 0, sw = 0;
+    int nsite = 0, nsw = 0;
+    const volatile unsigned long *w =
+        (const volatile unsigned long *)((lo + 128) & ~3UL);
+    const volatile unsigned long *end =
+        (const volatile unsigned long *)((hi & ~3UL) - 8);
+    for (; w < end; w++) {
+        if (*w == kPmSite && pm_site_at(w)) {
+            site = (unsigned long)w;
+            nsite++;
+        } else if (*w == 0x4E800020 && pm_switch_at(w)) {
+            sw = (unsigned long)w;
+            nsw++;
+        }
+    }
+    return nsw == 1 ? sw : nsite == 1 ? site : 0;
+}
+
+/* The site becomes a branch to a stub in the system heap that saves what
+   MP call 109 changes (kcb.h, nk_call) but r0, counts the call, passes
+   the new ApplZone to kKcbOpSwitch, restores, and runs the replaced
+   instruction: at B, the blr itself (the site is a b); at S, the lwz,
+   then a blr (the site is a bl: LR is free there). With no control block
+   registered (the engine gone without unpatching), the call fails and
+   nothing changes. */
+static unsigned long *pm_stub_new(unsigned long insn)
+{
+    unsigned long *p = (unsigned long *)NewPtrSysClear(kStubLongs * 4);
+    if (!p)
+        return 0;
+    unsigned long save = (unsigned long)(p + kStubSave);
+    unsigned long lis = 0x3C600000 | save >> 16;    /* lis r3,save@h */
+    unsigned long ori = 0x60630000 | (save & 0xFFFF); /* ori r3,r3,save@l */
+    unsigned long *c = p + kStubCode;
+    p[kStubInsn] = insn;
+    *c++ = 0x3C000000 | save >> 16;    /* lis r0,save@h */
+    *c++ = 0x60000000 | (save & 0xFFFF); /* ori r0,r0,save@l */
+    *c++ = 0x7C60012E;                 /* stwx r3,0,r0 */
+    *c++ = 0x7C030378;                 /* mr r3,r0 */
+    for (unsigned long r = 4; r <= 12; r++)
+        *c++ = 0x90030000 | r << 21 | (r - 3) * 4; /* stw rN,4(N-3)(r3) */
+    *c++ = 0x7C0802A6; /* mflr r0 */
+    *c++ = 0x90030028; /* stw r0,40(r3) */
+    *c++ = 0x7C0902A6; /* mfctr r0 */
+    *c++ = 0x9003002C; /* stw r0,44(r3) */
+    *c++ = 0x7C0102A6; /* mfxer r0 */
+    *c++ = 0x90030030; /* stw r0,48(r3) */
+    *c++ = 0x7C000026; /* mfcr r0 */
+    *c++ = 0x90030034; /* stw r0,52(r3) */
+    *c++ = 0x80830000 | kStubCalls * 4; /* lwz r4,calls(r3) */
+    *c++ = 0x38840001;                  /* addi r4,r4,1 */
+    *c++ = 0x90830000 | kStubCalls * 4; /* stw r4,calls(r3) */
+    *c++ = 0xA08002AA; /* lhz r4,0x2AA(0): ApplZone, 2-byte aligned */
+    *c++ = 0xA0A002AC; /* lhz r5,0x2AC(0) */
+    *c++ = 0x5085801E; /* rlwimi r5,r4,16,0,15 */
+    *c++ = 0x7CA42B78; /* mr r4,r5 */
+    *c++ = 0x38000000 | kMPEnforcer; /* li r0,109 */
+    *c++ = 0x38600000 | kKcbOpSwitch; /* li r3,5 */
+    *c++ = 0x44000002; /* sc */
+    *c++ = lis;
+    *c++ = ori;
+    *c++ = 0x80030034; /* lwz r0,52(r3) */
+    *c++ = 0x7C0FF120; /* mtcr r0 */
+    *c++ = 0x80030030; /* lwz r0,48(r3) */
+    *c++ = 0x7C0103A6; /* mtxer r0 */
+    *c++ = 0x8003002C; /* lwz r0,44(r3) */
+    *c++ = 0x7C0903A6; /* mtctr r0 */
+    *c++ = 0x80030028; /* lwz r0,40(r3) */
+    *c++ = 0x7C0803A6; /* mtlr r0 */
+    for (unsigned long r = 4; r <= 12; r++)
+        *c++ = 0x80030000 | r << 21 | (r - 3) * 4; /* lwz rN,4(N-3)(r3) */
+    *c++ = 0x80630000; /* lwz r3,0(r3) */
+    *c++ = insn;
+    if (insn != 0x4E800020)
+        *c++ = 0x4E800020; /* blr */
+    flush_code(p + kStubCode, (unsigned long)(c - (p + kStubCode)) * 4);
+    return p;
+}
+
+/* Install the hook (task level, before the system heap is watched). A
+   branch reaches 32 MB either way, or the lowest 32 MB absolutely. */
+static void pm_hook(State *s)
+{
+    unsigned long site = pm_find();
+    if (!site)
+        return;
+    unsigned long old = *(volatile unsigned long *)site;
+    unsigned long *stub = pm_stub_new(old);
+    if (!stub)
+        return;
+    unsigned long to = (unsigned long)(stub + kStubCode);
+    unsigned long link = old == 0x4E800020 ? 0 : 1; /* b at B, bl at S */
+    long off = (long)(to - site);
+    unsigned long insn;
+    if (off >= -0x2000000L && off < 0x2000000L)
+        insn = 0x48000000 | ((unsigned long)off & 0x03FFFFFC) | link;
+    else if (to < 0x2000000UL)
+        insn = 0x48000002 | to | link; /* absolute */
+    else {
+        DisposePtr((Ptr)stub);
+        return;
+    }
+    hold(s, stub, kStubLongs * 4, 1);
+    s->pm_stub = stub;
+    s->pm_site = site;
+    *(volatile unsigned long *)site = insn;
+    flush_code((volatile void *)site, 4);
+}
+
+/* Put the replaced instruction back and free the stub (task level, after
+   the system heap's pages are open again). */
+static void pm_unhook(State *s)
+{
+    if (!s->pm_site)
+        return;
+    *(volatile unsigned long *)s->pm_site = s->pm_stub[kStubInsn];
+    flush_code((volatile void *)s->pm_site, 4);
+    hold(s, s->pm_stub, kStubLongs * 4, 0);
+    DisposePtr((Ptr)s->pm_stub);
+    s->pm_site = 0;
+    s->pm_stub = 0;
 }
 
 /* The kernel's owner check (common/kcb.h): allocate the control block and
@@ -2580,6 +2880,13 @@ long engine_start(State **out, unsigned long mode, const char *name)
             DisposeHandle(t);
         }
     }
+    /* Application VSIDs need the kernel's block (patch 5's, as kcb_start
+       registers only that version). They come on with protection
+       (engine_set_mode), in the segments marked application memory has
+       (spaces_cover). */
+    s->spaces = s->kcb != 0;
+    if (s->spaces)
+        pm_hook(s);
     s->seen[kSrc68k] = s->h68k->count_handled;
     s->seen[kSrcNative] = s->hnat->count_handled;
     /* For tools/xlog-read.py. */
@@ -2655,7 +2962,9 @@ void engine_stop(State *s)
        ordinary temporary memory. */
     pool_remove(s);
     /* Stop denying and protecting, stop the tick, take what the rings
-       hold, then open everything before the hooks stop managing it. */
+       hold, then open everything before the hooks stop managing it.
+       Application VSIDs go first, as in engine_set_mode. */
+    spaces_set(s, 0);
     set_deny(s, kModeOff);
     s->mode = kModeOff;
     s->active = 0;
@@ -2673,6 +2982,7 @@ void engine_stop(State *s)
         unprotect_domain(s, i);
     }
     s->sys_on = 0;
+    pm_unhook(s);
     kcb_stop(s);
     self_exit_remove();
     g_sys_install(g_prev);

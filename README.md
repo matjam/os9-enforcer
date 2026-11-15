@@ -68,10 +68,14 @@ application run, and the notification says so.
   of memory: the system, or one application. On a write to a protected
   page, it looks up the owner of the code doing the write. A write by an
   application's code into another application's page is an offense.
-- **The extension.** The Enforcer Extension starts at startup. It
-  write-protects every application's memory except the current
-  application's, and keeps the owner table up to date as applications
-  launch and quit.
+- **Address spaces.** Each application runs with its own segment IDs for
+  the memory that holds applications. In them, every other application's
+  pages are read-only, and its own pages stay writable. An application
+  switch loads the next application's segment IDs, so it changes no page
+  protection, whatever the applications' sizes.
+- **The extension.** The Enforcer Extension starts at startup. It keeps the
+  owner table up to date as applications launch and quit, and turns the
+  per-application segment IDs on.
 - **Temporary memory.** Each application's `TempNewHandle` memory comes
   from chunks owned by that application, so it is protected like its
   partition.
@@ -99,9 +103,16 @@ Known holes:
 - A write by an application's 68k code in a deferred task, while the
   application is current, stops the application from inside the deferred
   task.
-- A write the kernel allows opens its page to every task for up to 16 ms.
-- For up to 16 ms after an application switch, a write by the new
-  application into a page the previous one was using is not caught.
+- A write the kernel allows opens its page for up to 16 ms to the
+  application that was current and to Multiprocessing Services tasks.
+- With virtual memory on, an application switch takes effect at the first
+  write that faults after it, which is Mac OS's own write to the new
+  application's stack. A write by the new application into the previous
+  application's memory before then is not caught.
+- With virtual memory on, when the current application touches a page of
+  another application that is on disk, the Virtual Memory Manager can map
+  it writable for the current application until the mapping is next
+  rebuilt.
 - The partly used first and last pages of a partition are not protected.
 - With virtual memory on, code in an application's own shared libraries
   and plug-ins counts as the system's.
@@ -112,6 +123,10 @@ Known holes:
   cannot: the kernel drops writes into Enforcer's own tables.
 - With virtual memory on, a protection can be lost briefly while the
   Virtual Memory Manager updates a page.
+- Application memory above 1.5 GB (more logical memory than Mac OS 9
+  normally has) is protected page by page as before: for up to 16 ms after
+  a switch, a write by the new application into a page the previous one
+  was using is not caught.
 
 Compatibility:
 - An application's temporary memory comes from chunks of its own. A large

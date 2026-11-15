@@ -41,10 +41,14 @@ POOL_STUBS = ["magic", "enabled_inside", "osd_old", "dh_old", "ets_old"]
 CHUNK = ["live", "domain", "handle", "block", "lo", "hi", "zone", "handles",
          "keep"]
 MAX_CHUNKS = 128
+# After the Chunk table: skips, application VSIDs and the Process Manager
+# hook.
+SPACES = ["skips", "spaces", "vsid_mask", "spaces_on", "pm_site", "pm_stub"]
 KCB = ["magic", "version", "mode", "current", "entries", "denied_page",
        "seq", "frame", "allowed", "logged", "denied", "bail", "self",
        "skipped", "applzone", "deny_native_page", "deny_native_seq",
-       "deny_68k_page", "deny_68k_seq", "tables"]
+       "deny_68k_page", "deny_68k_seq", "tables", "spaces", "rebuilt",
+       "vswitch", "lazy"]
 KCB_RING, KCB_RING_N, KCB_EVENTS = 0x300, 488, 12
 EVF = [(1, "68k"), (2, "task"), (4, "offense"), (8, "denied"),
        (16, "skipped")]
@@ -62,7 +66,8 @@ COUNTERS = (["own_" + s for s in SOURCES] + ["cross_" + s for s in SOURCES] +
             ["outside", "switches", "timer_runs", "kernel_errors",
              "refreshes", "added", "removed", "dropped", "nwriters",
              "info_errors"] + ["app_code_" + s for s in SOURCES] +
-            ["switch_pages", "switch_tb", "switch_tb_max", "tb_per_ms"])
+            ["switch_pages", "switch_tb", "switch_tb_max", "tb_per_ms",
+             "pm_switches"])
 DOMAIN_SIZE, WRITER_SIZE, OFFENSE_SIZE = 84, 64, 56
 CODE_STATES = ["not looked for", "in the partition", "owned", "failed"]
 SRC_MASK, APP_CODE = 0xFF, 0x100
@@ -84,7 +89,7 @@ def collect(addr):
                    h["max_offenses"] * h["offense_size"],
                    h["off_stopper"] + 4, h["off_sys"] + 4 * len(SYS_STATE),
                    h["off_kernel"] + 4 * (len(KERNEL) + len(POOL)) +
-                   MAX_CHUNKS * 4 * len(CHUNK))
+                   MAX_CHUNKS * 4 * len(CHUNK) + 4 * len(SPACES))
         d = read(a, size)
         o = h["off_kernel"]
         kernel = dict(zip(KERNEL, struct.unpack(
@@ -100,6 +105,9 @@ def collect(addr):
             if c["live"]:
                 c["slot"] = i
                 kernel["chunks"].append(c)
+        o += MAX_CHUNKS * 4 * len(CHUNK)
+        kernel.update(zip(SPACES, struct.unpack(">%dI" % len(SPACES),
+                                                d[o:o + 4 * len(SPACES)])))
         if kernel["pool"]:
             kernel.update(("stub_" + n, v) for n, v in zip(
                 POOL_STUBS, struct.unpack(">%dI" % len(POOL_STUBS),
@@ -157,6 +165,14 @@ def print_kernel(k):
               k["cb_seq"]))
     print("  engine: taken %d (last %d), lost %d, denied %d" % (
         k["kevents"], k["kseen"], k["klost"], k["kdenied"]))
+    print("  application VSIDs: %s (kernel %d), segments %02X; switches %d "
+          "(%d made at a store), PTEs built again %d; Process Manager hook "
+          "%s" % (
+              "on" if k["spaces_on"] else
+              "possible" if k["spaces"] else "no", k["cb_spaces"],
+              k["vsid_mask"], k["cb_vswitch"], k["cb_lazy"], k["cb_rebuilt"],
+              "at %08X, stub %08X" % (k["pm_site"], k["pm_stub"])
+              if k["pm_site"] else "not installed"))
     if k["events"]:
         print("  last events (owner/code/current: 1 system heap, 3+ domain "
               "slot + 3):")

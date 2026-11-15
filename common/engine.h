@@ -78,6 +78,14 @@
  * before. Without patch 4 the registration fails and the engine runs on the
  * hooks alone.
  *
+ * With patch 5 (application VSIDs, State.spaces) the engine protects no
+ * domain page by page in the segments the kernel covers (by_vsid): each
+ * application's pages are read-only in every other application's VSIDs,
+ * and a hook in the Process Manager's context switch (pm_hook) loads the
+ * next application's VSIDs. The timer no longer protects the previous
+ * domain at a switch; after a store the kernel allowed, it drops the
+ * page's PTE (kKcbOpFlush) instead of protecting the page.
+ *
  * Temporary memory pools (needs the kernel's owner check): the engine
  * patches TempNewHandle (_OSDispatch selector 0x1D), DisposeHandle and
  * ExitToShell with 68k stubs that call its native code. An application's
@@ -392,6 +400,9 @@ typedef struct {
        the pages, and the time in timebase ticks (tb_per_ms of them a
        millisecond). */
     unsigned long switch_pages, switch_tb, switch_tb_max, tb_per_ms;
+    /* Switches the hook in the Process Manager's switch passed to the
+       kernel (State.pm_stub), as of the last tick. */
+    unsigned long pm_switches;
 } Counters;
 
 /* In the system heap, so it outlives a program that stops without
@@ -470,6 +481,18 @@ typedef struct {
     /* Denied native stores the fault handler skipped instead of stopping
        the application: they came from above task level (skip_store). */
     unsigned long skips;
+    /* Application VSIDs (kernel patch 5, kcb.h kKcbOpSpaces). spaces is 1
+       when the kernel has them; vsid_mask has the segments they cover
+       (bit n: segment n), those of the partitions and chunks marked so
+       far, 0-5 only; spaces_on is 1 while they are on, which is while
+       protection is on. With them on, each application's pages in those
+       segments are read-only in every other application's VSIDs, so a
+       switch protects nothing there. */
+    unsigned long spaces, vsid_mask, spaces_on;
+    /* The hook in the Process Manager's switch: the address of the
+       instruction it replaces, or 0, and the stub it calls. */
+    unsigned long pm_site;
+    unsigned long *pm_stub;
 } State;
 
 /* Install the hooks, the fallback handler and the timer, read the process

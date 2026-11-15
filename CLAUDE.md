@@ -163,10 +163,15 @@ window: log, deny, log the system heap, deny with the system heap logged.
 - Patch 4, the owner check: the engine registers a control block (16 KB,
   physically contiguous) and an owner table (one byte per 4 KB page, up to
   128 table pages: 2 GB) with MP call 109, which the stock kernel leaves
-  unused (it returns −4 there). The kernel takes only `CB_VERSION` 4 and
+  unused (it returns −4 there). The kernel takes only `CB_VERSION` 5 and
   returns paramErr for another, so a mismatched extension and kernel
   protect nothing. Owner bytes: 0 none, 1 the system heap, 2 the control
-  block and the owner table, 3 + slot for an application's domain.
+  block and the owner table, 3 + slot for an application's domain. An
+  application's byte with `OWNER_CODE` (0x80, `kOwnerCode`) marks a page
+  where its code lies but which is not its memory (the partly used first
+  page of a partition, code outside it): the kernel's `code_of` gives the
+  application, for a store's code and for `ApplZone`, and `owner_of`
+  gives 0, so the page is nobody's as a target.
 - The control block and the owner table are read-only to Mac OS. The
   engine gives their pages owner 2 and write-protects them, and the
   kernel drops every store into a page with owner 2, in any mode, and
@@ -204,13 +209,57 @@ window: log, deny, log the system heap, deny with the system heap logged.
 - Every allowed store makes the page's PTE writable, runs the store again
   and records it in the block's ring (488 entries). The engine's timer
   takes the ring every 16 ms and protects the page again.
+- Patch 5, application VSIDs (`OP_SPACES`, `OP_SWITCH`, `OP_FLUSH`). Every
+  application runs in the blue task, in the system address space. With
+  `OP_SPACES` on, that space's segment registers for the segments in
+  `vsid_mask` hold the current application's own VSIDs: segment << 20 |
+  0xFFF00 + its owner byte (`space_switch` writes them into the
+  `AddressSpace` and loads them; the scheduler loads them from there after
+  another space ran). Segments 6 and up (kernel, emulator, I/O, ROM) keep
+  the system's.
+  - One PTE per page, as the kernel's VM and area code need: at
+    `PagingFunc1`'s "PLE already in the HTAB" exits, `vsid_fix` drops a PTE
+    built for another VSID (`InvalPTE` keeps R and C in the PLE) and lets
+    it build one for this VSID (`CB_REBUILT`).
+  - At PTE build, `pp_owner` sets PP 11 when another application owns the
+    page; otherwise PP comes from the PLE. So an application's own pages
+    are writable in its VSIDs and its PTEs stay valid across a switch.
+  - `task_write` takes a store into a page read-only by owner
+    (`ro_by_owner`) like one into a write-protected page. At a blue-task
+    store whose segment's VSID is not `ApplZone`'s application, it loads
+    the right VSIDs and runs the store again (`CB_LAZY`).
+  - A denied store into a page read-only only by owner gets a read-only
+    PLE: with virtual memory on, the 68k emulator asks the VM Manager about
+    a write fault first, and it retries a store into a page whose PLE is
+    writable, forever (Scribble `6` hung). The engine opens the PLE again
+    when it takes the denied event.
+  - `OP_OWNERS` drops the PTE of each page whose byte changes, and
+    `OP_SPACES` drops every application page's PTE, so pages are built
+    again for their new owner.
 
 ### The engine (`common/engine.c`, `common/engine.h`)
 
 - One domain per application: its partition's whole pages, its temporary
-  memory chunks, and with virtual memory on its main code section. The
-  engine protects every domain but the current one, and on a switch
-  protects the previous application's pages at once.
+  memory chunks, and with virtual memory on its main code section.
+- Application VSIDs (kernel patch 5) protect the domains: `mark` adds the
+  segments of each partition and chunk to `vsid_mask` (`spaces_cover`,
+  segments 0-5), and `engine_set_mode` turns them on with protection
+  (`spaces_set`). Nothing is protected page by page in those segments
+  (`by_vsid`): after a store the kernel allowed, the engine drops the
+  page's PTE (`OP_FLUSH`) instead of protecting it. A range past segment 5
+  is protected page by page as before.
+- The VSID switch: a hook in the Process Manager's native context switch
+  (`pm_hook`), at the `blr` after it loads the next process's registers
+  and stack (B in `engine.c`; `ApplZone` is already set), branches to a
+  stub in the system heap that calls `OP_SWITCH` with `ApplZone`. The
+  low-memory reload (S, after the `ApplZone` store) is the fallback site;
+  there the Process Manager still stores into the previous process's
+  stack, about two allowed faults a switch. Both are found by instruction
+  pattern in the system heap. With virtual memory on, the Process
+  Manager's code is file-mapped and its container exports nothing, so no
+  hook is installed: the kernel switches lazily at the first store that
+  faults, which is the Process Manager's store into the new process's
+  stack. The timer's `check_switch` calls `OP_SWITCH` too, as a backstop.
 - Current is the Process Manager's current process (`ApplZone`), the one
   whose code runs in the blue task between `WaitNextEvent` calls, in the
   foreground or the background.
@@ -218,21 +267,20 @@ window: log, deny, log the system heap, deny with the system heap logged.
     physical address in `CB_APPLZONE` (`applzone_physical`; with virtual
     memory on, `GetPhysical` needs low memory locked), and stores the
     owner of the page it points into in `CB_CURRENT`.
-  - The engine reads it on each tick (`check_switch`) to protect the
-    previous application's pages and move the hooks' current range. While
-    `ApplZone` is outside that range, the hooks count nothing as the
-    current application's, and the engine decides from each event's
-    zone (`event_app_code`).
-  - The new current application's pages are not opened at the switch:
-    its first store into each page faults, the kernel allows it, and the
-    page stays open (`kernel_event` protects again only pages outside the
-    current domain) until the application is switched out.
+  - The engine reads it on each tick (`check_switch`) to move the hooks'
+    current range (and, for ranges not covered by VSIDs, to protect the
+    previous application's pages). While `ApplZone` is outside that range,
+    the hooks count nothing as the current application's, and the engine
+    decides from each event's zone (`event_app_code`).
 - The span is 2 GB (`kSpanHi`): with 1.5 GB of RAM the Process Manager
   places applications at about 0x5E000000, from the top of RAM down. The
   owner table covers logical RAM, plus 256 MB with virtual memory on.
 - The partly used first page of a partition, where the heap and often the
-  code start, gets the application's owner byte only, unprotected
-  (`own_first_page`). Without it, code there was the system's.
+  code start, gets the application's owner byte with `kOwnerCode`, so it
+  stays unprotected (`own_first_page`): the Process Manager's block before
+  the partition shares the page, and under VSIDs a plain owner byte made
+  its stores fault at every switch. Without the byte, code there was the
+  system's. Code owned outside the partition (`own_code`) gets the same.
 - The Enforcer Extension runs only with the owner check registered; with a
   stock or other-release kernel it stops the engine and publishes
   `kEnforcerNoKernel` or `kEnforcerOtherKernel` for the control panel.
@@ -340,8 +388,9 @@ Worst first. Keep in step with Limits in `README.md`.
    application is current, is denied and the application stopped from
    there: the 68k stub tests only the interrupt mask, and skipping a 68k
    store needs its instruction length.
-3. A store the kernel allows opens the page for every task until the next
-   tick (16 ms).
+3. A store the kernel allows opens the page until the next tick (16 ms),
+   in the VSIDs it was made in: the application current then, and MP
+   tasks, which share the blue task's segment registers.
 4. The partly used first and last pages of a partition are not protected,
    and the last has no owner. The last holds the top of the application's
    A5 world.
@@ -358,13 +407,21 @@ Worst first. Keep in step with Limits in `README.md`.
    `ExitToShell`, made before the engine started, goes around the
    engine's stub while that application is current.
 10. With virtual memory on, a protect can be lost to `setPTEntryGivenPage`
-    until the engine protects the page again.
-11. The engine protects the previous application's pages on its timer's
-    tick, so for up to 16 ms after a switch the pages that application
-    had open take a store by the new application without a fault. (Who
-    is current is right at once: the kernel reads `ApplZone` at each
-    store, and the hooks ignore their current range while `ApplZone` is
-    outside it. Scribble `W` tests that.)
+    until the engine protects the page again (pages not covered by VSIDs:
+    the system heap, ranges past segment 5). For covered pages, the VM
+    calls that insert a PTE themselves (`VMLastExportedFunc`,
+    `VMSecondLastExportedFunc`, NKVMCalls.s 1822-1925) take PP from the
+    PLE, so a page another application owns, paged in under the current
+    VSIDs, is writable to the current application until its PTE is built
+    again. Not tested.
+11. With virtual memory on there is no switch hook (the Process Manager's
+    code is file-mapped), so the VSIDs follow at the first store that
+    faults after a switch, normally the Process Manager's store into the
+    new process's stack. A store by the new process into the previous
+    application's memory before that is not caught. Ranges past segment
+    5 are protected page by page, with the old 16 ms window after a
+    switch. (Who is current is right at once: the kernel reads `ApplZone`
+    at each store. Scribble `W` tests that.)
 12. `engine_stop` puts back the Exception Manager's system-wide handler
     without checking that it is still Enforcer's. A handler installed
     after Enforcer's is dropped.
@@ -404,15 +461,18 @@ serialized, and applications run in parallel only outside it.
      follows the pages an application writes between switches, about
      13 µs a page in QEMU, so a 64 MB working set costs about a quarter
      of a second at every switch.
-   - Per-application VSIDs. Each application gets its own segment IDs for
-     the segments that hold application memory; the kernel builds a
-     page-table entry writable when the owner table gives the page to
-     that space's application, read-only otherwise. A switch loads the
-     segment registers: no per-page work, no first-write faults on the
-     application's own pages, nothing left open after a switch, and an
-     allowed store opens the page in one space only. Needs a hook at the
-     Process Manager's switch, and probably the kernel built from the
-     reconstructed source.
+   - Done (2026-11-14, kernel patch 5): per-application VSIDs. Each
+     application gets its own segment IDs for the segments that hold
+     application memory; the kernel builds a page-table entry writable
+     when the owner table gives the page to that VSID's application,
+     read-only otherwise. A switch loads the segment registers: no
+     per-page work, no first-write faults on the application's own pages,
+     nothing left open after a switch. Built on the stock kernel's
+     binary, by rewriting the system space's segment registers rather
+     than adding address spaces. Measured in "Switch cost" below.
+   - Next: a switch hook with virtual memory on (find the Process
+     Manager's file-mapped code, and patch it held and writable), and a
+     measure of what a PTE rebuild costs.
 2. Preemption at safe points, native code. On its tick the kernel checks
    whether the current application has run past its time slice with
    only its own code on the stack (no Toolbox call in progress), and if
@@ -468,6 +528,25 @@ What it means:
 - Per-application VSIDs remove both parts: a switch loads segment
   registers, the application's own page-table entries stay valid in its
   space, and nothing is re-protected.
+
+With application VSIDs (kernel patch 5), measured the same way on
+2026-11-14 (`xlog-read.py` prints the kernel's counts on its
+`application VSIDs:` line):
+
+| | VM off | VM on |
+|---|---|---|
+| First write into each of 16,384 own pages after a switch back (`R`) | 6.1 ms (0.2 µs a page) | 6.0-6.3 ms (0.1-0.2 µs a page) |
+| The same writes again | 3.1 ms | 2.7-4.0 ms |
+| The engine's work at a switch (`switch:` line) | 15-17 µs | 17-34 µs |
+| VSID switches by the hook / made lazily at a store | 685 / 36 | none / 1,429 |
+| PTEs built again for another VSID, a switch | about 31 | about 73 |
+| Stores the kernel allowed in a boot to the Finder | 10 | 12 |
+
+The first writes after a switch cost TLB refills only: the
+application's PTEs were still in the HTAB. The pages rebuilt at each
+switch are shared ones in the covered segments (the Process Manager's
+heap, other applications' pages touched by system code), each one HTAB
+miss handled in the kernel; what one costs is not measured yet.
 
 ### Per-application VSIDs: what the kernel has
 
@@ -558,6 +637,28 @@ the fragment's code bytes) with a branch to a stub that stores
 `ApplZone` and makes the switch call. The rarer writers can be caught
 lazily: the kernel already reads `ApplZone` at each store it decides.
 
+What was built (patch 5) differs from that plan in three ways:
+- No new address spaces. The blue task stays in the system space, and
+  `OP_SWITCH` rewrites that space's segment registers for the covered
+  segments and loads them. That needs no `FindAreaAbove` redirect and no
+  area-call changes, and the scheduler, SIGP, idle and sleep keep
+  working, since they load the space's registers from the struct.
+- The hook is not at the `ApplZone` store but at the end of the native
+  context switch (B in `engine.c`), which comes after it, once the next
+  process's stack is loaded. At the store (S, kept as a fallback) the
+  Process Manager went on storing into the previous process's stack
+  under the new VSIDs: 368 allowed stores in a boot against 170 at B.
+  The context switch, at 0x0117DF00-0x0117E0DC in that boot, saves r13-r31,
+  FPSCR, XER, f14-f31 and the vector registers into the context at r3,
+  then loads them from the context at r4.
+- The mask comes from the marked partitions and chunks, not from the
+  Process Manager's zone: on 9.2.2 its zone header (0x1EEC9564 in a
+  512 MB guest) lies above the partitions, so `bkLim` is below it.
+Allowed stores in a boot then went from 170 to 10 with `kOwnerCode`: the
+partly used first page of a partition holds the Process Manager's block
+before the partition, and its plain owner byte made those stores fault
+at each switch.
+
 ## Installer (`installer/`)
 
 - It accepts a Mac OS ROM file whose ROM image holds NanoKernel 2.28 as
@@ -585,7 +686,10 @@ lazily: the kernel already reads `ApplZone` at each store it decides.
 `tools/xlog-read.py` and `tools/hooks-read.py` read logical memory with
 QEMU's memsave, which goes through the hashed page table: a page whose PTE
 is not in it does not read. That covers every page the engine protects and
-any page not used lately.
+any page not used lately. With application VSIDs, a page in a covered
+segment reads only when its PTE was built for the VSIDs loaded at the
+pause. `vdump.py` exits with "never in the blue task's address space"
+when any page of a range does not read; read page by page instead.
 
 To read anything else, use `tools/lmem.py`. It takes a physical dump and
 reads it through the map from logical to physical memory, which with
@@ -639,16 +743,19 @@ To check which kernel is running, dump it and compare it with the build
 (`build.sh` prints its size):
 
 ```bash
-../os9-protect/tools/qmp.py raw '{"execute":"pmemsave","arguments":{"val":15794176,"size":106884,"filename":"/tmp/nk-live.bin"}}'
+../os9-protect/tools/qmp.py raw '{"execute":"pmemsave","arguments":{"val":15794176,"size":108452,"filename":"/tmp/nk-live.bin"}}'
 ```
 
 ```bash
 cmp /tmp/nk-live.bin kernel/build/NanoKernel-v02.28.bin
 ```
 
-The last 276 bytes are data the kernel writes: `task_log` (272 bytes),
+The last 288 bytes are data the kernel writes: `task_log` (272 bytes),
 then `enf_cb` (4 bytes), the physical address of the registered control
-block. `build.sh` prints the physical address of both. `task_log` is a
+block, then patch 5's `vsid_mask`, `sys_space` (the blue task's
+`AddressSpace`, physical) and `vsid_cur` (the owner whose VSIDs it
+holds). `build.sh` prints the physical address of `task_log` and
+`enf_cb`. `task_log` is a
 count, three zero words, then 16 entries of four words (the task's PC, the
 address, the task's ID, the page's new PTE); the latest is number
 (count − 1) mod 16.

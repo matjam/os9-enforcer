@@ -27,7 +27,8 @@
 
 enum {
     kKcbMagic = 'ENFK',
-    kKcbVersion = 4,          /* 3: writable by Mac OS, one denied page;
+    kKcbVersion = 5,          /* 4: no application VSIDs;
+                                 3: writable by Mac OS, one denied page;
                                  2: no applzone; 1: 64 table pages and
                                  496 events */
     kKcbSize = 0x4000,
@@ -42,12 +43,30 @@ enum { kKcbPass, kKcbLog, kKcbEnforce };
 
 /* Owner bytes. An application's is kOwnerApp + its domain's slot.
    kOwnerTables marks the control block's and the owner table's pages: the
-   kernel drops every store into them. */
-enum { kOwnerNone = 0, kOwnerSystem = 1, kOwnerTables = 2, kOwnerApp = 3 };
+   kernel drops every store into them. An application's byte with
+   kOwnerCode marks a page where its code lies but which is not its memory
+   (the partly used first page of its partition, code outside it): the
+   kernel counts the code there as the application's, and treats the page
+   as nobody's. */
+enum {
+    kOwnerNone = 0,
+    kOwnerSystem = 1,
+    kOwnerTables = 2,
+    kOwnerApp = 3,
+    kOwnerCode = 0x80
+};
 
 /* MP call 109 operations (r3) on the registered block, which Mac OS
-   cannot write itself. */
-enum { kKcbOpOwners = 1, kKcbOpMode = 2, kKcbOpCurrent = 3 };
+   cannot write itself. Spaces, Switch and Flush are the kernel's
+   application VSIDs (kernel/nanokernel.s, patch 5). */
+enum {
+    kKcbOpOwners = 1,
+    kKcbOpMode = 2,
+    kKcbOpCurrent = 3,
+    kKcbOpSpaces = 4,  /* r4 on, r5 segment mask (bit n: segment n, 0-5) */
+    kKcbOpSwitch = 5,  /* r4 a zone: its application's VSIDs */
+    kKcbOpFlush = 6    /* r4 first page, r5 pages: drop their PTEs */
+};
 
 /* KEvent.info, low byte. */
 enum {
@@ -99,7 +118,11 @@ typedef struct {
        page once for each number. */
     volatile unsigned long deny_native[2], deny_68k[2];
     volatile unsigned long tables; /* stores into the tables, dropped */
-    unsigned long reserved[44];
+    /* Application VSIDs: on (kKcbOpSpaces), PTEs built again for another
+       VSID, switches by kKcbOpSwitch, and switches the kernel made at a
+       store because ApplZone had changed without one. */
+    volatile unsigned long spaces, rebuilt, vswitch, lazy;
+    unsigned long reserved[40];
     unsigned long pages[kKcbTablePages]; /* physical */
     KEvent ring[kKcbRing];              /* event n at (n - 1) % kKcbRing */
 } KernelCB;
@@ -111,6 +134,8 @@ _Static_assert(offsetof(KernelCB, applzone) == 0x38, "CB_APPLZONE");
 _Static_assert(offsetof(KernelCB, deny_native) == 0x3C, "CB_DENY_NATIVE");
 _Static_assert(offsetof(KernelCB, deny_68k) == 0x44, "CB_DENY_68K");
 _Static_assert(offsetof(KernelCB, tables) == 0x4C, "CB_TABLES");
+_Static_assert(offsetof(KernelCB, spaces) == 0x50, "CB_SPACES");
+_Static_assert(offsetof(KernelCB, lazy) == 0x5C, "CB_LAZY");
 _Static_assert(offsetof(KernelCB, pages) == 0x100, "CB_PAGES");
 _Static_assert(offsetof(KernelCB, ring) == 0x300, "CB_RING");
 _Static_assert(sizeof(KEvent) == 32, "event size");
@@ -178,12 +203,23 @@ static inline long kcb_owners(unsigned long first, unsigned long count,
     return nk_call(kMPEnforcer, &k);
 }
 
-/* kKcbOpMode or kKcbOpCurrent. */
+/* kKcbOpMode, kKcbOpCurrent or kKcbOpSwitch; or one with a second
+   argument (kKcbOpSpaces, kKcbOpFlush). */
 static inline long kcb_set(unsigned long op, unsigned long value)
 {
     KRegs k = {0};
     k.r3 = op;
     k.r4 = value;
+    return nk_call(kMPEnforcer, &k);
+}
+
+static inline long kcb_set2(unsigned long op, unsigned long a,
+                            unsigned long b)
+{
+    KRegs k = {0};
+    k.r3 = op;
+    k.r4 = a;
+    k.r5 = b;
     return nk_call(kMPEnforcer, &k);
 }
 
