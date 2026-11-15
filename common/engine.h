@@ -533,7 +533,24 @@ typedef struct {
        which is while protection is on, with slices of slice_ms. */
     struct YieldData *yield;
     unsigned long preempt_on, slice_ms;
+    /* Launch sizes. The Process Manager sizes a new application's
+       partition from its 'SIZE' resource: one routine copies the preferred
+       and minimum sizes into a record and adds the default stack. A hook
+       at that routine's exit (size_site, patched like pm_site; size_mapped
+       as pm_mapped) raises the preferred size to kSizeFactor times what
+       the file asks, but no more than size_cap: 1/kSizeShare of the
+       Process Manager heap's free bytes, set each tick, 0 while protection
+       is off. The minimum stays, so an application still launches when
+       memory is short. Launching does not touch the partition's pages
+       (CLAUDE.md, "Memory on demand"), so with virtual memory on the
+       larger partition costs addresses, not memory. size_raised counts
+       the sizes raised; size_from and size_to are the last. */
+    unsigned long size_site;
+    unsigned long *size_stub;
+    unsigned long size_mapped, size_cap, size_raised, size_from, size_to;
 } State;
+
+enum { kSizeFactor = 4, kSizeShare = 4 };
 
 /* Install the hooks, the fallback handler and the timer, read the process
    list, and start in mode. name is the running program's, for the log.

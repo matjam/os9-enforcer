@@ -39,6 +39,19 @@ enum {
     kStubLongs = 72
 };
 
+/* The launch size hook (size_hook): the instruction at its site, and the
+   stub's layout in longs (the cap, the count of sizes raised, the last
+   size before and after, then code). */
+enum {
+    kSizeInsn = 0x7FA3EB78, /* mr r3,r29 */
+    kSzCap = 0,
+    kSzRaised = 1,
+    kSzFrom = 2,
+    kSzTo = 3,
+    kSzCode = 8,
+    kSzLongs = 40
+};
+
 /* SysPages.flags */
 enum { kPageExcluded = 1, kPageHot = 2, kPageCooled = 4 };
 
@@ -905,6 +918,7 @@ static void sys_start(State *s)
     /* The hook's stub stores into its save area at every switch, and the
        yield stub counts in its block. */
     sys_exclude_block(s, s->pm_stub, s->pm_stub ? kStubLongs * 4 : 0);
+    sys_exclude_block(s, s->size_stub, s->size_stub ? kSzLongs * 4 : 0);
     sys_exclude_block(s, s->yield, s->yield ? sizeof hyield_code : 0);
     unsigned long hi = sys_heap_hi(s, lo, sp->cap), n = (hi - lo) / kPage;
     sys_check_access(s, 0, n);
@@ -2865,6 +2879,177 @@ static void pm_hook(State *s)
     flush_code((volatile void *)site, 4);
 }
 
+/* Launch sizes (engine.h). The Process Manager's routine that reads a
+   'SIZE' resource into a record at r31 (flags, the preferred size at +2,
+   the minimum at +6) ends, in 9.2.2:
+       lwz  r3,802(0)        ; the default stack, added to both sizes
+       cmpwi r3,8192
+       ...
+       stw  r7,6(r31)
+   Z:  mr   r3,r29           ; the result: whether there was a resource
+       addi r1,r1,80
+   Z becomes a branch to a stub that raises the preferred size, runs Z and
+   returns to the instruction after it. The volatile registers and CTR are
+   dead there. The stub:
+       lis   r5,stub@h ; ori r5,r5,stub@l
+       lwz   r6,0(r5)        ; the cap; 0: off
+       lwz   r4,2(r31)       ; the preferred size
+       cmplwi r6,0 ; beq done
+       rlwinm. r7,r4,0,0,1 ; bne done   ; 1 GB or more: leave it
+       slwi  r7,r4,2         ; kSizeFactor times
+       cmplw r7,r6 ; ble +8 ; mr r7,r6  ; no more than the cap
+       cmplw r7,r4 ; ble done           ; and no less than asked
+       stw   r7,2(r31)
+       ...                   ; count it; keep the two sizes
+   done: mr  r3,r29
+       lis   r5,back@h ; ori r5,r5,back@l ; mtctr r5 ; bctr */
+static int size_site_at(const volatile unsigned long *w)
+{
+    return w[0] == kSizeInsn && w[1] == 0x38210050 && w[-1] == 0x90FF0006 &&
+           w[-11] == 0x2C032000 && w[-12] == 0x80600322;
+}
+
+/* The stub, returning to the instruction after site (0: not known yet). */
+static void size_stub_aim(unsigned long *p, unsigned long site)
+{
+    unsigned long base = (unsigned long)p, back = site + 4;
+    unsigned long *c = p + kSzCode;
+    *c++ = 0x3CA00000 | base >> 16;      /* lis r5,base@h */
+    *c++ = 0x60A50000 | (base & 0xFFFF); /* ori r5,r5,base@l */
+    *c++ = 0x80C50000 | kSzCap * 4;      /* lwz r6,cap(r5) */
+    *c++ = 0x809F0002;                   /* lwz r4,2(r31) */
+    *c++ = 0x28060000;                   /* cmplwi r6,0 */
+    *c++ = 0x4182003C;                   /* beq done */
+    *c++ = 0x54870003;                   /* rlwinm. r7,r4,0,0,1 */
+    *c++ = 0x40820034;                   /* bne done */
+    *c++ = 0x5487103A;                   /* slwi r7,r4,2 */
+    *c++ = 0x7C073040;                   /* cmplw r7,r6 */
+    *c++ = 0x40810008;                   /* ble +8 */
+    *c++ = 0x7CC73378;                   /* mr r7,r6 */
+    *c++ = 0x7C072040;                   /* cmplw r7,r4 */
+    *c++ = 0x4081001C;                   /* ble done */
+    *c++ = 0x90FF0002;                   /* stw r7,2(r31) */
+    *c++ = 0x81050000 | kSzRaised * 4;   /* lwz r8,raised(r5) */
+    *c++ = 0x39080001;                   /* addi r8,r8,1 */
+    *c++ = 0x91050000 | kSzRaised * 4;   /* stw r8,raised(r5) */
+    *c++ = 0x90850000 | kSzFrom * 4;     /* stw r4,from(r5) */
+    *c++ = 0x90E50000 | kSzTo * 4;       /* stw r7,to(r5) */
+    *c++ = kSizeInsn;                    /* done: mr r3,r29 */
+    *c++ = 0x3CA00000 | back >> 16;      /* lis r5,back@h */
+    *c++ = 0x60A50000 | (back & 0xFFFF); /* ori r5,r5,back@l */
+    *c++ = 0x7CA903A6;                   /* mtctr r5 */
+    *c++ = 0x4E800420;                   /* bctr */
+    flush_code(p + kSzCode, (unsigned long)(c - (p + kSzCode)) * 4);
+}
+
+/* The branch from site to the stub's code, or 0 when it does not reach. */
+static unsigned long size_branch(State *s, unsigned long site)
+{
+    unsigned long to = (unsigned long)(s->size_stub + kSzCode);
+    long off = (long)(to - site);
+    if (off >= -0x2000000L && off < 0x2000000L)
+        return 0x48000000 | ((unsigned long)off & 0x03FFFFFC); /* b */
+    if (to < 0x2000000UL)
+        return 0x48000002 | to; /* ba */
+    return 0;
+}
+
+/* Make the stub (engine_start, before the system heap is watched) and, with
+   the Process Manager's code in the system heap (virtual memory off), hook
+   the site. */
+static void size_hook(State *s)
+{
+    unsigned long *p = (unsigned long *)NewPtrSysClear(kSzLongs * 4);
+    if (!p)
+        return;
+    size_stub_aim(p, 0);
+    hold(s, p, kSzLongs * 4, 1);
+    s->size_stub = p;
+    unsigned long lo = lowmem_long(0x2A6); /* SysZone */
+    unsigned long hi = *(volatile unsigned long *)lo;
+    unsigned long site = 0;
+    int n = 0;
+    for (const volatile unsigned long *w =
+             (const volatile unsigned long *)((lo + 128) & ~3UL);
+         (unsigned long)w < (hi & ~3UL) - 8; w++)
+        if (*w == kSizeInsn && size_site_at(w)) {
+            site = (unsigned long)w;
+            n++;
+        }
+    unsigned long insn = n == 1 ? size_branch(s, site) : 0;
+    if (!insn)
+        return;
+    size_stub_aim(p, site);
+    s->size_site = site;
+    *(volatile unsigned long *)site = insn;
+    flush_code((volatile void *)site, 4);
+}
+
+/* With virtual memory on: the site, found by pm_hook_mapped in the
+   file-mapped code, patched through the kernel on a held page. */
+static void size_hook_mapped(State *s, unsigned long site)
+{
+    if (!s->size_stub || s->size_site)
+        return;
+    unsigned long insn = size_branch(s, site);
+    if (!insn)
+        return;
+    size_stub_aim(s->size_stub, site);
+    HoldMemory((void *)(site & kPageMask), kPage);
+    if (*(volatile unsigned long *)site != kSizeInsn ||
+        kcb_patch(site, kSizeInsn, insn)) {
+        UnholdMemory((void *)(site & kPageMask), kPage);
+        s->c.kernel_errors++;
+        return;
+    }
+    s->size_site = site;
+    s->size_mapped = 1;
+}
+
+/* Put the instruction back and free the stub, as pm_unhook. */
+static void size_unhook(State *s)
+{
+    if (!s->size_stub)
+        return;
+    s->size_stub[kSzCap] = 0;
+    if (s->size_site && s->size_mapped) {
+        volatile unsigned long *w = (volatile unsigned long *)s->size_site;
+        if (!s->kcb || kcb_patch(s->size_site, *w, kSizeInsn)) {
+            s->c.kernel_errors++;
+            s->size_site = 0;
+            s->size_stub = 0;
+            s->size_mapped = 0;
+            return;
+        }
+        UnholdMemory((void *)(s->size_site & kPageMask), kPage);
+        s->size_mapped = 0;
+    } else if (s->size_site) {
+        *(volatile unsigned long *)s->size_site = kSizeInsn;
+        flush_code((volatile void *)s->size_site, 4);
+    }
+    hold(s, s->size_stub, kSzLongs * 4, 0);
+    DisposePtr((Ptr)s->size_stub);
+    s->size_site = 0;
+    s->size_stub = 0;
+}
+
+/* The cap for the next launch, and the stub's counts (task level). */
+static void size_follow(State *s)
+{
+    unsigned long *p = s->size_stub;
+    if (!p)
+        return;
+    unsigned long cap = 0;
+    if (s->mode != kModeOff && s->pm_zone)
+        cap = ((unsigned long)((THz)s->pm_zone)->zcbFree / kSizeShare) &
+              ~0xFFFUL;
+    p[kSzCap] = cap;
+    s->size_cap = cap;
+    s->size_raised = p[kSzRaised];
+    s->size_from = p[kSzFrom];
+    s->size_to = p[kSzTo];
+}
+
 /* Whether the page at addr is in the kernel area area and can be read:
    the area for file-mapped code is larger than what is mapped in it, and
    a read of a page with nothing behind it is a bus error. HoldMemory
@@ -2903,15 +3088,20 @@ static void pm_hook_mapped(State *s)
         lo -= kPage;
     while (hi - page < kPmReach && page_readable(hi, area))
         hi += kPage;
-    unsigned long site = 0;
-    int n = 0;
+    unsigned long site = 0, zsite = 0;
+    int n = 0, nz = 0;
     for (const volatile unsigned long *w =
              (const volatile unsigned long *)(lo + 128);
          (unsigned long)w < hi - 8; w++)
         if (*w == 0x4E800020 && pm_switch_at(w)) {
             site = (unsigned long)w;
             n++;
+        } else if (*w == kSizeInsn && size_site_at(w)) {
+            zsite = (unsigned long)w;
+            nz++;
         }
+    if (nz == 1)
+        size_hook_mapped(s, zsite);
     if (n != 1)
         return;
     /* The stub engine_start made for B, before the system heap was
@@ -3391,6 +3581,7 @@ long engine_start(State **out, unsigned long mode, const char *name)
        (spaces_cover). */
     s->spaces = s->kcb != 0;
     if (s->spaces) {
+        size_hook(s);
         pm_hook(s);
         /* Not found (virtual memory on): a stub for B now, so that the
            system heap's watch leaves it out; pm_hook_mapped installs it
@@ -3467,6 +3658,7 @@ void engine_poll(State *s)
     if (s->want_sys != s->sys_on)
         engine_set_sys(s, s->want_sys);
     sys_follow(s);
+    size_follow(s);
     if (s->pm_stub && !s->pm_site && s->kcb && s->kcb->lazy_pc &&
         s->kcb->lazy_pc != s->pm_tried && s->pm_tries < kPmTries)
         pm_hook_mapped(s);
@@ -3502,6 +3694,7 @@ void engine_stop(State *s)
         unprotect_domain(s, i);
     }
     s->sys_on = 0;
+    size_unhook(s);
     pm_unhook(s);
     kcb_stop(s);
     self_exit_remove();

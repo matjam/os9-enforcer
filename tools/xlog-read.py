@@ -43,7 +43,8 @@ MAX_CHUNKS = 128
 # hook.
 SPACES = ["skips", "spaces", "vsid_mask", "spaces_on", "pm_site", "pm_stub",
           "pm_mapped", "pm_tried", "pm_tries", "yield", "preempt_on",
-          "slice_ms"]
+          "slice_ms", "size_site", "size_stub", "size_mapped", "size_cap",
+          "size_raised", "size_from", "size_to"]
 # The yield stub's data (common/hyield.h).
 YIELD = (["magic", "entry", "vecbr", "check", "wne", "entered", "yielded",
           "lost", "starting", "not_task", "in_call", "other_stack",
@@ -188,6 +189,13 @@ def print_kernel(k):
                   k["pm_stub"]) if k["pm_site"] else
               "not installed (%d searches, the last from %08X)" % (
                   k["pm_tries"], k["pm_tried"])))
+    print("  launch sizes: hook %s; cap %d KB; raised %d, the last from %d KB "
+          "to %d KB" % (
+              "at %08X%s" % (k["size_site"],
+                             " (file-mapped)" if k["size_mapped"] else "")
+              if k["size_site"] else "not installed",
+              k["size_cap"] >> 10, k["size_raised"], k["size_from"] >> 10,
+              k["size_to"] >> 10))
     if k["yield"]:
         print("  preemption: %s, slice %d ms (kernel %d ticks), stub %08X; "
               "redirects %d (pending %08X); stub entries %d, WaitNextEvent "
