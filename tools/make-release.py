@@ -72,7 +72,7 @@ def plain(markdown):
     """README.md without the Markdown marks that only add noise as text."""
     out = []
     for line in markdown.split("\n"):
-        if line.startswith("```"):
+        if line.startswith("```") or line.startswith("[!["):  # code, badges
             continue
         line = re.sub(r"^#+ ", "", line)
         line = line.replace("**", "").replace("`", "")

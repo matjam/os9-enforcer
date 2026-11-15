@@ -1,5 +1,9 @@
 # Enforcer
 
+[![Build](https://github.com/matjam/os9-enforcer/actions/workflows/build.yml/badge.svg?branch=main)](https://github.com/matjam/os9-enforcer/actions/workflows/build.yml)
+[![Latest release](https://img.shields.io/github/v/release/matjam/os9-enforcer)](https://github.com/matjam/os9-enforcer/releases/latest)
+[![License: MIT](https://img.shields.io/github/license/matjam/os9-enforcer)](LICENSE)
+
 Enforcer adds memory protection between applications, preemption, and
 memory on demand to Mac OS 9.2.2 on NewWorld Macs. It is a patch to the
 Mac OS kernel, an extension and a control panel.
