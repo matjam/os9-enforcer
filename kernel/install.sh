@@ -50,6 +50,9 @@ hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage \
 dev=$(awk '$2 == "Apple_partition_scheme" {print $1}' "$tmp/attach")
 part=$(awk '$2 == "Apple_HFS" {print $1}' "$tmp/attach")
 mkdir "$tmp/mnt"
+# A disk from a machine that crashed or was stopped is not unmounted
+# cleanly, and macOS does not mount it for writing until it is repaired.
+fsck_hfs -fy "$part" >/dev/null 2>&1 || true
 mount -t hfs -o nobrowse "$part" "$tmp/mnt"
 
 dest="$tmp/mnt/System Folder/Mac OS ROM"

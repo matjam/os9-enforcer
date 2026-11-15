@@ -1710,11 +1710,37 @@ static unsigned long pool_shrink(State *s)
 /* Make sure the pool holds its headroom and pages more. Task level, at a
    point where the Memory Manager can be called. Returns 0 when the
    machine has no memory for it. */
-static int sparse_ensure(State *s, unsigned long pages)
+/* Pages promised to allocations and not yet given (State.pool_debt): the
+   pages the kernel has given since the last look come off it. A touch
+   the engine promised nothing for also counts, so the debt can run low;
+   the headroom covers that. */
+static void sparse_settle(State *s)
 {
+    long given = sparse_info(1);
+    if (given < 0)
+        return;
+    unsigned long d = (unsigned long)given - s->pool_given;
+    s->pool_given = (unsigned long)given;
+    s->pool_debt = s->pool_debt > d ? s->pool_debt - d : 0;
+    if (!s->sparse_used)
+        s->pool_debt = 0;
+}
+
+static int sparse_ensure(State *s, unsigned long pages, int promise)
+{
+    sparse_settle(s);
     long level = sparse_info(0);
     if (level < 0)
         return 0;
+    /* With promise, the pages are for a block an application will use
+       later: they stay in the pool until they are touched or the pieces
+       are given back, so the engine's poll does not take them away while
+       the application is still on its way through the block (Scribble E:
+       a preempted write loop, the poll in between, and a touch with the
+       pool empty). Without, they are touched right away. */
+    if (promise)
+        s->pool_debt += pages;
+    pages = promise ? s->pool_debt : s->pool_debt + pages;
     while ((unsigned long)level < kPoolHeadroom + pages) {
         unsigned long n = pool_grow(s);
         if (!n) {
@@ -1733,8 +1759,10 @@ static void sparse_balance(State *s)
 {
     if (!s->sparse_area)
         return;
+    sparse_settle(s);
     long level = sparse_info(0);
-    unsigned long keep = s->sparse_used ? 2 * kPoolHeadroom : 0;
+    unsigned long keep =
+        s->sparse_used ? 2 * kPoolHeadroom + s->pool_debt : 0;
     while (level > 0 && (unsigned long)level > keep + kPoolBlock / kPage) {
         unsigned long n = pool_shrink(s);
         if (!n)
@@ -1742,7 +1770,9 @@ static void sparse_balance(State *s)
         level -= n;
     }
     if (s->sparse_used)
-        sparse_ensure(s, 0);
+        sparse_ensure(s, 0, 0);
+    else
+        s->pool_debt = 0;
 }
 
 /* units pieces of the range, in a row: their address, or 0. */
@@ -1805,7 +1835,7 @@ static long pool_md(long sel, unsigned long a0, unsigned long a1)
     unsigned long first = addr & kPageMask;
     unsigned long last = (addr + len - 1) & kPageMask;
     if (CurrentExecutionLevel() == kTaskLevel)
-        sparse_ensure(s, (last - first) / kPage + 1);
+        sparse_ensure(s, (last - first) / kPage + 1, 0);
     unsigned long pairs = 0, run = 0, run_len = 0, done = 0;
     for (unsigned long p = first;; p += kPage) {
         (void)*(volatile unsigned char *)p; /* a page, if it had none */
@@ -1904,7 +1934,7 @@ static Chunk *sparse_chunk(State *s, int d, unsigned long size)
         if (!s->chunks[i].live)
             slot = i;
     if (!s->sparse_area || slot < 0 || units > kSparseMost ||
-        !sparse_ensure(s, 16))
+        !sparse_ensure(s, 16, 0))
         return 0;
     unsigned long lo = sparse_alloc(s, units);
     if (!lo)
@@ -2140,7 +2170,7 @@ static long pool_over(long trap, long size, int ptr)
            have them there first. */
         if (chunk_is_sparse(c) &&
             ((unsigned long)((THz)c->zone)->zcbFree < (unsigned long)size ||
-             !sparse_ensure(s, (unsigned long)size / kPage + 2)))
+             !sparse_ensure(s, (unsigned long)size / kPage + 2, 1)))
             continue;
         b = ptr ? (unsigned long)chunk_alloc_ptr(c, size)
                 : (unsigned long)chunk_alloc(c, size);
@@ -2924,7 +2954,7 @@ static void pool_top(long size)
     State *s = g_state;
     if (s && s->running && s->sparse_area && size > 0 &&
         CurrentExecutionLevel() == kTaskLevel)
-        sparse_ensure(s, (unsigned long)size / kPage + 2);
+        sparse_ensure(s, (unsigned long)size / kPage + 2, 1);
 }
 
 static PoolStubs *pool_install(void)
@@ -3710,7 +3740,7 @@ static long part_new(long size)
     for (int i = 0; i < kMaxParts && slot < 0; i++)
         if (!s->parts[i].units)
             slot = i;
-    if (slot < 0 || units > kSparseMost || !sparse_ensure(s, 64))
+    if (slot < 0 || units > kSparseMost || !sparse_ensure(s, 64, 0))
         return -1;
     unsigned long lo = sparse_alloc(s, units);
     if (!lo)

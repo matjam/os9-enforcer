@@ -648,6 +648,9 @@ typedef struct {
     unsigned long *part;
     unsigned long part_made, part_freed;
     unsigned long md_calls; /* _MemoryDispatch calls for the sparse range */
+    /* Pages promised to allocations and not yet given by the kernel, and
+       the kernel's count of pages given at the last look. */
+    unsigned long pool_debt, pool_given;
     SparsePart parts[kMaxParts];
     PoolBlock pool_blocks[kPoolBlocks];
 } State;

@@ -137,10 +137,6 @@ Known holes:
   application into the previous application's memory before then is not
   caught. The same applies at an application's launch and quit, with
   virtual memory on or off.
-- With virtual memory on, when the current application touches a page of
-  another application that is on disk, the Virtual Memory Manager can map
-  it writable for the current application until the mapping is next
-  rebuilt.
 - The partly used first and last pages of a partition are not protected.
 - With virtual memory on, code in an application's own shared libraries
   and plug-ins counts as the system's.

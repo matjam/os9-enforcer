@@ -207,6 +207,10 @@ kernel:
         stock   0x5EC8                          # FDP_06c0, after its stwcx.
         b       stwcx_probe                     # was: isync
 
+        stock   0x9C48                          # VMLastExportedFunc_0x87: the
+        b       vm_pp                           # PTE a VM call builds itself
+                                                # (patch 5); was: blr
+
         stock   0xACB8 + 4 * MP_ENFORCER        # MP call table (patch 4)
         .4byte  enf_register - kernel - 4 * MP_ENFORCER # was: MPCallBad
                                                 # (.long would stop `stock`
@@ -734,9 +738,12 @@ pf1_paged_pp:
         bl      pp_owner                        # for "present, no PTE"
         b       PF1_build
 1:      bge     cr7, 2f                         # not "no page": as before
-        bl      sparse_fill                     # patch 7
-        bne     2f
-        li      8, 0x801                        # as @_12c, for an area not
+        mfcr    21                              # cr0 is PagingFunc1's
+        bl      sparse_fill                     # result ("page fault"
+        beq     3f                              # here): patch 7 keeps it
+        mtcrf   0x84, 21                        # when it gives no page
+        b       PF1_paged_rest                  # (and cr5)
+3:      li      8, 0x801                        # as @_12c, for an area not
         li      9, 0x01                         # at 0; then the test again,
         lwz     28, 0(26)                       # with the page in the PLE
         b       pf1_paged
@@ -761,7 +768,9 @@ pf1_list_pp:
 # ahead of what can be touched. OP_SPARSE_FREE takes pages back.
 #
 # sparse_fill: r27 the address, r26 &PLE, r28 the PLE (no page, no PTE).
-# Returns cr0.eq when the PLE has a page now. Uses r14-r20, cr0, cr5.
+# Returns cr0.eq when the PLE has a page now. Uses r14-r20, cr0, cr5; the
+# caller puts cr0 back when it is not eq, since PagingFunc1 returns its
+# result there (with virtual memory on, every page fault passes here).
 sparse_fill:
         mflr    14
         bl      1f
@@ -875,6 +884,48 @@ pp_owner:
         beq     9f                              # this VSID's application's
         ori     31, 31, 3                       # PP 11: read-only
 9:      mtlr    22
+        blr
+
+# vm_pp: with virtual memory on, the VM calls that put a page in the page
+# table themselves (VMLastExportedFunc_0x87: r4 the page number, r8 and r9
+# the new PTE, its protection from the PLE alone) skipped pp_owner, so a
+# page of another application that was paged in while the current one
+# touched it was writable to the current one (Scribble n at a page of the
+# Finder's that was not resident: the store landed, with no fault). The
+# routine's blr comes here: the PTE's lower word gets pp_owner's
+# protection. Every register is kept but r9; the saves are in vm_save
+# (the VM calls run in the blue task only).
+vm_pp:
+        mflr    7                               # r5 and r7 are the routine's
+        bl      1f                              # own scratch
+1:      mflr    5
+        stw     7, vm_save - 1b(5)              # its return address
+        mfcr    7
+        stw     7, vm_save + 4 - 1b(5)
+        stw     8, vm_save + 8 - 1b(5)
+        stw     14, vm_save + 12 - 1b(5)
+        stw     15, vm_save + 16 - 1b(5)
+        stw     16, vm_save + 20 - 1b(5)
+        stw     22, vm_save + 24 - 1b(5)
+        stw     27, vm_save + 28 - 1b(5)
+        stw     31, vm_save + 32 - 1b(5)
+        mr      31, 9                           # the PTE's lower word
+        slwi    27, 4, 12                       # the page's address
+        bl      pp_owner                        # uses r8, r9, r14-r16, r22
+        mr      9, 31
+        bl      2f
+2:      mflr    5
+        lwz     8, vm_save + 8 - 2b(5)
+        lwz     14, vm_save + 12 - 2b(5)
+        lwz     15, vm_save + 16 - 2b(5)
+        lwz     16, vm_save + 20 - 2b(5)
+        lwz     22, vm_save + 24 - 2b(5)
+        lwz     27, vm_save + 28 - 2b(5)
+        lwz     31, vm_save + 32 - 2b(5)
+        lwz     7, vm_save + 4 - 2b(5)
+        mtcr    7
+        lwz     7, vm_save - 2b(5)
+        mtlr    7
         blr
 
 # vsid_owner: r9 a segment register's value -> r9 the owner byte whose
@@ -1759,3 +1810,5 @@ sparse_fills:
         .long   0                               # pages given (1),
 sparse_empty:
         .long   0                               # faults with none to give (2)
+vm_save:
+        .long   0, 0, 0, 0, 0, 0, 0, 0, 0       # vm_pp's registers

@@ -733,6 +733,12 @@ The patch:
   everywhere else).
 - With the pool empty the fault goes on as in the stock kernel, and is
   counted. The caller has to keep the pool ahead of what can be touched.
+- `PagingFunc1` returns its result in cr0 ("page fault", "invalid
+  address"), and with virtual memory on every page fault passes the
+  patch's test. The first version left its own compare in cr0, so every
+  page fault came back as an invalid address and startup stopped with an
+  address error. The site saves CR and puts cr0 and cr5 back when it
+  gives no page. Test a kernel change with virtual memory on as well.
 - Operations of MP call 109 (`kcb.h`): `OP_SPARSE` (the range),
   `OP_POOL_PUT` (a physical page the caller owns), `OP_POOL_GET` (one
   back), `OP_SPARSE_FREE` (an address and a number of pages: their PTEs
@@ -822,12 +828,17 @@ Worst first. Keep in step with Limits in `README.md`.
    engine's stub while that application is current.
 10. With virtual memory on, a protect can be lost to `setPTEntryGivenPage`
     until the engine protects the page again (pages not covered by VSIDs:
-    the system heap, ranges past segment 5). For covered pages, the VM
-    calls that insert a PTE themselves (`VMLastExportedFunc`,
-    `VMSecondLastExportedFunc`, NKVMCalls.s 1822-1925) take PP from the
-    PLE, so a page another application owns, paged in under the current
-    VSIDs, is writable to the current application until its PTE is built
-    again. Not tested.
+    the system heap, ranges past segment 5). For covered pages this is
+    closed (2026-11-15): the VM calls that insert a PTE themselves
+    (`VMLastExportedFunc`, `VMSecondLastExportedFunc`, NKVMCalls.s
+    1822-1925) took PP from the PLE, so a page another application owned,
+    paged in while the current one touched it, stayed writable to the
+    current one. Scribble `n`, `W` and `6` landed in a page of the
+    Finder's heap that was not resident (the test's target moved there
+    when `GetProcessInformation` began to count chunks; the build before
+    that tested a resident page and was denied). `vm_pp`, at the routine's
+    `blr` (kernel offset 0x9C48), gives that PTE `pp_owner`'s protection;
+    `n` and `6` are denied at the same address.
 11. With virtual memory on, the switch hook goes in only after the first
     lazy switch, whose PC the search needs (25 lazy switches in a VM-on
     boot before it was in). Until then, and at launches and quits, the
@@ -1188,6 +1199,14 @@ Left:
   the second group emptied the pool: the application quit with a type 2
   error, and the machine went on. Calls the ROM makes for itself past the
   trap table, smaller blocks and the stack come out of the headroom.
+- What `pool_top` and overflow promise stays in the pool until the kernel
+  has given that many pages or the pieces are given back (`pool_debt`,
+  `sparse_settle`). Before, the poll took pages back while a preempted
+  write loop was still on its way through a grown block, and the next
+  touch found the pool empty: the application went away without a
+  message. A block that is freed untouched keeps its promise until its
+  application quits, so the pool can hold more than is needed (34 MB
+  after two runs of `E`).
 - Freed heap pages do not go back until the partition does (reclaim).
 - `GetProcessInformation` reports the partition's 29 MB as its size, not
   the pages behind it, and a sparse chunk by its pieces.
