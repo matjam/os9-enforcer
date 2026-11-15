@@ -9,7 +9,7 @@ Reads PREFIX.sites, PREFIX.words and, if there, PREFIX.pages (see
 storewatch.c). Low memory globals are named from the LMGet accessors in the
 Multiversal Interfaces in the Retro68 toolchain
 ($RETRO68/multiversal/CIncludes/Multiverse.h, RETRO68 defaulting to
-/opt/retro68), which give each global's address.
+~/.local/opt/retro68), which give each global's address.
 
 The page model section gives, for each protection interval:
   traps/interval  traps per interval: at one interval per 16 ms tick, times
@@ -25,8 +25,8 @@ import sys
 from collections import defaultdict
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-MULTIVERSE = os.path.join(os.environ.get("RETRO68", "/opt/retro68"),
-                          "multiversal", "CIncludes", "Multiverse.h")
+RETRO68 = os.environ.get("RETRO68") or os.path.expanduser("~/.local/opt/retro68")
+MULTIVERSE = os.path.join(RETRO68, "multiversal", "CIncludes", "Multiverse.h")
 LOW_END = 0x2800
 
 

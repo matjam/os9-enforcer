@@ -1,22 +1,23 @@
 #!/bin/sh
-# Build the Retro68 PowerPC toolchain from the Retro68 submodule
-# (toolchain/Retro68) and install it in /opt/retro68, or in $RETRO68 when
-# that is set. ./build.sh, kernel/build.sh and tools/make-dist.sh find it
-# there (toolchain/find.sh).
+# Install the Retro68 PowerPC toolchain in ~/.local/opt/retro68, or in
+# $RETRO68 when that is set. ./build.sh, kernel/build.sh and
+# tools/make-dist.sh find it there (toolchain/find.sh); CI runs this script
+# to build it.
 #
-# Usage: toolchain/build.sh
+# Usage:
+#   toolchain/build.sh       fetch, build and install
+#   toolchain/build.sh src   fetch only
 #
-# The install folder must be writable and empty. To make /opt/retro68, run
-# once:
-#   sudo mkdir -p /opt/retro68 && sudo chown "$USER" /opt/retro68
-# The build files go into toolchain/build, which can be removed afterwards.
-# The installed toolchain records the submodule commit it was built from in
-# REVISION; when that is the submodule's commit, the script does nothing.
-# To rebuild from another commit, empty the install folder first.
+# Fetches Retro68 at the commit below, with its multiversal submodule, into
+# toolchain/Retro68, builds in toolchain/build, and installs. Both folders
+# are git-ignored and can be removed afterwards. A finished install records
+# the commit in REVISION; when that is this commit, the script does
+# nothing. To move to another commit, change it here, empty the install
+# folder, and run the script.
 #
-# Fetches the submodule if it is missing. Builds PowerPC only, with the
-# open-source Multiversal Interfaces: Enforcer has no 68k or Carbon
-# programs and needs none of Apple's Universal Interfaces.
+# Builds PowerPC only, with the open-source Multiversal Interfaces:
+# Enforcer has no 68k or Carbon programs and needs none of Apple's
+# Universal Interfaces.
 #
 # Needs, on macOS:
 #   brew install boost cmake ninja gmp mpfr libmpc bison texinfo
@@ -24,31 +25,45 @@
 #   sudo apt-get install cmake ninja-build g++ libgmp-dev libmpfr-dev \
 #       libmpc-dev libboost-all-dev bison flex texinfo ruby
 set -eu
+commit=a4a389c41e90b1095a40ccf13f28678b6cfbba86
+url=https://github.com/autc04/Retro68.git
+
 here=$(cd "$(dirname "$0")" && pwd)
 src=$here/Retro68
 out=$here/build
-prefix=${RETRO68:-/opt/retro68}
+prefix=${RETRO68:-$HOME/.local/opt/retro68}
 
-if [ ! -f "$src/build-toolchain.bash" ] ||
-   [ ! -f "$src/multiversal/make-multiverse.rb" ]; then
-    git -C "$here/.." submodule update --init --recursive toolchain/Retro68
-fi
-rev=$(git -C "$src" rev-parse HEAD)
+stage=${1:-all}
+case "$stage" in
+    all|src) ;;
+    *) echo "usage: $0 [src]" >&2; exit 2 ;;
+esac
 
-if [ -f "$prefix/REVISION" ] && [ "$(cat "$prefix/REVISION")" = "$rev" ]; then
-    echo "toolchain: $prefix is already built from Retro68 $rev"
+if [ "$stage" = all ] && [ -f "$prefix/REVISION" ] &&
+   [ "$(cat "$prefix/REVISION")" = "$commit" ]; then
+    echo "toolchain: $prefix is already built from Retro68 $commit"
     exit 0
 fi
-mkdir -p "$prefix" 2>/dev/null || true
+
+# Fetch the one commit, not Retro68's history.
+if [ ! -d "$src/.git" ] || [ "$(git -C "$src" rev-parse HEAD)" != "$commit" ]; then
+    rm -rf "$src"
+    git init -q "$src"
+    git -C "$src" fetch -q --depth 1 "$url" "$commit"
+    git -C "$src" checkout -q FETCH_HEAD
+fi
+git -C "$src" submodule update -q --init --recursive --depth 1
+[ "$stage" = src ] && exit 0
+
+mkdir -p "$prefix"
 if [ ! -w "$prefix" ]; then
-    echo "$prefix is not a folder you can write. To make it, run:" >&2
-    echo "  sudo mkdir -p $prefix && sudo chown \"\$USER\" $prefix" >&2
+    echo "$prefix is not a folder you can write." >&2
     exit 1
 fi
 if [ -n "$(ls -A "$prefix")" ]; then
     old=$(cat "$prefix/REVISION" 2>/dev/null || echo "an unknown commit")
-    echo "$prefix holds a toolchain built from Retro68 $old;" >&2
-    echo "the submodule is at $rev. To replace it, empty $prefix first." >&2
+    echo "$prefix holds a toolchain built from Retro68 $old." >&2
+    echo "To replace it with $commit, empty $prefix first." >&2
     exit 1
 fi
 
@@ -66,5 +81,5 @@ mkdir -p "$out"
 cd "$out"
 bash "$src/build-toolchain.bash" --no-68k --no-carbon --multiversal --ninja \
     --prefix="$prefix"
-echo "$rev" >"$prefix/REVISION"
+echo "$commit" >"$prefix/REVISION"
 echo "toolchain: $prefix"

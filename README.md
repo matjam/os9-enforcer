@@ -171,9 +171,9 @@ Compatibility:
 
 ## Building
 
-Enforcer builds with Retro68's PowerPC toolchain, which this repository
-builds from source: Retro68 is a Git submodule in `toolchain/Retro68`.
-The build needs no Apple files.
+Enforcer builds with Retro68's PowerPC toolchain, which
+`toolchain/build.sh` builds from source at a pinned commit. The build
+needs no Apple files.
 
 To install the packages the toolchain needs on macOS, run:
 
@@ -187,16 +187,9 @@ On Debian or Ubuntu, run:
 sudo apt-get install cmake ninja-build g++ libgmp-dev libmpfr-dev libmpc-dev libboost-all-dev bison flex texinfo ruby python3
 ```
 
-The toolchain installs in `/opt/retro68`. To make that folder yours, run
-this once:
-
-```bash
-sudo mkdir -p /opt/retro68 && sudo chown "$USER" /opt/retro68
-```
-
-To build the toolchain, run this once. It fetches the submodule (1.7 GB),
-builds in `toolchain/build` (2.3 GB) and installs in `/opt/retro68`; on an
-8-core Mac it takes about 7 minutes:
+To build the toolchain, run this once. It fetches Retro68 into
+`toolchain/Retro68`, builds in `toolchain/build` (2.3 GB) and installs in
+`~/.local/opt/retro68`; on an 8-core Mac it takes about 7 minutes:
 
 ```bash
 toolchain/build.sh
@@ -239,13 +232,12 @@ kernel work.
 | `h68k/` | H68KTest: tests for both write hooks |
 | `wlog/` | WLog: the first write logger |
 | `probe/` | Probe: the first page protection experiment |
-| `toolchain/` | Retro68 (a submodule) and the scripts that build its toolchain into `/opt/retro68` and find it |
-| `qemu/` | QEMU for the test machine (a submodule), its patch, and the script that builds it into `/opt/qemu-os9` |
+| `toolchain/` | The scripts that install the Retro68 toolchain in `~/.local/opt/retro68` and find it |
+| `qemu/` | The patch and the script that install QEMU for the test machine in `~/.local/opt/qemu-os9` |
 | `refs/` | Reference sources (submodules): the NanoKernel reconstructions and tbxi |
 | `tools/` | Host scripts: drive the test machine, read the engine's state and the guest's memory, QEMU plugins, build helpers |
 
 ## License
 
-Enforcer is under the MIT License; see `LICENSE`. The submodules
-(Retro68 in `toolchain/Retro68`, QEMU in `qemu/src`, and `refs/`) have
-their own licenses.
+Enforcer is under the MIT License; see `LICENSE`. Retro68, QEMU and the
+reference sources in `refs/` have their own licenses.

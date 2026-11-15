@@ -17,7 +17,9 @@
 # The guest has a network card (sungem) on QEMU's user-mode network: DHCP,
 # outbound internet, and the host reachable at 10.0.2.2.
 # A QMP control socket is always opened at run/qmp.sock, for screenshots
-# and scripted input.
+# and scripted input; QMP_SOCK=path opens it there instead (tools/qmp.py
+# takes the same variable), so two machines can run at once. The events
+# socket is the same path with .events before .sock.
 #
 # A guest restart hangs QEMU's mac99 firmware on a black screen, so QEMU is
 # told to exit on a guest restart instead, and this script starts it again
@@ -29,16 +31,16 @@ cd "$(dirname "$0")"
 DISK=${DISK:-disks/os9.qcow2}
 MEM=${MEM:-512}
 CDROM=media/macos-922-uni.iso
-QMP=run/qmp.sock
-EVENTS=run/events.sock
+QMP=${QMP_SOCK:-run/qmp.sock}
+EVENTS=${QMP%.sock}.events.sock
 
-# Prefer the QEMU that qemu/build.sh installs (in /opt/qemu-os9, or
-# $QEMU_PREFIX), which adds integer scaling to the Cocoa window; fall back
-# to Homebrew's QEMU.
+# Prefer the QEMU that qemu/build.sh installs (in ~/.local/opt/qemu-os9,
+# or $QEMU_PREFIX), which adds integer scaling to the Cocoa window; fall
+# back to Homebrew's QEMU.
 QEMU=qemu-system-ppc
 QEMU_IMG=qemu-img
 zoom="zoom-to-fit=on"
-qemu_prefix=${QEMU_PREFIX:-/opt/qemu-os9}
+qemu_prefix=${QEMU_PREFIX:-$HOME/.local/opt/qemu-os9}
 if [ -x "$qemu_prefix/bin/qemu-system-ppc" ]; then
   QEMU=$qemu_prefix/bin/qemu-system-ppc
   QEMU_IMG=$qemu_prefix/bin/qemu-img

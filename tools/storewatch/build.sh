@@ -2,13 +2,13 @@
 # Build the storewatch QEMU plugin: tools/storewatch/build/libstorewatch.dylib.
 #
 # It needs glib from Homebrew and the QEMU that qemu/build.sh installs (in
-# /opt/qemu-os9, or $QEMU_PREFIX), which has plugins enabled: the plugin is
-# built with that QEMU's plugin header and runs only in it.
+# ~/.local/opt/qemu-os9, or $QEMU_PREFIX), which has plugins enabled: the
+# plugin is built with that QEMU's plugin header and runs only in it.
 
 set -eu
 cd "$(dirname "$0")"
 
-header=${QEMU_PREFIX:-/opt/qemu-os9}/include
+header=${QEMU_PREFIX:-$HOME/.local/opt/qemu-os9}/include
 if [ ! -f "$header/qemu-plugin.h" ]; then
   echo "no $header/qemu-plugin.h: run qemu/build.sh first" >&2
   exit 1

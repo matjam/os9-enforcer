@@ -24,20 +24,14 @@ jobs:
           sudo apt-get install -y cmake ninja-build g++ libgmp-dev \
             libmpfr-dev libmpc-dev libboost-all-dev bison flex texinfo ruby
 
-      - name: Find the Retro68 commit
-        id: retro68
-        run: echo "commit=$(git rev-parse HEAD:toolchain/Retro68)" >> "$GITHUB_OUTPUT"
-
-      # toolchain/build.sh installs into /opt/retro68, as on a Mac.
-      - name: Make /opt/retro68
-        run: sudo mkdir -p /opt/retro68 && sudo chown "$(id -un)" /opt/retro68
-
+      # toolchain/build.sh pins the Retro68 commit, fetches it and installs
+      # the toolchain into ~/.local/opt/retro68.
       - name: Restore the toolchain
         id: cache
         uses: actions/cache/restore@v6
         with:
-          path: /opt/retro68
-          key: retro68-ppc-${{ runner.os }}-${{ runner.arch }}-${{ steps.retro68.outputs.commit }}-${{ hashFiles('toolchain/build.sh') }}
+          path: ~/.local/opt/retro68
+          key: retro68-ppc-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('toolchain/build.sh') }}
 
       - name: Build the toolchain
         if: steps.cache.outputs.cache-hit != 'true'
@@ -48,7 +42,7 @@ jobs:
         if: steps.cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
         with:
-          path: /opt/retro68
+          path: ~/.local/opt/retro68
           key: ${{ steps.cache.outputs.cache-primary-key }}
 
       - name: Build the programs

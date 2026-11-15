@@ -7,11 +7,11 @@ learned on the way.
 ## Conventions
 
 - Everything Enforcer needs is in this repository: the test machine
-  (`run.sh`, `disks/`, the tools that drive the guest), the third-party
-  sources as submodules (Retro68, QEMU, the reference sources), and the
-  scripts that build them. Retro68 and the patched QEMU install outside
-  it, in `/opt/retro68` and `/opt/qemu-os9`, and Aura (`../aura`) uses the
-  same installs and copies its base disks from `disks/`.
+  (`run.sh`, `disks/`, the tools that drive the guest), the reference
+  sources (submodules in `refs/`), and the scripts that install Retro68
+  and the patched QEMU in `~/.local/opt/retro68` and
+  `~/.local/opt/qemu-os9` (`toolchain/build.sh`, `qemu/build.sh`). Nothing
+  here is for another project, and other projects keep their own.
 - Commit each working step to `main`. The remote, `origin`, is the
   private GitHub repository matjam/os9-enforcer.
 - Commit only our own sources, scripts and patches. Apple's files stay out
@@ -30,14 +30,9 @@ To set up a new clone on macOS, install the packages:
 brew install boost cmake ninja gmp mpfr libmpc bison texinfo hfsutils glib pixman libslirp pkg-config
 ```
 
-Make the two install folders yours (once per machine):
-
-```bash
-sudo mkdir -p /opt/retro68 /opt/qemu-os9 && sudo chown "$USER" /opt/retro68 /opt/qemu-os9
-```
-
-Build and install the toolchain, then QEMU, then make tbxi's Python
-environment. Each script fetches its submodule when it is missing:
+Install the toolchain and QEMU, and make tbxi's Python environment. The
+install scripts fetch the source they build, and do nothing when the
+install is already there:
 
 ```bash
 toolchain/build.sh
@@ -74,31 +69,36 @@ engine program and links DriverServicesLib.
 The toolchain is Retro68's PowerPC toolchain (GCC 16), with the
 open-source Multiversal Interfaces: Apple's Universal Interfaces are not
 installed, so Open Transport, Navigation Services and other post-System 7
-APIs have no headers. `toolchain/build.sh` builds it from the
-`toolchain/Retro68` submodule in `toolchain/build` and installs it in
-`/opt/retro68` (or `$RETRO68`), PowerPC only. `toolchain/find.sh` gives
-`build.sh`, `kernel/build.sh`, `kernel/extract.sh` and
-`tools/make-dist.sh` `$RETRO68`, or `/opt/retro68`.
+APIs have no headers. `toolchain/build.sh` pins the Retro68 commit
+(a4a389c41), fetches that commit and its multiversal submodule into
+`toolchain/Retro68`, builds in `toolchain/build`, PowerPC only, and
+installs in `~/.local/opt/retro68` (or `$RETRO68`). Both folders are
+git-ignored and can be removed after the install. `toolchain/find.sh`
+gives the install folder to `build.sh`, `kernel/build.sh`,
+`kernel/extract.sh` and `tools/make-dist.sh`. A fixed install folder
+matters: Retro68 writes its absolute path into the toolchain's files.
 
-The install records the Retro68 commit it was built from in
-`/opt/retro68/REVISION`. `toolchain/build.sh` does nothing when it is the
-submodule's commit, and `find.sh` warns when it is not the commit this
-repository pins (Aura shares the install). The submodule is pinned to
-a4a389c41. To move it, check out the new commit in `toolchain/Retro68`,
-commit the submodule, empty `/opt/retro68`, and run `toolchain/build.sh`.
+A finished install records the commit in `REVISION`, and
+`toolchain/build.sh` does nothing when it is the pinned one;
+`toolchain/build.sh src` only fetches. To move to another commit, change
+`commit` in the script, empty `~/.local/opt/retro68`, and run it.
+`./build.sh` starts a program's `build/` folder again when its CMake cache
+names another toolchain (`RETRO68_ROOT`), since the cache keeps the tools
+it found first.
 
 To build a CMake project with it, configure it with
-`-DCMAKE_TOOLCHAIN_FILE=/opt/retro68/powerpc-apple-macos/cmake/retroppc.toolchain.cmake`.
+`-DCMAKE_TOOLCHAIN_FILE=$HOME/.local/opt/retro68/powerpc-apple-macos/cmake/retroppc.toolchain.cmake`.
 A Retro68 project must declare both C and CXX (`project(Name C CXX)`),
 because `add_application` links with the C++ driver.
 
-Toolchains built on different hosts do not build byte-identical
-programs; our own code comes out the same, the C library linked in does
-not:
+Toolchains built separately do not build byte-identical programs; our own
+code comes out the same, the C library linked in does not:
 - `toolchain/build.sh` on macOS, against a toolchain built by hand from
   the same commit: the extension and the control panel match. In the
   installer, newlib's `dtoa` read-only data is 64 bytes longer, which
-  moves the data after it.
+  moves the data after it. Against the build in `~/.local/opt` (Retro68
+  a4a389c41 again, 2026-11-14), 113 bytes of the installer's newlib
+  `dtoa` and `mprec` read-only data differ, at the same length.
 - GitHub Actions (Linux): the resource forks match. Code differs only in
   newlib's stdio and `_exit` at the end of each code section.
 Both builds were installed in the guest: the installer recognized the
@@ -111,22 +111,25 @@ toolchain is 354 MB.
 `tools/make-dist.sh` puts the three programs users install, and an HFS
 image holding them, in `dist/`. `.github/workflows/build.yml` builds the
 toolchain, every program and `dist/` on each push, and keeps `dist/` as
-the artifact "Enforcer". It caches the toolchain (`/opt/retro68`) under
-the submodule commit and the hash of `toolchain/build.sh`; either change
-rebuilds it.
+the artifact "Enforcer". It runs `toolchain/build.sh` and caches
+`~/.local/opt/retro68` under the hash of the script, which holds the
+pinned commit; changing the script rebuilds it.
 
 ### QEMU
 
-`qemu/build.sh` builds QEMU from the `qemu/src` submodule (QEMU's git, at
-the v11.1.3 tag, fetched shallow) with each `qemu/patches/*.patch`
-applied to its checkout, a detached HEAD (`.gitmodules` ignores the
-changes there). It configures `qemu/build` (`--prefix=/opt/qemu-os9
---target-list=ppc-softmmu --enable-cocoa --enable-plugins --disable-docs
+`qemu/build.sh` pins the QEMU release (v11.1.3), clones its tag shallow
+into `qemu/src`, and applies each `qemu/patches/*.patch` to the checkout.
+It configures `qemu/build` for the install folder
+(`--target-list=ppc-softmmu --enable-cocoa --enable-plugins --disable-docs
 --disable-werror`), builds it at `nice -n 19`, and installs it in
-`/opt/qemu-os9` (or `$QEMU_PREFIX`). Running it again skips patches
-already applied and rebuilds only what changed.
+`~/.local/opt/qemu-os9` (or `$QEMU_PREFIX`). `qemu/src` and `qemu/build`
+are git-ignored. Running it again skips patches already applied and
+rebuilds only what changed; it configures again when the install folder
+changes (`qemu/build/.prefix`). The install records the release and the
+patches' SHA-1 in `REVISION`; with `qemu/build` gone and `REVISION`
+matching, the script does nothing.
 
-`run.sh` uses `/opt/qemu-os9/bin/qemu-system-ppc` when it exists,
+`run.sh` uses `~/.local/opt/qemu-os9/bin/qemu-system-ppc` when it exists,
 otherwise Homebrew's `qemu-system-ppc`. The patch,
 `0001-cocoa-zoom-integer.patch`, adds the Cocoa `zoom-integer=on|off`
 option. To change it, run `qemu/build.sh src` (fetch and patch only), edit
@@ -136,8 +139,8 @@ the files in `qemu/src`, then regenerate it:
 git -C qemu/src diff > qemu/patches/0001-cocoa-zoom-integer.patch
 ```
 
-To move to another QEMU release, check out its tag in `qemu/src`, commit
-the submodule, check that the patches apply, remove `qemu/build`, and run
+To move to another QEMU release, change `version` in `qemu/build.sh`, run
+`qemu/build.sh src` to check that the patches apply, and run
 `qemu/build.sh`.
 
 ### Reference sources
@@ -183,6 +186,15 @@ memory on; use the control panel there.
 `DISK` defaults to `disks/os9.qcow2`; a name ending in `.qcow2` opens as
 qcow2, any other as raw, relative to the repository's top folder.
 
+To try Enforcer by hand, run `./try.sh` (`--vm` for virtual memory on,
+`--fresh` to start over). It boots your own copy of `os9-vmoff.qcow2` (or
+`os9-pool.qcow2`), made on first use as a whole image in `disks/try.qcow2`
+(`try-vm.qcow2`), so tests that change the test disks do not touch it.
+Its QMP socket is `run/try.sock` (`run/try-vm.sock`), so it runs beside a
+test machine; to drive it, set `QMP_SOCK=run/try.sock` for `tools/qmp.py`,
+`tools/push.sh` and the tools that read the guest. `run.sh` takes
+`QMP_SOCK` too, and `push.sh` keeps its files per socket.
+
 `run.sh` starts QEMU again from the hard disk whenever the guest restarts:
 QEMU's mac99 firmware hangs on a black screen after a guest restart, so
 QEMU exits on a restart instead, and the window closes and reopens.
@@ -226,10 +238,11 @@ An overlay records only its own changes, so changing the image under it
 corrupts the overlay. To make an overlay again, create it on its base
 (the base's name is relative to the overlay's folder), then boot it and
 set it up; for `os9-novm.qcow2`, turn Virtual Memory off in the Memory
-control panel and restart:
+control panel and restart. `qemu-img` is in the `bin/` of the QEMU
+install, or Homebrew's:
 
 ```bash
-/opt/qemu-os9/bin/qemu-img create -f qcow2 -b os9.qcow2 -F qcow2 disks/os9-novm.qcow2
+qemu-img create -f qcow2 -b os9.qcow2 -F qcow2 disks/os9-novm.qcow2
 ```
 
 `os9-kernel.img` is raw so that macOS can attach it and write the ROM file
@@ -237,7 +250,7 @@ into its System Folder while the machine is off; it takes about 330 MB on
 disk (8 GB sparse). To make it again, with the stock Mac OS ROM file:
 
 ```bash
-/opt/qemu-os9/bin/qemu-img convert -O raw disks/os9-novm.qcow2 disks/os9-kernel.img
+qemu-img convert -O raw disks/os9-novm.qcow2 disks/os9-kernel.img
 ```
 
 `os9.qcow2` holds the snapshot `clean-install`: Mac OS 9.2.2 straight
@@ -1156,7 +1169,7 @@ path (0x80200000 blue task, 0x00008000 CPU plugin, 0 another task).
 ## QEMU plugins
 
 Four QEMU TCG plugins in `tools/` watch the guest. Each builds with its
-`build.sh` against the plugin header of the QEMU in `/opt/qemu-os9` and
+`build.sh` against the plugin header of the QEMU that `qemu/build.sh` installs and
 runs only in that QEMU; `run.sh` loads one with `PLUGIN=LIBRARY,ARGS`.
 memwatch, pcwatch and iolog write their report when QEMU exits (for
 example after `tools/qmp.py quit`).

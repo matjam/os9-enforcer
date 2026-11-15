@@ -1,7 +1,11 @@
-# Only our own sources, scripts and patches are tracked. Third-party sources
-# are submodules: Retro68 (toolchain/Retro68), QEMU (qemu/src, which
-# qemu/build.sh patches) and the reference sources (refs/). Apple's software
+# Only our own sources, scripts and patches are tracked. The reference
+# sources (refs/) are submodules. toolchain/build.sh and qemu/build.sh fetch
+# Retro68 and QEMU into toolchain/Retro68 and qemu/src. Apple's software
 # (the install image, the disk images) stays local.
+
+# Retro68 and QEMU, fetched by their install scripts.
+/toolchain/Retro68/
+/qemu/src/
 
 # Build output (./build.sh builds each program in PROGRAM/build,
 # toolchain/build.sh the toolchain in toolchain/build, qemu/build.sh QEMU in

@@ -23,8 +23,14 @@ if [ $# -eq 0 ]; then
 fi
 
 mkdir -p "$here/run"
+# The machine's QMP socket (QMP_SOCK, as for tools/qmp.py) names this
+# script's files in run/, so two machines' discs do not mix.
+tag=push
+if [ -n "${QMP_SOCK:-}" ]; then
+  tag=push-$(basename "$QMP_SOCK" .sock)
+fi
 # A new file name each time, so the guest sees a different disc.
-image="$here/run/push-$(date +%Y%m%d-%H%M%S).img"
+image="$here/run/$tag-$(date +%Y%m%d-%H%M%S).img"
 
 # Size: the files plus a quarter for HFS overhead, at least 2 MB, rounded up
 # to whole megabytes (a whole number of 2048-byte CD sectors).
@@ -42,7 +48,7 @@ humount
 # Mac OS locks the tray while a disc is mounted and does not notice a disc
 # swapped underneath it, so a mounted disc is ejected from the guest first.
 qmp="$here/tools/qmp.py"
-last="$here/run/push-last-name"
+last="$here/run/$tag-last-name"
 case "$("$qmp" cd-state)" in
   locked*)
     "$qmp" guest-eject "$(cat "$last" 2>/dev/null || echo Transfer)"
@@ -51,7 +57,7 @@ esac
 
 "$qmp" change-cd "$image"
 printf '%s\n' "$name" > "$last"
-for old in "$here"/run/push-*.img; do
+for old in "$here"/run/"$tag"-[0-9]*.img; do
   [ "$old" = "$image" ] || rm -f "$old"
 done
 echo "pushed $# file(s) as \"$name\" ($image)"

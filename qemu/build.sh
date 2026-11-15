@@ -1,33 +1,36 @@
 #!/bin/sh
-# Build the patched QEMU that run.sh prefers and install it in
-# /opt/qemu-os9, or in $QEMU_PREFIX when that is set.
+# Install the patched QEMU that run.sh prefers in ~/.local/opt/qemu-os9, or
+# in $QEMU_PREFIX when that is set.
 #
 # Usage:
 #   qemu/build.sh        fetch, patch, configure, build and install
 #   qemu/build.sh src    fetch and patch only (qemu/src), for editing patches
 #
 # Steps:
-#   1. Fetch the submodule qemu/src (QEMU's git, at the release tag the
-#      superproject pins) if it is missing.
-#   2. Apply each qemu/patches/*.patch in name order to its checkout (a
-#      detached HEAD; .gitmodules ignores the changes). A patch that is
+#   1. Fetch QEMU at the release below into qemu/src (a shallow clone of
+#      its tag), unless it is there.
+#   2. Apply each qemu/patches/*.patch in name order. A patch that is
 #      already applied is skipped, so the script can be run again.
 #   3. Configure qemu/build for the install folder if it has not been
-#      configured, build it, and install it. Configuring fetches QEMU's
-#      meson subprojects into qemu/src. To change the install folder,
-#      remove qemu/build first.
+#      configured for it (qemu/build/.prefix), build it, and install it.
+#      Configuring fetches QEMU's meson subprojects into qemu/src.
+# qemu/src and qemu/build are git-ignored and can be removed afterwards.
+# A finished install records the release and the patches' SHA-1 in
+# REVISION; when that matches and qemu/build is gone, the script does
+# nothing.
 #
-# The install folder must be writable. To make /opt/qemu-os9, run once:
-#   sudo mkdir -p /opt/qemu-os9 && sudo chown "$USER" /opt/qemu-os9
-#
-# To change a patch, edit the files in qemu/src, then regenerate it (while
-# there is only one patch):
+# To change a patch, run qemu/build.sh src, edit the files in qemu/src,
+# then regenerate it (while there is only one patch):
 #   git -C qemu/src diff > qemu/patches/0001-cocoa-zoom-integer.patch
 # To go back to the unpatched release: git -C qemu/src checkout -- .
 
 set -eu
+version=v11.1.3
+url=https://github.com/qemu/qemu.git
+
 cd "$(dirname "$0")"
-prefix=${QEMU_PREFIX:-/opt/qemu-os9}
+prefix=${QEMU_PREFIX:-$HOME/.local/opt/qemu-os9}
+revision="$version $(cat patches/*.patch 2>/dev/null | shasum | cut -d' ' -f1)"
 
 stage=${1:-all}
 case "$stage" in
@@ -35,8 +38,18 @@ case "$stage" in
   *) echo "usage: $0 [src]" >&2; exit 2 ;;
 esac
 
-if [ ! -f src/configure ]; then
-  git -C .. submodule update --init --depth 1 qemu/src
+if [ "$stage" = all ] && [ ! -d build ] && [ -f "$prefix/REVISION" ] &&
+   [ "$(cat "$prefix/REVISION")" = "$revision" ]; then
+  echo "qemu: $prefix is already built from $version with these patches"
+  exit 0
+fi
+
+if [ ! -d src/.git ] ||
+   [ "$(git -C src describe --tags --exact-match 2>/dev/null)" != "$version" ]; then
+  rm -rf src build
+  git -c advice.detachedHead=false clone -q --depth 1 --branch "$version" \
+    "$url" src 2>&1 | grep -v 'is not a commit' >&2 || true
+  [ -f src/configure ] || { echo "could not fetch QEMU $version" >&2; exit 1; }
 fi
 
 for p in patches/*.patch; do
@@ -55,22 +68,17 @@ done
 
 [ "$stage" = src ] && exit 0
 
-if [ ! -f build/build.ninja ]; then
+if [ ! -f build/build.ninja ] ||
+   [ "$(cat build/.prefix 2>/dev/null)" != "$prefix" ]; then
   mkdir -p build
   (cd build && nice -n 19 ../src/configure --prefix="$prefix" \
     --target-list=ppc-softmmu --enable-cocoa --enable-plugins \
     --disable-docs --disable-werror)
+  echo "$prefix" >build/.prefix
 fi
 nice -n 19 make -C build -j"$(sysctl -n hw.ncpu)"
 
-mkdir -p "$prefix" 2>/dev/null || true
-if [ ! -w "$prefix" ]; then
-  echo "Built qemu/build, but $prefix is not a folder you can write." >&2
-  echo "To make it, run:" >&2
-  echo "  sudo mkdir -p $prefix && sudo chown \"\$USER\" $prefix" >&2
-  echo "then run qemu/build.sh again to install." >&2
-  exit 1
-fi
+mkdir -p "$prefix"
 make -C build install >/dev/null
-git -C src describe --tags --always >"$prefix/REVISION"
+echo "$revision" >"$prefix/REVISION"
 echo "Installed $prefix/bin/qemu-system-ppc"
