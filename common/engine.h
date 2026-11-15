@@ -237,7 +237,7 @@ enum {
     kPoolOsd = 28,
     kPoolDh = 43,
     kPoolEts = 12,
-    kPoolGne = 30,
+    kPoolGne = 27,
     kPoolClient = 9
 };
 
@@ -248,8 +248,7 @@ enum {
  * (the half-second refresh can come much later), and finds an
  * application's native code. It calls the engine only when ApplZone
  * differs from last, so once per process switch, and then goes on to the
- * filter that was installed before it (gne_old, or none). It clears
- * force_quit on every call, enabled or not. The trap table
+ * filter that was installed before it (gne_old, or none). The trap table
  * cannot be used for this: each application has its own patches of
  * _WaitNextEvent and _GetNextEvent, which the Process Manager swaps on
  * every switch. */
@@ -268,10 +267,6 @@ typedef struct {
        engine_start to engine_stop, pools on or off, so the engine stops
        when the program running it quits without engine_stop (a crash). */
     volatile unsigned short quit_hook;
-    /* The timebase (low word, odd) when Command-Option-Escape went down,
-       or 0 once an event call has run since: the Process Manager shows
-       Force Quit only in an event call. */
-    volatile unsigned long force_quit;
     /* GetSystemClientProcess (_OSDispatch selector $3F, which InterfaceLib
        does not export) as 68k code, called through rd_client: long
        client(ProcessSerialNumber *). It names the system, not the current
@@ -515,8 +510,6 @@ typedef struct {
        which is while protection is on, with slices of slice_ms. */
     struct YieldData *yield;
     unsigned long preempt_on, slice_ms;
-    /* Command-Option-Escape was down at the last tick. */
-    unsigned long force_quit_down;
 } State;
 
 /* Install the hooks, the fallback handler and the timer, read the process

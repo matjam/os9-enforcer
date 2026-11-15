@@ -77,7 +77,9 @@
  *   U  and in one called from 68k code in this application's heap. A call
  *      is in progress below both: preemption must leave them alone.
  *   H  U for 20 s. Command-Option-Escape during it must bring up Force
- *      Quit, and its buttons must work before the 20 s are up.
+ *      Quit, and its buttons must work before the 20 s are up: the
+ *      Process Manager runs the dialog during the hang by itself (slowly
+ *      under QEMU).
  *
  *   G  TempNewHandle in system mode (BeginSystemMode), as system software
  *      makes memory that outlives the current application: the handle
@@ -951,7 +953,7 @@ int main(void)
             }
             unsigned long safe0 = y->safe, call0 = y->in_call,
                           w0 = y->yielded, e0 = y->entered,
-                          b0 = y->broken, f0 = y->forced;
+                          b0 = y->broken;
             UniversalProcPtr cbu = NewRoutineDescriptor(
                 (ProcPtr)cb_spin, kCStackBased, kPowerPCISA);
             if (ch == 'C') {
@@ -970,16 +972,15 @@ int main(void)
             DisposeRoutineDescriptor(cbu);
             printf("%s callback: %lu ms, gaps over 1 ms %lu, the longest "
                    "%lu us; stub entries %lu, in a call %lu, chain not "
-                   "ending at the base %lu, safe %lu, for Force Quit %lu, "
-                   "WaitNextEvent calls %lu\n",
+                   "ending at the base %lu, safe %lu, WaitNextEvent calls "
+                   "%lu\n",
                    ch == 'C' ? "native" : "68k", g_cb.ticks / per_ms,
                    g_cb.gaps, g_cb.max_gap * 1000 / per_ms, y->entered - e0,
                    y->in_call - call0, y->broken - b0, y->safe - safe0,
-                   y->forced - f0, y->yielded - w0);
+                   y->yielded - w0);
             printf("the last chain (sp %08lX, base %08lX, %lu frames):",
                    y->last_sp, y->last_base, y->last_n);
-            for (unsigned long i = 0; i <= y->last_n && i < kYieldChain;
-                 i++)
+            for (unsigned long i = 0; i <= y->last_n && i < 11; i++)
                 printf(" %08lX", y->chain[i]);
             printf("\n");
             continue;

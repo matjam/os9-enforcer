@@ -451,9 +451,27 @@ Findings:
   `Z` ended. The Process Manager completes a major switch after the
   front application takes its suspend event, and the stub's
   `WaitNextEvent` has an empty mask.
-- Command-Option-Escape sent through QMP (`qmp.py key cmd-alt-esc`) does
-  not bring up Force Quit in the guest, idle or not, so the system's own
-  Force Quit cannot be tested this way.
+- Force Quit is the hang recovery, and it works with Enforcer. To send
+  Command-Option-Escape, use `qmp.py key cmd-opt-esc 600`: the keys must
+  be held about 600 ms (100 ms is missed).
+  - During a preempted hog (Scribble `Z`) the dialog comes up from the
+    stub's `WaitNextEvent`; Force Quit stopped Scribble and the engine
+    dropped its domain.
+  - During a hog inside a 68k callback (`U`, `H`), which the stub never
+    lets call `WaitNextEvent`, the Process Manager runs the dialog by
+    itself, with Enforcer on or off: it is up within a second, and its
+    buttons work. Under QEMU it is slow: the hog runs 5 to 6.5 times
+    slower while the dialog is up, a click takes seconds to register,
+    and the guest's PC samples are in the 68k emulator in the hog's
+    context. How the Process Manager runs it there was not found.
+  - A version that made the stub call `WaitNextEvent` (mask mouse-down
+    and mouse-up) for 3 s after Command-Option-Escape, even inside a
+    callback, made the dialog quick; it was taken out (89322d9 reverted),
+    since the system's own path works and those calls let other
+    applications run while a Toolbox call is in progress. With mask 0
+    the dialog was drawn but took no clicks.
+  - The dialog is not in the application's `WindowList` (low memory
+    0x9D6): it is in another layer.
 
 ### Findings that constrain the design
 
@@ -562,10 +580,10 @@ Worst first. Keep in step with Limits in `README.md`.
     before the check looks at the room left, so an application within
     1 KB of its stack's limit overflows into its heap.
 18. A long Toolbox call, or a callback the Toolbox makes (a `ModalDialog`
-    filter), is never preempted, and there is no hang recovery: an
-    application that never yields at a safe point holds the processor as
-    before. A preempted application gives background applications time,
-    but a switch to another application in front waits until it yields
+    filter), is never preempted: an application that never yields at a
+    safe point holds the processor as before, until Force Quit. A
+    preempted application gives background applications time, but a
+    switch to another application in front waits until it yields
     itself.
 19. Each engine start leaves one yield stub (about 1 KB) in the system
     heap.

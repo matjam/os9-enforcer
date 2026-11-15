@@ -63,6 +63,9 @@ write came from code that cannot be stopped safely (interrupt-time code, a
 deferred task or a separate task), Enforcer blocks the write and lets the
 application run, and the notification says so.
 
+To stop an application that does not respond, use Force Quit
+(Command-Option-Escape), as without Enforcer.
+
 ## How it works
 
 - **The kernel.** The patched NanoKernel keeps an owner for each 4 KB page
