@@ -121,6 +121,7 @@ allowed store changes nothing.
 | `t` | time 2 s of trapped writes | prints the cost of one trap |
 | `L` | keep 64 MB of temporary memory, every page written | in a chunk of Scribble's |
 | `R` | after `L`: time one write into each of its pages right after a switch back, then again | prints the cost of the faults |
+| `F` | time a read of each page of the Finder's partition right after a switch back, then again | prints the PTEs rebuilt (application VSIDs) and their cost |
 | `m`, `M` | 64 KB kept, 1 MB freed, of temporary memory | in Scribble's own chunks |
 | `T` | native code into the Finder's temporary memory | denied, Scribble stopped |
 | `P` | write and read back 600 MB of temporary memory | pages out other applications (VM on) |
@@ -470,9 +471,10 @@ serialized, and applications run in parallel only outside it.
      nothing left open after a switch. Built on the stock kernel's
      binary, by rewriting the system space's segment registers rather
      than adding address spaces. Measured in "Switch cost" below.
-   - Next: a switch hook with virtual memory on (find the Process
-     Manager's file-mapped code, and patch it held and writable), and a
-     measure of what a PTE rebuild costs.
+   - Next: a switch hook with virtual memory on. The Process Manager's
+     code is file-mapped there; a kernel operation that writes the
+     instruction through its physical address, on a held page, would
+     leave the page clean to the Virtual Memory Manager.
 2. Preemption at safe points, native code. On its tick the kernel checks
    whether the current application has run past its time slice with
    only its own code on the stack (no Toolbox call in progress), and if
@@ -546,7 +548,13 @@ The first writes after a switch cost TLB refills only: the
 application's PTEs were still in the HTAB. The pages rebuilt at each
 switch are shared ones in the covered segments (the Process Manager's
 heap, other applications' pages touched by system code), each one HTAB
-miss handled in the kernel; what one costs is not measured yet.
+miss handled in the kernel. Scribble `F` reads each of the Finder's 259
+pages after a switch to the Finder and back: 952 µs, against 37 µs
+again, with 38 PTEs rebuilt. QEMU flushes its own TLB at every `mtsr`,
+so that covers 259 TLB refills as well; a rebuild comes to roughly 14 µs
+in QEMU, the cost of any page fault there. About 31 rebuilds a switch
+(VM off) is then about 0.4 ms a switch in QEMU, and far less on a real
+Mac, where a fault is a few µs.
 
 ### Per-application VSIDs: what the kernel has
 

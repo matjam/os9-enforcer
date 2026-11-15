@@ -466,7 +466,8 @@ int main(void)
         printf("\nn native store, 6 68k store, b BlockMoveData, o own "
                "heap, s/S native/68k store into the system heap, t time "
                "traps, m temporary memory, M 1 MB of it, L keep 64 MB of "
-               "it, R time writing it after a switch, T store into "
+               "it, R time writing it after a switch, F time reading the "
+               "Finder after a switch, T store into "
                "another application's, P page 600 MB, Y from an MP task, "
                "V from a Time Manager task, D from a deferred task, W "
                "right after a switch, K into the control block and the "
@@ -710,6 +711,46 @@ int main(void)
                    "%lu us: %.1f us a page in faults\n", pages,
                    (unsigned long)(t1 - t0), (unsigned long)(t2 - t1),
                    (double)((t1 - t0) - (t2 - t1)) / pages);
+            continue;
+        }
+        case 'F': {
+            /* After a switch out and back, read one word of each page of
+               the Finder's partition, then again. With application VSIDs,
+               the first read of a page whose PTE was built for the
+               Finder's VSIDs builds it again for Scribble's (kernel patch
+               5, CB_REBUILT): the difference is what a rebuild costs. */
+            State *s = engine_state();
+            if (!s) {
+                printf("needs Enforcer running\n");
+                continue;
+            }
+            unsigned long n = s->c.switches, mine =
+                (unsigned long)ApplicationZone();
+            EventRecord ev;
+            int tries = 0;
+            while ((s->c.switches == n || s->cur_zone != mine) &&
+                   tries++ < 1000)
+                WaitNextEvent(0, &ev, 1, NULL);
+            volatile unsigned long *p =
+                (volatile unsigned long *)((loc + 4095) & ~4095UL);
+            unsigned long pages = (loc + size - (unsigned long)p) / 4096;
+            unsigned long sum = 0;
+            unsigned long r0 = s->kcb ? s->kcb->rebuilt : 0;
+            unsigned long long t0 = micros();
+            for (unsigned long i = 0; i < pages; i++)
+                sum += p[i * 1024];
+            unsigned long long t1 = micros();
+            unsigned long r1 = s->kcb ? s->kcb->rebuilt : 0;
+            for (unsigned long i = 0; i < pages; i++)
+                sum += p[i * 1024];
+            unsigned long long t2 = micros();
+            unsigned long rebuilt = r1 - r0;
+            printf("%lu Finder pages read after a switch: first %lu us, "
+                   "again %lu us; %lu PTEs built again, %.1f us each "
+                   "(sum %08lX)\n", pages, (unsigned long)(t1 - t0),
+                   (unsigned long)(t2 - t1), rebuilt,
+                   rebuilt ? (double)((t1 - t0) - (t2 - t1)) / rebuilt : 0.0,
+                   sum);
             continue;
         }
         case 'm': {
