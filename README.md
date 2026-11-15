@@ -1,18 +1,92 @@
 # Enforcer
 
-Enforcer adds three things to Mac OS 9.2.2 on NewWorld Macs:
+Enforcer adds memory protection between applications, preemption, and
+memory on demand to Mac OS 9.2.2 on NewWorld Macs. It is a patch to the
+Mac OS kernel, an extension and a control panel.
+
+Enforcer has been tested only on QEMU's `mac99` machine, not on real
+hardware.
+
+## Why
+
+Mac OS 9 has three limits that later systems removed. Enforcer addresses
+each one without changing how applications are written.
+
+- **One application can take the whole Mac down.** All applications and
+  the system share one address space, and nothing stops an application
+  from writing into another's memory. A bug in one application damages
+  another, or the system, and the usual result is a restart and lost
+  work in every open application.
+- **One application can hold the processor.** Multitasking is
+  cooperative: an application runs until it calls `WaitNextEvent`. An
+  application that computes for a long time freezes the others.
+- **Memory is fixed at launch.** Each application gets one block of
+  memory whose size is typed into its Get Info window. An application
+  reports "out of memory" when that block is full, however much the Mac
+  has free, and memory an application does not use is not available to
+  others.
+
+## What it does
 
 - **Crash containment.** When an application writes into another
   application's memory, Enforcer blocks the write and stops the
   application that made it. The other applications and the system keep
   running, and you do not need to restart.
-- **Preemption.** An application that computes for a long time without
-  giving up the processor is made to share it.
-- **Memory on demand.** The sizes in an application's Get Info window
-  stop being a hard limit. An application gets memory as it uses it.
+- **Preemption.** An application whose own PowerPC code runs for 20 ms
+  without calling `WaitNextEvent` is made to call it. Other applications
+  get time, and the application then goes on where it was.
+- **Memory on demand.** The sizes in Get Info stop being a hard limit:
+  - An application that asks for 640 KB or more is launched with a
+    29 MB partition. The partition uses RAM only where the application
+    touches it, and gives the RAM back when the application quits.
+  - A smaller application is launched with up to four times its
+    preferred size.
+  - When an application's partition is full, a new block comes from
+    temporary memory that the application owns.
 
-Enforcer has been tested only on QEMU's `mac99` machine, not on real
-hardware.
+## How it works
+
+Mac OS 9 on a NewWorld Mac already runs on a small kernel, the
+NanoKernel, which is stored in the Mac OS ROM file and controls the
+processor's memory management unit (MMU). Mac OS uses it for virtual
+memory and for Multiprocessing Services, but not to protect applications
+from each other. Enforcer adds that.
+
+- **The kernel patch.** Enforcer Installer patches the NanoKernel in the
+  Mac OS ROM file. The patched kernel keeps an owner for each 4 KB page
+  of memory: the system, or one application. Without the extension
+  running, the patched kernel behaves as Apple's.
+- **Address spaces.** Each application runs with its own view of the
+  memory that holds applications. In it, the application's own pages are
+  writable and every other application's pages are read-only. An
+  application switch changes which view the processor uses, so the cost
+  of a switch does not depend on the applications' sizes.
+- **Deciding a write.** A write to a read-only page stops in the kernel,
+  which looks up the owner of the page and the owner of the code doing
+  the write. A write by the system is allowed. A write by an
+  application's code into another application's page is denied: the
+  memory is not changed.
+- **Stopping the application.** The Enforcer Extension keeps the owner
+  table up to date as applications launch and quit. When the kernel
+  denies a write by the current application, the extension makes that
+  application quit through `ExitToShell`, as if it had quit itself.
+  When the writer cannot be stopped safely (interrupt-time code, a
+  Multiprocessing Services task, an application in the background), the
+  write is skipped and the writer goes on.
+- **Temporary memory.** Mac OS gives all applications temporary memory
+  from one shared heap. Enforcer gives each application its temporary
+  memory from blocks that the application owns, so it is protected like
+  the partition.
+- **Preemption.** The kernel's timer notices an application that has run
+  its own PowerPC code for 20 ms. At a point where that is safe (no
+  Toolbox call in progress, not at interrupt time), the application is
+  redirected into a call to `WaitNextEvent`, and returns to where it was
+  when Mac OS gives it time again.
+- **Memory on demand.** Enforcer changes the size the Process Manager
+  reads at launch. For a 29 MB partition it also supplies the memory: a
+  range of addresses above the Mac's memory where the patched kernel
+  gives a page RAM the first time it is touched, from a pool that
+  Enforcer fills from free memory and returns when it is not needed.
 
 ## Requirements
 
@@ -75,35 +149,75 @@ If the Mac OS ROM file is not patched (for example after reinstalling
 Mac OS), the extension does not start and the control panel says so. To
 fix it, open Enforcer Installer and click Install.
 
-## What each feature does
+Preemption is on with Enforce and Log only.
 
-### Crash containment
+## Compatibility
 
-The patched kernel keeps an owner for each 4 KB page of memory: the
-system, or one application. Each application runs with every other
-application's pages read-only. A write by an application's code into
-another application's page is denied, the target's memory is not
-changed, and the application that wrote is stopped as if it had quit.
+Enforcer has been run with the software of a standard Mac OS 9.2.2
+installation: its extensions and control panels, the Finder, Apple
+System Profiler, Sherlock 2, Scrapbook and Stickies. No third-party
+extension or application has been tested. What follows is what the
+design implies; treat it as a guide to what to check.
 
-Temporary memory is protected in the same way: each application's
-temporary memory comes from blocks that the application owns.
+Before you rely on Enforcer with your software, set the control panel to
+Log only and use the Mac as usual. Log only records each write Enforcer
+would block and stops nothing. If the log names an application you
+trust, that application does something Enforcer does not allow.
 
-### Preemption
+### Extensions and control panels
 
-An application whose own PowerPC code runs for 20 ms without calling
-`WaitNextEvent` is made to call it, when that is safe. Other applications
-get time, and the application then goes on where it was. Preemption is on
-with Enforce and Log only.
+- **Code that an extension loads into the system heap counts as the
+  system's.** Enforcer never blocks or stops it, including when it runs
+  inside an application. Most extensions work this way, so most are
+  neither helped nor hindered. A bug in an extension can still damage
+  any application.
+- **Trap patches chain as usual.** Enforcer patches a few Memory Manager
+  and Process Manager traps (`NewHandle`, `NewPtr`, `DisposePtr`,
+  `DisposeHandle`, `SetHandleSize`, `SetPtrSize`, `ReallocateHandle`,
+  `_OSDispatch`, `_MemoryDispatch`, `ExitToShell`) and passes each call
+  on. An extension that patches the same traps runs before or after
+  Enforcer's patch, as with any two extensions.
+- **Software that replaces Mac OS's virtual memory, or patches the
+  kernel or the Mac OS ROM file itself, is not expected to work.** This
+  covers memory doublers, and enablers for processor upgrade cards that
+  change the ROM file. Enforcer Installer refuses a Mac OS ROM file it
+  does not recognize.
+- **Extensions that put code into each application's heap** have that
+  code counted as the application's. If it writes into another
+  application, the application it runs in is stopped.
 
-### Memory on demand
+### Applications
 
-- An application that asks for 640 KB or more is launched with a 29 MB
-  partition. The partition uses RAM only where the application touches
-  it, and gives the RAM back when the application quits.
-- A smaller application is launched with up to four times its preferred
-  size.
-- When an application's partition is full, a new block comes from
-  temporary memory that the application owns.
+- **PowerPC and 68k applications are both protected.** Only PowerPC
+  code is preempted.
+- **Applications that share memory by passing pointers** to each other
+  (and then write through them) are stopped in Enforce mode. Apple
+  events, the Clipboard, files and shared libraries are not affected:
+  the system does the copying.
+- **A write by another application's code into the current application**
+  is allowed and logged, because callbacks work that way.
+- **Applications that take all the memory they can find at launch** get
+  what `MaxMem` reports, which is the partition's size. With a 29 MB
+  partition that can be more RAM than the application took before.
+- **Applications that test for low memory by asking for a very large
+  block** and expect it to fail can now get the block.
+- **Applications that depend on never being interrupted** during a long
+  computation can be affected by preemption, which calls `WaitNextEvent`
+  for them: a pointer kept into an unlocked handle can be left pointing
+  at a block that moved.
+- **Debuggers and programs that write-protect their own pages** (some
+  garbage collectors) do not see faults on pages Enforcer opens for
+  them.
+
+### If something does not work
+
+1. To see whether memory on demand is the cause, turn off "Give
+   applications more memory than Get Info sets" and launch the
+   application again.
+2. To see whether protection or preemption is the cause, choose Log
+   only (protection off, preemption on), then Off (both off).
+3. To take Enforcer out, hold Shift at startup to turn extensions off,
+   or remove it with Enforcer Installer.
 
 ## Limits
 
@@ -146,9 +260,7 @@ Memory on demand:
   applications launched during startup keep ordinary partitions.
 - The setting is one for every application: on or off.
 
-Compatibility:
-- Programs that write-protect pages themselves (debuggers, garbage
-  collectors) do not see faults on pages Enforcer opens for them.
+Temporary memory:
 - A large temporary handle can fail to grow with `SetHandleSize` where
   Mac OS would have grown it.
 
