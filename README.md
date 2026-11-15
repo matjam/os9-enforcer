@@ -144,6 +144,10 @@ Preemption:
   Toolbox called back (a dialog filter, for example), is not preempted.
 - An application that has not called `WaitNextEvent` once since it
   launched is not preempted.
+- Background applications get time from a preempted application, but
+  bringing another application to the front (a click in its window,
+  Command-Tab) waits until the preempted one calls `WaitNextEvent`
+  itself.
 - `WaitNextEvent` can move memory. An application that keeps a pointer
   into an unlocked handle across a long computation can find the block
   moved after it was preempted.

@@ -430,6 +430,14 @@ Findings:
   frame: the callback's caller is the caller of `CallUniversalProc`.
 - The redirects at startup were in applications that launch, compute and
   quit before they call `WaitNextEvent` (the `starting` count).
+- A foreground switch waits for the preempted application: Command-Tab
+  during Scribble `Z` (VM on) brought the Finder to the front only when
+  `Z` ended. The Process Manager completes a major switch after the
+  front application takes its suspend event, and the stub's
+  `WaitNextEvent` has an empty mask.
+- Command-Option-Escape sent through QMP (`qmp.py key cmd-alt-esc`) does
+  not bring up Force Quit in the guest, idle or not, so the system's own
+  Force Quit cannot be tested this way.
 
 ### Findings that constrain the design
 
@@ -540,7 +548,9 @@ Worst first. Keep in step with Limits in `README.md`.
 18. A long Toolbox call, or a callback the Toolbox makes (a `ModalDialog`
     filter), is never preempted, and there is no hang recovery: an
     application that never yields at a safe point holds the processor as
-    before.
+    before. A preempted application gives background applications time,
+    but a switch to another application in front waits until it yields
+    itself.
 19. Each engine start leaves one yield stub (about 1 KB) in the system
     heap.
 
