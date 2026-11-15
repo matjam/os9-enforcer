@@ -65,7 +65,8 @@ enum {
     kKcbOpCurrent = 3,
     kKcbOpSpaces = 4,  /* r4 on, r5 segment mask (bit n: segment n, 0-5) */
     kKcbOpSwitch = 5,  /* r4 a zone: its application's VSIDs */
-    kKcbOpFlush = 6    /* r4 first page, r5 pages: drop their PTEs */
+    kKcbOpFlush = 6,   /* r4 first page, r5 pages: drop their PTEs */
+    kKcbOpPatch = 7    /* r4 address, r5 old word, r6 new: kcb_patch */
 };
 
 /* KEvent.info, low byte. */
@@ -122,7 +123,8 @@ typedef struct {
        VSID, switches by kKcbOpSwitch, and switches the kernel made at a
        store because ApplZone had changed without one. */
     volatile unsigned long spaces, rebuilt, vswitch, lazy;
-    unsigned long reserved[40];
+    volatile unsigned long lazy_pc; /* the PC of the last lazy switch */
+    unsigned long reserved[39];
     unsigned long pages[kKcbTablePages]; /* physical */
     KEvent ring[kKcbRing];              /* event n at (n - 1) % kKcbRing */
 } KernelCB;
@@ -136,6 +138,7 @@ _Static_assert(offsetof(KernelCB, deny_68k) == 0x44, "CB_DENY_68K");
 _Static_assert(offsetof(KernelCB, tables) == 0x4C, "CB_TABLES");
 _Static_assert(offsetof(KernelCB, spaces) == 0x50, "CB_SPACES");
 _Static_assert(offsetof(KernelCB, lazy) == 0x5C, "CB_LAZY");
+_Static_assert(offsetof(KernelCB, lazy_pc) == 0x60, "CB_LAZY_PC");
 _Static_assert(offsetof(KernelCB, pages) == 0x100, "CB_PAGES");
 _Static_assert(offsetof(KernelCB, ring) == 0x300, "CB_RING");
 _Static_assert(sizeof(KEvent) == 32, "event size");
@@ -220,6 +223,22 @@ static inline long kcb_set2(unsigned long op, unsigned long a,
     k.r3 = op;
     k.r4 = a;
     k.r5 = b;
+    return nk_call(kMPEnforcer, &k);
+}
+
+/* Replace the word old at addr with new, through its physical address,
+   and make it the code the CPU runs. The page must have a PTE (read the
+   word first), and should be held: the change does not mark the page
+   modified, so a file-mapped page read in again loses it. Returns 0, or
+   paramErr when the word is not old or the page has no PTE. */
+static inline long kcb_patch(unsigned long addr, unsigned long old,
+                             unsigned long new_word)
+{
+    KRegs k = {0};
+    k.r3 = kKcbOpPatch;
+    k.r4 = addr;
+    k.r5 = old;
+    k.r6 = new_word;
     return nk_call(kMPEnforcer, &k);
 }
 

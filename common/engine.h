@@ -490,9 +490,13 @@ typedef struct {
        switch protects nothing there. */
     unsigned long spaces, vsid_mask, spaces_on;
     /* The hook in the Process Manager's switch: the address of the
-       instruction it replaces, or 0, and the stub it calls. */
+       instruction it replaces, or 0, and the stub it calls. pm_mapped is
+       1 when the site is in file-mapped code (virtual memory on), patched
+       through the kernel (kcb_patch) on a held page; pm_tried and
+       pm_tries are the last lazy-switch PC searched from, and how many. */
     unsigned long pm_site;
     unsigned long *pm_stub;
+    unsigned long pm_mapped, pm_tried, pm_tries;
 } State;
 
 /* Install the hooks, the fallback handler and the timer, read the process

@@ -105,10 +105,13 @@ Known holes:
   task.
 - A write the kernel allows opens its page for up to 16 ms to the
   application that was current and to Multiprocessing Services tasks.
-- With virtual memory on, an application switch takes effect at the first
-  write that faults after it, which is Mac OS's own write to the new
-  application's stack. A write by the new application into the previous
-  application's memory before then is not caught.
+- With virtual memory on, Enforcer finds Mac OS's application switch
+  only after the first switch following startup. Until then, a switch
+  takes effect at the first write that faults after it, normally Mac OS's
+  own write to the new application's stack, and a write by the new
+  application into the previous application's memory before then is not
+  caught. The same applies at an application's launch and quit, with
+  virtual memory on or off.
 - With virtual memory on, when the current application touches a page of
   another application that is on disk, the Virtual Memory Manager can map
   it writable for the current application until the mapping is next

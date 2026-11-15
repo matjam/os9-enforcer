@@ -2613,14 +2613,100 @@ static void pm_hook(State *s)
     flush_code((volatile void *)site, 4);
 }
 
+/* Whether the page at addr is in the kernel area area and can be read:
+   the area for file-mapped code is larger than what is mapped in it, and
+   a read of a page with nothing behind it is a bus error. HoldMemory
+   brings a page in, and fails for such a page. */
+static int page_readable(unsigned long addr, unsigned long area)
+{
+    unsigned long a = 0;
+    if (nk_area_from_address(addr, &a) || a != area ||
+        HoldMemory((void *)addr, kPage))
+        return 0;
+    UnholdMemory((void *)addr, kPage);
+    return 1;
+}
+
+/* With virtual memory on, the Process Manager's code is file-mapped above
+   logical RAM, so pm_hook does not find B. The kernel records the PC of
+   the store at its last lazy switch (KernelCB.lazy_pc): with no hook, that
+   is the Process Manager's first store on the next process's stack, in
+   the code that holds B. Look for B in the readable pages around it
+   (page_readable), and patch
+   it through the kernel: kcb_patch stores through the physical address,
+   so the Virtual Memory Manager sees the page clean, and the page is held
+   so that it keeps the change. Task level (it reads in code from disk);
+   at most kPmTries PCs. */
+enum { kPmReach = 0x24000, kPmTries = 8 };
+
+static void pm_hook_mapped(State *s)
+{
+    unsigned long pc = s->kcb->lazy_pc & ~3UL, area = 0;
+    s->pm_tried = s->kcb->lazy_pc;
+    s->pm_tries++;
+    unsigned long page = pc & kPageMask, lo = page, hi = page + kPage;
+    if (nk_area_from_address(pc, &area) || !page_readable(page, area))
+        return;
+    while (page - lo < kPmReach && page_readable(lo - kPage, area))
+        lo -= kPage;
+    while (hi - page < kPmReach && page_readable(hi, area))
+        hi += kPage;
+    unsigned long site = 0;
+    int n = 0;
+    for (const volatile unsigned long *w =
+             (const volatile unsigned long *)(lo + 128);
+         (unsigned long)w < hi - 8; w++)
+        if (*w == 0x4E800020 && pm_switch_at(w)) {
+            site = (unsigned long)w;
+            n++;
+        }
+    if (n != 1)
+        return;
+    /* The stub engine_start made for B, before the system heap was
+       watched. */
+    unsigned long to = (unsigned long)(s->pm_stub + kStubCode);
+    long off = (long)(to - site);
+    unsigned long insn;
+    if (off >= -0x2000000L && off < 0x2000000L)
+        insn = 0x48000000 | ((unsigned long)off & 0x03FFFFFC); /* b */
+    else if (to < 0x2000000UL)
+        insn = 0x48000002 | to; /* ba */
+    else
+        return;
+    HoldMemory((void *)(site & kPageMask), kPage);
+    if (*(volatile unsigned long *)site != 0x4E800020 || /* a PTE for it */
+        kcb_patch(site, 0x4E800020, insn)) {
+        UnholdMemory((void *)(site & kPageMask), kPage);
+        s->c.kernel_errors++;
+        return;
+    }
+    s->pm_site = site;
+    s->pm_mapped = 1;
+}
+
 /* Put the replaced instruction back and free the stub (task level, after
-   the system heap's pages are open again). */
+   the system heap's pages are open again). If the kernel cannot put it
+   back, the site still branches to the stub, so the stub stays: it does
+   nothing with no control block registered. */
 static void pm_unhook(State *s)
 {
-    if (!s->pm_site)
+    if (!s->pm_stub)
         return;
-    *(volatile unsigned long *)s->pm_site = s->pm_stub[kStubInsn];
-    flush_code((volatile void *)s->pm_site, 4);
+    if (s->pm_site && s->pm_mapped) {
+        volatile unsigned long *w = (volatile unsigned long *)s->pm_site;
+        if (!s->kcb || kcb_patch(s->pm_site, *w, s->pm_stub[kStubInsn])) {
+            s->c.kernel_errors++;
+            s->pm_site = 0;
+            s->pm_stub = 0;
+            s->pm_mapped = 0;
+            return;
+        }
+        UnholdMemory((void *)(s->pm_site & kPageMask), kPage);
+        s->pm_mapped = 0;
+    } else if (s->pm_site) {
+        *(volatile unsigned long *)s->pm_site = s->pm_stub[kStubInsn];
+        flush_code((volatile void *)s->pm_site, 4);
+    }
     hold(s, s->pm_stub, kStubLongs * 4, 0);
     DisposePtr((Ptr)s->pm_stub);
     s->pm_site = 0;
@@ -2885,8 +2971,16 @@ long engine_start(State **out, unsigned long mode, const char *name)
        (engine_set_mode), in the segments marked application memory has
        (spaces_cover). */
     s->spaces = s->kcb != 0;
-    if (s->spaces)
+    if (s->spaces) {
         pm_hook(s);
+        /* Not found (virtual memory on): a stub for B now, so that the
+           system heap's watch leaves it out; pm_hook_mapped installs it
+           later. */
+        if (!s->pm_site) {
+            s->pm_stub = pm_stub_new(0x4E800020);
+            hold(s, s->pm_stub, kStubLongs * 4, 1);
+        }
+    }
     s->seen[kSrc68k] = s->h68k->count_handled;
     s->seen[kSrcNative] = s->hnat->count_handled;
     /* For tools/xlog-read.py. */
@@ -2952,6 +3046,9 @@ void engine_poll(State *s)
     if (s->want_sys != s->sys_on)
         engine_set_sys(s, s->want_sys);
     sys_follow(s);
+    if (s->pm_stub && !s->pm_site && s->kcb && s->kcb->lazy_pc &&
+        s->kcb->lazy_pc != s->pm_tried && s->pm_tries < kPmTries)
+        pm_hook_mapped(s);
 }
 
 void engine_stop(State *s)

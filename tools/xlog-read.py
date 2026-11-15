@@ -43,12 +43,13 @@ CHUNK = ["live", "domain", "handle", "block", "lo", "hi", "zone", "handles",
 MAX_CHUNKS = 128
 # After the Chunk table: skips, application VSIDs and the Process Manager
 # hook.
-SPACES = ["skips", "spaces", "vsid_mask", "spaces_on", "pm_site", "pm_stub"]
+SPACES = ["skips", "spaces", "vsid_mask", "spaces_on", "pm_site", "pm_stub",
+          "pm_mapped", "pm_tried", "pm_tries"]
 KCB = ["magic", "version", "mode", "current", "entries", "denied_page",
        "seq", "frame", "allowed", "logged", "denied", "bail", "self",
        "skipped", "applzone", "deny_native_page", "deny_native_seq",
        "deny_68k_page", "deny_68k_seq", "tables", "spaces", "rebuilt",
-       "vswitch", "lazy"]
+       "vswitch", "lazy", "lazy_pc"]
 KCB_RING, KCB_RING_N, KCB_EVENTS = 0x300, 488, 12
 EVF = [(1, "68k"), (2, "task"), (4, "offense"), (8, "denied"),
        (16, "skipped")]
@@ -166,13 +167,17 @@ def print_kernel(k):
     print("  engine: taken %d (last %d), lost %d, denied %d" % (
         k["kevents"], k["kseen"], k["klost"], k["kdenied"]))
     print("  application VSIDs: %s (kernel %d), segments %02X; switches %d "
-          "(%d made at a store), PTEs built again %d; Process Manager hook "
-          "%s" % (
+          "(%d made at a store, the last at %08X), PTEs built again %d; "
+          "Process Manager hook %s" % (
               "on" if k["spaces_on"] else
               "possible" if k["spaces"] else "no", k["cb_spaces"],
-              k["vsid_mask"], k["cb_vswitch"], k["cb_lazy"], k["cb_rebuilt"],
-              "at %08X, stub %08X" % (k["pm_site"], k["pm_stub"])
-              if k["pm_site"] else "not installed"))
+              k["vsid_mask"], k["cb_vswitch"], k["cb_lazy"], k["cb_lazy_pc"],
+              k["cb_rebuilt"],
+              "at %08X%s, stub %08X" % (
+                  k["pm_site"], " (file-mapped)" if k["pm_mapped"] else "",
+                  k["pm_stub"]) if k["pm_site"] else
+              "not installed (%d searches, the last from %08X)" % (
+                  k["pm_tries"], k["pm_tried"])))
     if k["events"]:
         print("  last events (owner/code/current: 1 system heap, 3+ domain "
               "slot + 3):")

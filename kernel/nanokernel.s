@@ -113,6 +113,7 @@ kernel:
                                                 # another VSID
         .set    CB_VSWITCH, 0x058               # VSID switches (OP_SWITCH)
         .set    CB_LAZY, 0x05C                  # VSID switches at a store
+        .set    CB_LAZY_PC, 0x060               # and the PC of the last
         .set    CB_PAGES, 0x100                 # owner table pages, physical
                                                 # (128 of them: 2 GB)
         .set    CB_RING, 0x300                  # RING_N events of 32 bytes
@@ -145,6 +146,7 @@ kernel:
         .set    OP_SPACES, 4
         .set    OP_SWITCH, 5
         .set    OP_FLUSH, 6
+        .set    OP_PATCH, 7
         .set    VSID_APP, 0xFFF00               # application VSIDs: segment
                                                 # << 20 | VSID_APP + owner
         .set    CTX_R6, 0x134                   # ContextBlock.r6 and .r7: an
@@ -403,6 +405,7 @@ check:  lwz     9, CB_APPLZONE(31)              # who is current: the owner
         bl      space_switch
         li      8, CB_LAZY
         bl      count
+        stw     10, CB_LAZY_PC(31)              # for the engine's hook
         b       retry
 2:      mr      8, 27                           # the page's owner
         bl      owner_of
@@ -1012,6 +1015,13 @@ enf_register:
 #   OP_SWITCH: r4 a zone (ApplZone): load the VSIDs of the application
 #     that owns it, or the system's.
 #   OP_FLUSH: r4 the first page, r5 the number of pages: drop their PTEs.
+#   OP_PATCH: r4 a word's logical address in the blue task's space, r5 the
+#     word it must hold, r6 the word to store. The kernel stores it through
+#     the physical address and makes it the code the CPU runs; the page's
+#     PTE does not record the change, so to the Virtual Memory Manager a
+#     file-mapped code page stays clean. The page must have a PTE (read it
+#     first) and should be held, or it can be read in again without the
+#     change. paramErr when the word differs or there is no PTE.
 enf_op:
         bl      1f
 1:      mflr    16
@@ -1030,6 +1040,8 @@ enf_op:
         beq     eo_switch
         cmpwi   3, OP_FLUSH
         beq     eo_flush
+        cmpwi   3, OP_PATCH
+        beq     eo_patch
 eo_bad: li      3, -50
         b       MPReturn
 eo_ok:  li      3, 0
@@ -1151,6 +1163,72 @@ eo_flush:
         li      9, 0
         stw     9, KDP_HTABLock(1)
         b       eo_ok
+
+eo_patch:
+        andi.   9, 4, 3
+        bne     eo_bad
+        lwz     24, CTX_R6(6)                   # the word to store
+        mr      22, 4                           # the address
+        mr      23, 5                           # the word it must hold
+        addi    8, 1, KDP_HTABLock
+        bl      AcquireLock
+        mr      8, 22
+        bl      phys_of
+        li      9, 0
+        stw     9, KDP_HTABLock(1)
+        cmpwi   8, 0
+        beq     eo_bad                          # no PTE
+        lwz     9, 0(8)
+        cmpw    9, 23
+        bne     eo_bad                          # not the word expected
+        stw     24, 0(8)
+        dcbst   0, 8
+        sync
+        icbi    0, 8
+        sync
+        isync
+        b       eo_ok
+
+# phys_of: r8 a logical address in the blue task's space -> r8 its
+# physical address, or 0 when its page has no PTE. The caller holds the
+# HTAB lock. Keeps r22-r29, r31; uses r9, r14-r21, r30, cr0, cr1, cr5-7.
+phys_of:
+        mflr    20
+        mr      21, 31
+        mr      15, 8                           # the address
+        bl      1f
+1:      mflr    9
+        lwz     8, sys_space - 1b(9)
+        cmpwi   8, 0
+        bne     2f
+        mfsprg  8, 0                            # before OP_SPACES: the
+        lwz     8, EWA_PA_CurAddressSpace(8)    # caller's
+2:      mr      9, 15
+        bl      FindAreaAbove                   # uses r16, r17
+        lwz     16, Area_LogicalBase(8)
+        lwz     17, Area_LogicalEnd(8)
+        cmplw   15, 16
+        blt     8f                              # in no area
+        cmplw   15, 17
+        bgt     8f
+        lwz     17, Area_Flags(8)
+        andi.   17, 17, 0x8000
+        bne     8f                              # contiguous: no PLEs
+        mr      31, 8
+        mr      8, 15
+        bl      SpaceGetPagePLE                 # uses r16-r18
+        beq     8f
+        lwz     16, 0(30)
+        andi.   16, 16, PLE_InHTAB
+        beq     8f                              # no PTE
+        bl      GetPTEFromPLE                   # r17: its lower word
+        rlwinm  8, 17, 0, 0, 19                 # the physical page
+        rlwimi  8, 15, 0, 20, 31                # and the offset in it
+        b       9f
+8:      li      8, 0
+9:      mr      31, 21
+        mtlr    20
+        blr
 
 # spaces_off: the system's VSIDs again, CB_SPACES 0, and every application
 # page's PTE dropped, to be built again from its PLE. r31 the block; uses

@@ -210,7 +210,8 @@ window: log, deny, log the system heap, deny with the system heap logged.
 - Every allowed store makes the page's PTE writable, runs the store again
   and records it in the block's ring (488 entries). The engine's timer
   takes the ring every 16 ms and protects the page again.
-- Patch 5, application VSIDs (`OP_SPACES`, `OP_SWITCH`, `OP_FLUSH`). Every
+- Patch 5, application VSIDs (`OP_SPACES`, `OP_SWITCH`, `OP_FLUSH`,
+  `OP_PATCH`). Every
   application runs in the blue task, in the system address space. With
   `OP_SPACES` on, that space's segment registers for the segments in
   `vsid_mask` hold the current application's own VSIDs: segment << 20 |
@@ -237,6 +238,14 @@ window: log, deny, log the system heap, deny with the system heap logged.
   - `OP_OWNERS` drops the PTE of each page whose byte changes, and
     `OP_SPACES` drops every application page's PTE, so pages are built
     again for their new owner.
+  - The lazy switch records its store's PC in `CB_LAZY_PC`.
+  - `OP_PATCH` (`kcb_patch`) replaces one word of code through its
+    physical address: `phys_of` finds the page's PTE under the HTAB lock,
+    the old word must match, and the kernel writes the new one, then
+    `dcbst`/`icbi`. The write goes around the PTE, so the page's changed
+    bit stays clear and the Virtual Memory Manager never writes a
+    file-mapped page back with it. The page must have a PTE and should be
+    held, or a page read in again loses the change.
 
 ### The engine (`common/engine.c`, `common/engine.h`)
 
@@ -256,11 +265,24 @@ window: log, deny, log the system heap, deny with the system heap logged.
   low-memory reload (S, after the `ApplZone` store) is the fallback site;
   there the Process Manager still stores into the previous process's
   stack, about two allowed faults a switch. Both are found by instruction
-  pattern in the system heap. With virtual memory on, the Process
-  Manager's code is file-mapped and its container exports nothing, so no
-  hook is installed: the kernel switches lazily at the first store that
-  faults, which is the Process Manager's store into the new process's
-  stack. The timer's `check_switch` calls `OP_SWITCH` too, as a backstop.
+  pattern in the system heap. Launches and quits set `ApplZone` outside
+  the context switch, so a few switches stay lazy with the hook (14 of
+  553 in a VM-off boot). The timer's `check_switch` calls `OP_SWITCH`
+  too, as a backstop.
+- The VSID switch with virtual memory on: the Process Manager's code is
+  file-mapped above logical RAM, not in the system heap, and its
+  container exports nothing. Until a hook is in, the kernel switches
+  lazily at the first store that faults, which is the Process Manager's
+  store into the new process's stack, and records its PC. The timer
+  then searches for B within 0x24000 bytes of that PC (`pm_hook_mapped`)
+  and writes `b` (or `ba`) to the stub there with `OP_PATCH`, on a held
+  page. The search reads only pages in the PC's kernel area that a
+  `HoldMemory` probe can bring in (`page_readable`): a large file mapping
+  has unbacked pages, and reading one stopped the extension with a bus
+  error. The stub is allocated at start whether or not a site was found,
+  so it is in branch reach. The engine searches again from each new lazy
+  PC, at most 8 times. `pm_unhook` puts the `blr` back with `OP_PATCH`;
+  if that fails, it leaves the stub in place.
 - Current is the Process Manager's current process (`ApplZone`), the one
   whose code runs in the blue task between `WaitNextEvent` calls, in the
   foreground or the background.
@@ -415,14 +437,16 @@ Worst first. Keep in step with Limits in `README.md`.
     PLE, so a page another application owns, paged in under the current
     VSIDs, is writable to the current application until its PTE is built
     again. Not tested.
-11. With virtual memory on there is no switch hook (the Process Manager's
-    code is file-mapped), so the VSIDs follow at the first store that
-    faults after a switch, normally the Process Manager's store into the
-    new process's stack. A store by the new process into the previous
-    application's memory before that is not caught. Ranges past segment
-    5 are protected page by page, with the old 16 ms window after a
-    switch. (Who is current is right at once: the kernel reads `ApplZone`
-    at each store. Scribble `W` tests that.)
+11. With virtual memory on, the switch hook goes in only after the first
+    lazy switch, whose PC the search needs (25 lazy switches in a VM-on
+    boot before it was in). Until then, and at launches and quits, the
+    VSIDs follow at the first store that faults after a switch, normally
+    the Process Manager's store into the new process's stack, and a
+    store by the new process into the previous application's memory
+    before that is not caught. Ranges past segment 5 are protected page
+    by page, with the old 16 ms window after a switch. (Who is current is
+    right at once: the kernel reads `ApplZone` at each store. Scribble
+    `W` tests that.)
 12. `engine_stop` puts back the Exception Manager's system-wide handler
     without checking that it is still Enforcer's. A handler installed
     after Enforcer's is dropped.
@@ -471,10 +495,10 @@ serialized, and applications run in parallel only outside it.
      nothing left open after a switch. Built on the stock kernel's
      binary, by rewriting the system space's segment registers rather
      than adding address spaces. Measured in "Switch cost" below.
-   - Next: a switch hook with virtual memory on. The Process Manager's
-     code is file-mapped there; a kernel operation that writes the
-     instruction through its physical address, on a held page, would
-     leave the page clean to the Virtual Memory Manager.
+   - Done (2026-11-14): a switch hook with virtual memory on. The
+     Process Manager's code is file-mapped there; the kernel writes the
+     branch through its physical address (`OP_PATCH`) on a held page, so
+     the page stays clean to the Virtual Memory Manager.
 2. Preemption at safe points, native code. On its tick the kernel checks
    whether the current application has run past its time slice with
    only its own code on the stack (no Toolbox call in progress), and if
@@ -540,7 +564,7 @@ With application VSIDs (kernel patch 5), measured the same way on
 | First write into each of 16,384 own pages after a switch back (`R`) | 6.1 ms (0.2 µs a page) | 6.0-6.3 ms (0.1-0.2 µs a page) |
 | The same writes again | 3.1 ms | 2.7-4.0 ms |
 | The engine's work at a switch (`switch:` line) | 15-17 µs | 17-34 µs |
-| VSID switches by the hook / made lazily at a store | 685 / 36 | none / 1,429 |
+| VSID switches by the hook / made lazily at a store | 685 / 36 | 402 / 25 (none / 1,429 without the hook) |
 | PTEs built again for another VSID, a switch | about 31 | about 73 |
 | Stores the kernel allowed in a boot to the Finder | 10 | 12 |
 
@@ -751,7 +775,7 @@ To check which kernel is running, dump it and compare it with the build
 (`build.sh` prints its size):
 
 ```bash
-../os9-protect/tools/qmp.py raw '{"execute":"pmemsave","arguments":{"val":15794176,"size":108452,"filename":"/tmp/nk-live.bin"}}'
+../os9-protect/tools/qmp.py raw '{"execute":"pmemsave","arguments":{"val":15794176,"size":108700,"filename":"/tmp/nk-live.bin"}}'
 ```
 
 ```bash
