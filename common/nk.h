@@ -14,6 +14,15 @@
 #define NK_H
 
 enum {
+    kcCreateArea = 72,         /* r3 space (0 = current), r4 access (6: read
+                                  and write), r5 length, r6 separation, r7
+                                  flags and alignment (0x600C: at the base,
+                                  4 KB pages), r8 base -> r8 base, r9 area.
+                                  The pages have no memory until mapped. */
+    kcDeleteArea = 74,         /* r3 area, with nothing mapped */
+    kcPutFreePage = 84,        /* r3 a physical page, for the kernel's own
+                                  free list (area page tables come from it) */
+    kcGetFreePageCount = 100,  /* -> r4 */
     kcSetAreaAccess = 76,      /* r3 area, r4 values, r5 mask, r6 start, r7 len */
     kcAreaInfo = 78,           /* r3 area, r4 1, r5 selector -> r6..r9 */
     kcGetAreaFromAddress = 80, /* r3 space (0 = current), r4 addr -> r5 area */

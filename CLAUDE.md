@@ -331,6 +331,7 @@ allowed store changes nothing.
 | `G` | `TempNewHandle` in system mode (`BeginSystemMode`) | PASS: the handle is the Process Manager's, not in a chunk |
 | `A` | draw an Appearance scroll bar with a thumb for 3 s; first in a fresh boot, then again after `q`, a launch and `m` | the first passes 1 request on in system mode (the theme's thumb image); the second thumb is the same as the first |
 | `O` | 6 MB of handles and 2 MB of pointers in 256 KB blocks (the file asks for a 1 MB partition), written, read back and disposed | PASS: every block, those the partition cannot hold in chunks, the chunks freed after disposing |
+| `J` | sparse memory (kernel patch 7, VM off; once a boot: it leaves 450 KB in the system heap): a 64 MB area with a pool of 64 pages, 48 pages touched, freed, one touched again | PASS: each page zero at first touch and holding its data, the pool's counts right, the area deleted |
 
 `Y`, `V` and `D` flip the word, read it back and restore it, and print
 whether the store landed.
@@ -688,6 +689,60 @@ Findings:
   - The dialog is not in the application's `WindowList` (low memory
     0x9D6): it is in another layer.
 
+### Sparse memory (kernel patch 7)
+
+A range of addresses whose pages get memory when they are first touched,
+with virtual memory off. It is the kernel half of "Memory on demand"
+(Roadmap); nothing in the engine uses it yet, and Scribble `J` tests it.
+
+What the stock kernel has (read in `refs/powermac-rom/NanoKernel`,
+`NKAddressSpaces.s`, `NKPaging.s`, `NKInterrupts.s`):
+- `MPCreateArea` (MP call 72: r3 space or 0, r4 access, r5 length, r6
+  separation, r7 flags, r8 base; returns r8 base, r9 area) makes an area
+  with one page list entry (PLE) a page and no memory. Flags 0x600C place
+  it exactly at the base with 4 KB pages; 0x2000 at or above; access 6 is
+  read and write. Its PLE and fault-counter arrays come from the kernel's
+  free page list when they are over 4 KB: about pages/1024 + pages/2048
+  + 2 pages.
+- The kernel's free page list is empty after startup on the test machine
+  (`MPGetFreePageCount`, call 100, returned 0). `MPPutFreePage` (84, r3 a
+  physical page) adds a page and checks nothing, so give it only pages
+  Mac OS will never use again.
+- `MPMapPage` (85) puts a page in a PLE; `MPUnmapPages` (86) takes it
+  out; `MPDeleteArea` (74) needs nothing mapped. No path clears a page or
+  maps on demand: `PagingFunc1` returns "page fault" for a PLE with no
+  page, and for the blue task that goes to Mac OS.
+- An area is looked up before the segment's own map, so an area above
+  logical RAM takes the faults there. 0x40000000 was free on the 512 MB
+  machine.
+
+The patch:
+- At `PagingFunc1`'s "no page" exit for a paged area, when the address is
+  between `sparse_lo` and `sparse_hi`, `sparse_fill` takes a page from the
+  pool, clears it, sets the PLE as `MPMapPage` does, adds to the area's
+  `BytesMapped`, and runs the PLE test again, so the stock code builds the
+  PTE and patch 5 gives it its owner's protection.
+- The pool is a list through the first word of each free page, by
+  physical address, under the HTAB lock (which `PagingFunc1`'s callers
+  hold; the kernel's own free list needs the pool lock, taken first
+  everywhere else).
+- With the pool empty the fault goes on as in the stock kernel, and is
+  counted. The caller has to keep the pool ahead of what can be touched.
+- Operations of MP call 109 (`kcb.h`): `OP_SPARSE` (the range),
+  `OP_POOL_PUT` (a physical page the caller owns), `OP_POOL_GET` (one
+  back), `OP_SPARSE_FREE` (an address and a number of pages: their PTEs
+  dropped, their pages back in the pool; returns how many), and
+  `OP_SPARSE_INFO` (the pool's size, pages given, faults with it empty).
+  A kernel without the patch returns paramErr, and the control block's
+  version is unchanged.
+
+Scribble `J` (2026-11-15, VM off): 48 system heap pages to the kernel's
+free list, a 64 MB area at 0x40000000, a pool of 64 system heap pages.
+48 pages touched 1.3 MB apart: all zero, all hold what was written, pool
+16, no fault with the pool empty; 48 freed, pool 64; one touched again
+reads zero; the pool taken back, the area deleted. Scribble `O`, `Z` and
+`n` pass on this kernel.
+
 ### Findings that constrain the design
 
 - Protection bits 11 make a page read-only for all code, the kernel
@@ -1016,8 +1071,19 @@ Not built, and why:
   larger partition with virtual memory off (hole 23). Both need the
   partition's range to exceed what backs it: a zero-fill pager in the
   kernel with a pool of pages, and the partition placed outside the
-  Process Manager's heap. That is the next large step if these limits
-  matter in use.
+  Process Manager's heap.
+
+The pager is built (2026-11-15, "Sparse memory (kernel patch 7)"). What
+is left is using it:
+1. The engine owns the pool: pages from locked temporary memory, kept
+   ahead of use, with the owner table sized for the sparse range.
+2. Overflow chunks in a sparse area: a chunk's zone can then be large,
+   and its free pages go back with `OP_SPARSE_FREE`.
+3. Partitions in a sparse area. Launch (`0x117E170` reads the sizes; the
+   caller stores the preferred size and calls one routine that makes the
+   process, retrying smaller on `memFullErr` down to the minimum) has the
+   partition as a block of the Process Manager's heap, with its size,
+   lock and disposal going through that heap. Trace that routine first.
 
 ### Switch cost
 
@@ -1277,11 +1343,12 @@ tools/qmp.py raw '{"execute":"pmemsave","arguments":{"val":15794176,"size":10924
 cmp /tmp/nk-live.bin kernel/build/NanoKernel-v02.28.bin
 ```
 
-The last 288 bytes are data the kernel writes: `task_log` (272 bytes),
+The last 312 bytes are data the kernel writes: `task_log` (272 bytes),
 then `enf_cb` (4 bytes), the physical address of the registered control
 block, then patch 5's `vsid_mask`, `sys_space` (the blue task's
 `AddressSpace`, physical) and `vsid_cur` (the owner whose VSIDs it
-holds). `build.sh` prints the physical address of `task_log` and
+holds), then patch 7's `sparse_lo`, `sparse_hi`, `pool_head`,
+`pool_count`, `sparse_fills` and `sparse_empty`. `build.sh` prints the physical address of `task_log` and
 `enf_cb`. `task_log` is a
 count, three zero words, then 16 entries of four words (the task's PC, the
 address, the task's ID, the page's new PTE); the latest is number

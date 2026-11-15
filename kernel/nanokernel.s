@@ -70,6 +70,9 @@ kernel:
         .set    Area_LogicalBase, 0x024
         .set    Area_LogicalEnd, 0x028          # its last byte
         .set    PLE_InHTAB, 0x800               # bits 0-19 then index the PTE
+        .set    PLE_HasPage, 0x001              # bits 0-19 are its page
+        .set    Area_BytesMapped, 0x038
+        .set    EWA_SpecialAreaPtr, -0x0E4      # PagingFunc1's area
         .set    FLAG_EMU, 0x0080                # EWA.kFlagEmu (bit 8), oris
         .set    FLAG_BLUE, 0x0020               # EWA.kFlagBlue (bit 10), oris
         .set    FLAG_SIGP, 0x8000               # EWA.kFlagSIGP (bit 16), ori
@@ -163,6 +166,11 @@ kernel:
         .set    OP_YIELD, 9
         .set    OP_RESUME, 10
         .set    OP_FRESH, 11
+        .set    OP_SPARSE, 12                   # patch 7
+        .set    OP_POOL_PUT, 13
+        .set    OP_POOL_GET, 14
+        .set    OP_SPARSE_FREE, 15
+        .set    OP_SPARSE_INFO, 16
         .set    VSID_APP, 0xFFF00               # application VSIDs: segment
                                                 # << 20 | VSID_APP + owner
         .set    CTX_MSR, 0x0A4                  # ContextBlock: MSR,
@@ -724,12 +732,79 @@ pf1_paged_pp:
         bne     1f                              # as at the site: build only
         bl      pp_owner                        # for "present, no PTE"
         b       PF1_build
-1:      b       PF1_paged_rest
+1:      bge     cr7, 2f                         # not "no page": as before
+        bl      sparse_fill                     # patch 7
+        bne     2f
+        li      8, 0x801                        # as @_12c, for an area not
+        li      9, 0x01                         # at 0; then the test again,
+        lwz     28, 0(26)                       # with the page in the PLE
+        b       pf1_paged
+2:      b       PF1_paged_rest
 pf1_list_pp:
         bne     1f
         bl      pp_owner
         b       PF1_build
 1:      b       PF1_list_rest
+
+# Patch 7: sparse memory. The stock kernel has areas whose pages have no
+# physical page until one is mapped (MPCreateArea, MP call 72, then
+# MPMapPage), and PagingFunc1 reports a touch of such a page as a page
+# fault, which Mac OS cannot serve with virtual memory off. Between
+# sparse_lo and sparse_hi (OP_SPARSE), the patch serves it: it takes a
+# physical page from its pool, clears it, puts it in the page's PLE as
+# MPMapPage does, and lets PagingFunc1 build the PTE. The pool is a list
+# through the first word of each free page (physical addresses), filled by
+# OP_POOL_PUT with pages the caller owns and will not use, and protected by
+# the HTAB lock, which PagingFunc1's caller holds. With the pool empty the
+# fault goes on as in the stock kernel, so the caller must keep the pool
+# ahead of what can be touched. OP_SPARSE_FREE takes pages back.
+#
+# sparse_fill: r27 the address, r26 &PLE, r28 the PLE (no page, no PTE).
+# Returns cr0.eq when the PLE has a page now. Uses r14-r20, cr0, cr5.
+sparse_fill:
+        mflr    14
+        bl      1f
+1:      mflr    16
+        mtlr    14
+        lwz     17, sparse_lo - 1b(16)
+        lwz     18, sparse_hi - 1b(16)
+        cmplw   cr5, 27, 17
+        blt     cr5, 9f
+        cmplw   cr5, 27, 18
+        bge     cr5, 9f
+        lwz     19, pool_head - 1b(16)
+        cmpwi   19, 0
+        beq     8f
+        lwz     17, 0(19)                       # the next free page
+        stw     17, pool_head - 1b(16)
+        lwz     17, pool_count - 1b(16)
+        addi    17, 17, -1
+        stw     17, pool_count - 1b(16)
+        li      17, 0                           # clear it
+        li      20, 0
+2:      stwx    20, 19, 17
+        addi    17, 17, 4
+        cmplwi  17, 4096
+        blt     2b
+        andi.   28, 28, 0x7E6                   # as MPMapPage: the flags,
+        or      28, 28, 19                      # the page, "has a page"
+        ori     28, 28, PLE_HasPage
+        stw     28, 0(26)
+        mfsprg  17, 0
+        lwz     17, EWA_SpecialAreaPtr(17)      # the area, from @_88
+        lwz     18, Area_BytesMapped(17)
+        addi    18, 18, 4096
+        stw     18, Area_BytesMapped(17)
+        lwz     17, sparse_fills - 1b(16)
+        addi    17, 17, 1
+        stw     17, sparse_fills - 1b(16)
+        cmpw    17, 17                          # eq
+        blr
+8:      lwz     17, sparse_empty - 1b(16)       # no page to give
+        addi    17, 17, 1
+        stw     17, sparse_empty - 1b(16)
+9:      cmpwi   1, 0                            # ne: r1 is the KDP
+        blr
 
 # vsid_fix: at PagingFunc1's PLE (r26 &PLE, r28 the PLE, r27 the address),
 # when the PLE's PTE has another VSID than this segment's, drop the PTE
@@ -1102,6 +1177,16 @@ enf_op:
         beq     eo_yield
         cmpwi   3, OP_FRESH
         beq     eo_fresh
+        cmpwi   3, OP_SPARSE
+        beq     eo_sparse
+        cmpwi   3, OP_POOL_PUT
+        beq     eo_pool_put
+        cmpwi   3, OP_POOL_GET
+        beq     eo_pool_get
+        cmpwi   3, OP_SPARSE_FREE
+        beq     eo_sparse_free
+        cmpwi   3, OP_SPARSE_INFO
+        beq     eo_sparse_info
 eo_bad: li      3, -50
         b       MPReturn
 eo_ok:  li      3, 0
@@ -1284,6 +1369,134 @@ eo_fresh:
         li      17, 0
         stbx    17, 31, 9
         b       eo_ok
+
+# Patch 7's operations.
+eo_sparse:                                      # r4, r5: the range (0, 0: none)
+        addi    8, 1, KDP_HTABLock
+        bl      AcquireLock
+        bl      1f
+1:      mflr    16
+        stw     4, sparse_lo - 1b(16)
+        stw     5, sparse_hi - 1b(16)
+        li      9, 0
+        stw     9, KDP_HTABLock(1)
+        b       eo_ok
+
+eo_pool_put:                                    # r4: a physical page
+        andi.   9, 4, 0xFFF
+        bne     eo_bad
+        cmpwi   4, 0
+        beq     eo_bad
+        addi    8, 1, KDP_HTABLock
+        bl      AcquireLock
+        bl      1f
+1:      mflr    16
+        lwz     17, pool_head - 1b(16)
+        stw     17, 0(4)
+        stw     4, pool_head - 1b(16)
+        lwz     17, pool_count - 1b(16)
+        addi    17, 17, 1
+        stw     17, pool_count - 1b(16)
+        li      9, 0
+        stw     9, KDP_HTABLock(1)
+        b       eo_ok
+
+eo_pool_get:                                    # returns a page, or 0
+        addi    8, 1, KDP_HTABLock
+        bl      AcquireLock
+        bl      1f
+1:      mflr    16
+        lwz     3, pool_head - 1b(16)
+        cmpwi   3, 0
+        beq     2f
+        lwz     17, 0(3)
+        stw     17, pool_head - 1b(16)
+        lwz     17, pool_count - 1b(16)
+        addi    17, 17, -1
+        stw     17, pool_count - 1b(16)
+2:      li      9, 0
+        stw     9, KDP_HTABLock(1)
+        b       MPReturn
+
+eo_sparse_info:                                 # r4: 0 pages in the pool, 1
+        bl      1f                              # pages given, 2 faults with
+1:      mflr    16                              # the pool empty
+        cmplwi  4, 2
+        bgt     eo_bad
+        slwi    9, 4, 2
+        addi    9, 9, pool_count - 1b
+        lwzx    3, 16, 9
+        b       MPReturn
+
+# r4 an address, r5 a number of pages: take the pages in the sparse range
+# back into the pool (their PTEs dropped, their PLEs empty again). Returns
+# how many it took.
+eo_sparse_free:
+        mr      22, 4
+        mr      23, 5
+        li      24, 0
+        addi    8, 1, KDP_HTABLock
+        bl      AcquireLock
+1:      cmpwi   23, 0
+        beq     7f
+        bl      2f
+2:      mflr    9
+        lwz     16, sparse_lo - 2b(9)
+        lwz     17, sparse_hi - 2b(9)
+        cmplw   22, 16
+        blt     6f
+        cmplw   22, 17
+        bge     6f
+        mfsprg  8, 0
+        lwz     8, EWA_PA_CurAddressSpace(8)
+        mr      9, 22
+        bl      FindAreaAbove                   # uses r16, r17
+        lwz     16, Area_LogicalBase(8)
+        lwz     17, Area_LogicalEnd(8)
+        cmplw   22, 16
+        blt     6f
+        cmplw   22, 17
+        bgt     6f
+        lwz     17, Area_Flags(8)
+        andi.   17, 17, 0x8000
+        bne     6f                              # contiguous: no PLEs
+        mr      25, 8                           # the area
+        mr      31, 8
+        mr      8, 22
+        bl      SpaceGetPagePLE                 # uses r16-r18
+        beq     6f
+        lwz     16, 0(30)
+        andi.   16, 16, PLE_InHTAB
+        beq     3f
+        bl      GetPTEFromPLE
+        mr      8, 22
+        bl      InvalPTE
+        bl      DeletePTE                       # the page back in the PLE
+3:      lwz     16, 0(30)
+        andi.   17, 16, PLE_HasPage
+        beq     6f
+        rlwinm  19, 16, 0, 0, 19                # the physical page
+        andi.   16, 16, 0x7E6
+        stw     16, 0(30)
+        bl      4f
+4:      mflr    9
+        lwz     17, pool_head - 4b(9)
+        stw     17, 0(19)
+        stw     19, pool_head - 4b(9)
+        lwz     17, pool_count - 4b(9)
+        addi    17, 17, 1
+        stw     17, pool_count - 4b(9)
+        lwz     17, Area_BytesMapped(25)
+        addi    17, 17, -4096
+        stw     17, Area_BytesMapped(25)
+        addi    24, 24, 1
+6:      addi    22, 22, 4096
+        addi    23, 23, -1
+        b       1b
+7:      li      9, 0
+        stw     9, KDP_HTABLock(1)
+        mr      3, 24
+        b       MPReturn
 
 # r4 the block. Returns through MPReturn with r10 (the PC), r12 (LR) and
 # r13 (CR) set, which SchExitInterrupt loads before its rfi, the caller's
@@ -1496,3 +1709,15 @@ sys_space:
 vsid_cur:
         .long   0                               # the owner whose VSIDs it
                                                 # holds (0: the system's)
+sparse_lo:
+        .long   0                               # patch 7: the sparse range,
+sparse_hi:
+        .long   0
+pool_head:
+        .long   0                               # its free pages (physical),
+pool_count:
+        .long   0                               # how many (OP_SPARSE_INFO 0),
+sparse_fills:
+        .long   0                               # pages given (1),
+sparse_empty:
+        .long   0                               # faults with none to give (2)

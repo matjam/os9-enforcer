@@ -615,7 +615,8 @@ int main(void)
                "owner table, X make the Enforcer Extension quit "
                "as in a crash, Z run 5 s without yielding, C/U the same "
                "in a native/68k callback, H 20 s in a 68k callback, G "
-               "temporary memory in system mode, A draw a scroll bar, O 8 MB in this 1 MB partition, q "
+               "temporary memory in system mode, A draw a scroll bar, O 8 MB in this 1 MB partition, J sparse "
+               "memory, q "
                "quit; then Return\n");
         int ch = getchar();
         while (ch != '\n' && getchar() != '\n')
@@ -1251,6 +1252,114 @@ int main(void)
                           (unsigned long)over * kBlock;
             printf("%s\n", got == kN && over > 0 && !bad && !dirty && home &&
                                counted && chunks2 <= chunks0 + 1
+                               ? "PASS" : "FAIL");
+            continue;
+        }
+        case 'J': {
+            /* Sparse memory (kernel patch 7): a 64 MB area above RAM with
+               no memory behind it, and a pool of 64 pages. Touch 48 pages
+               spread over it: each must read as zeros, hold what is
+               written, and come out of the pool. Give them back, touch
+               one again (zeros again), and take everything down. The
+               pages given to the kernel's free list stay there, and both
+               blocks stay in the system heap: run it once a boot. */
+            enum { kBase = 0x40000000, kLen = 64 << 20, kPool = 64,
+                   kFeed = 48, kTouch = 48 };
+            long vm = 0;
+            KRegs k;
+            memset(&k, 0, sizeof k);
+            k.r3 = kKcbOpSparseInfo;
+            long have = nk_call(kMPEnforcer, &k);
+            if (have < 0) {
+                printf("SKIP: the kernel has no sparse memory (%ld)\n", have);
+                continue;
+            }
+            if (!Gestalt(gestaltVMAttr, &vm) && (vm & 1)) {
+                printf("SKIP: virtual memory is on\n");
+                continue;
+            }
+            Ptr feed = NewPtrSysClear((kFeed + 1) * 4096L);
+            Ptr pool = NewPtrSysClear((kPool + 1) * 4096L);
+            if (!feed || !pool) {
+                printf("no memory in the system heap\n");
+                continue;
+            }
+            memset(&k, 0, sizeof k);
+            nk_call(kcGetFreePageCount, &k);
+            unsigned long free0 = k.r4;
+            unsigned long a = ((unsigned long)feed + 4095) & ~4095UL;
+            int fed = 0;
+            for (int i = 0; i < kFeed; i++, a += 4096) {
+                memset(&k, 0, sizeof k);
+                k.r3 = kcb_physical((void *)a, 4096);
+                if (k.r3 && !nk_call(kcPutFreePage, &k))
+                    fed++;
+            }
+            memset(&k, 0, sizeof k);
+            k.r4 = 6;
+            k.r5 = kLen;
+            k.r7 = 0x600C;
+            k.r8 = kBase;
+            long err = nk_call(kcCreateArea, &k);
+            unsigned long area = k.r9;
+            printf("kernel free pages %lu, fed %d; area %08lX at %08lX: "
+                   "error %ld\n", free0, fed, area, k.r8, err);
+            if (err)
+                continue;
+            kcb_set2(kKcbOpSparse, kBase, kBase + kLen);
+            a = ((unsigned long)pool + 4095) & ~4095UL;
+            int put = 0;
+            for (int i = 0; i < kPool; i++, a += 4096) {
+                unsigned long p = kcb_physical((void *)a, 4096);
+                if (p && !kcb_set(kKcbOpPoolPut, p))
+                    put++;
+            }
+            int dirty = 0, bad = 0;
+            for (int i = 0; i < kTouch; i++) {
+                volatile unsigned long *p = (volatile unsigned long *)
+                    (kBase + (unsigned long)i * 0x150000 + 0x3000);
+                for (int w = 0; w < 1024; w++)
+                    if (p[w])
+                        dirty++;
+                for (int w = 0; w < 1024; w++)
+                    p[w] = 0x4A000000UL | (unsigned long)i << 12 | w;
+            }
+            for (int i = 0; i < kTouch; i++) {
+                volatile unsigned long *p = (volatile unsigned long *)
+                    (kBase + (unsigned long)i * 0x150000 + 0x3000);
+                for (int w = 0; w < 1024; w++)
+                    if (p[w] != (0x4A000000UL | (unsigned long)i << 12 | w))
+                        bad++;
+            }
+            long left = kcb_set(kKcbOpSparseInfo, 0);
+            long given = kcb_set(kKcbOpSparseInfo, 1);
+            long empty = kcb_set(kKcbOpSparseInfo, 2);
+            long freed = kcb_set2(kKcbOpSparseFree, kBase, kLen / 4096);
+            long back = kcb_set(kKcbOpSparseInfo, 0);
+            volatile unsigned long *again =
+                (volatile unsigned long *)(kBase + 0x3000);
+            int stale = 0;
+            for (int w = 0; w < 1024; w++)
+                if (again[w])
+                    stale++;
+            long freed2 = kcb_set2(kKcbOpSparseFree, kBase, kLen / 4096);
+            kcb_set2(kKcbOpSparse, 0, 0);
+            int got = 0;
+            while (kcb_set(kKcbOpPoolGet, 0) > 0)
+                got++;
+            memset(&k, 0, sizeof k);
+            k.r3 = area;
+            long del = nk_call(kcDeleteArea, &k);
+            printf("pool %d; %d pages touched: %d words not zero, %d wrong; "
+                   "pool then %ld, given %ld, empty faults %ld; freed %ld, "
+                   "pool %ld; touched again: %d words not zero, freed %ld; "
+                   "pool taken back %d, area deleted: %ld\n",
+                   put, kTouch, dirty, bad, left, given, empty, freed, back,
+                   stale, freed2, got, del);
+            printf("%s\n", put == kPool && !dirty && !bad &&
+                               left == kPool - kTouch && empty == 0 &&
+                               freed == kTouch && back == kPool && !stale &&
+                               freed2 == 1 && got == kPool && !del
                                ? "PASS" : "FAIL");
             continue;
         }

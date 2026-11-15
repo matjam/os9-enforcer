@@ -73,7 +73,18 @@ enum {
                           ticks (0: one slice) */
     kKcbOpResume = 10, /* from the stub: r4 a register block (common/
                           hyield.s); needs no block registered */
-    kKcbOpFresh = 11   /* r4 a new application's owner: yielded[r4] = 0 */
+    kKcbOpFresh = 11,  /* r4 a new application's owner: yielded[r4] = 0 */
+    /* Sparse memory (kernel patch 7): between the two addresses of
+       kKcbOpSparse, a page of an area (MPCreateArea) that has no physical
+       page gets one from the kernel's pool, cleared, when it is first
+       touched. A kernel without the patch returns paramErr for these. */
+    kKcbOpSparse = 12,     /* r4, r5 the range (0, 0: none) */
+    kKcbOpPoolPut = 13,    /* r4 a physical page the caller will not use */
+    kKcbOpPoolGet = 14,    /* returns a physical page from the pool, or 0 */
+    kKcbOpSparseFree = 15, /* r4 an address, r5 pages: back into the pool;
+                              returns how many it took */
+    kKcbOpSparseInfo = 16  /* r4 0: pages in the pool; 1: pages given; 2:
+                              faults with the pool empty */
 };
 
 /* KEvent.info, low byte. */
