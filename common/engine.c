@@ -3100,9 +3100,11 @@ static void size_follow(State *s)
     if (!p)
         return;
     unsigned long cap = 0;
+    /* With virtual memory off the partition reserves RAM, so the share is
+       smaller. */
     if (s->mode != kModeOff && s->mem_on && s->pm_zone)
-        cap = ((unsigned long)((THz)s->pm_zone)->zcbFree / kSizeShare) &
-              ~0xFFFUL;
+        cap = ((unsigned long)((THz)s->pm_zone)->zcbFree /
+               (s->vm ? kSizeShare : kSizeShareReal)) & ~0xFFFUL;
     p[kSzCap] = cap;
     s->size_cap = cap;
     s->size_raised = p[kSzRaised];

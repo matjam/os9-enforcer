@@ -57,6 +57,11 @@ it, open Enforcer Installer and click Install.
 the system heap. Enforcer never blocks those: applications and extensions
 write there legitimately.
 
+"Give applications more memory than Get Info sets" (on by default) lets an
+application launch with a larger partition and take more memory when the
+partition is full. To have the Get Info sizes apply as without Enforcer,
+turn it off; applications already running keep what they have.
+
 When Enforcer stops an application, a notification names the application,
 the one whose memory it tried to write into, and the address. When the
 write came from code that cannot be stopped safely (interrupt-time code, a
@@ -87,7 +92,8 @@ To stop an application that does not respond, use Force Quit
   outlives the application.
 - **Memory sizes.** The sizes in an application's Get Info window stop
   being a hard limit. At launch, an application gets up to four times its
-  preferred size, but no more than a quarter of the free memory. When its
+  preferred size, but no more than a quarter of the free memory (an eighth
+  with virtual memory off). When its
   partition is full, a new block comes from temporary memory that the
   application owns, as long as 2 MB of temporary memory stays free.
 - **Stopping.** When the current application writes into another
@@ -172,7 +178,7 @@ Memory sizes:
   not the memory an application has outside it.
 - With virtual memory off, a larger partition reserves real memory whether
   the application uses it or not.
-- There is no setting for the sizes, other than turning Enforcer off.
+- The sizes are one setting for every application: on or off.
 
 Compatibility:
 - An application's temporary memory comes from chunks of its own. A large

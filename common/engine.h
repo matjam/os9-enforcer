@@ -545,8 +545,9 @@ typedef struct {
        at that routine's exit (size_site, patched like pm_site; size_mapped
        as pm_mapped) raises the preferred size to kSizeFactor times what
        the file asks, but no more than size_cap: 1/kSizeShare of the
-       Process Manager heap's free bytes, set each tick, 0 while protection
-       is off. The minimum stays, so an application still launches when
+       Process Manager heap's free bytes (1/kSizeShareReal with virtual
+       memory off, where the partition reserves RAM), set at task level, 0
+       while protection or mem_on is off. The minimum stays, so an application still launches when
        memory is short. Launching does not touch the partition's pages
        (CLAUDE.md, "Memory on demand"), so with virtual memory on the
        larger partition costs addresses, not memory. size_raised counts
@@ -560,7 +561,7 @@ typedef struct {
     volatile unsigned long mem_on, want_mem;
 } State;
 
-enum { kSizeFactor = 4, kSizeShare = 4 };
+enum { kSizeFactor = 4, kSizeShare = 4, kSizeShareReal = 8 };
 
 /* Install the hooks, the fallback handler and the timer, read the process
    list, and start in mode. name is the running program's, for the log.

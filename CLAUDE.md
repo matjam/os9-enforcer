@@ -566,7 +566,8 @@ window: log, deny, log the system heap, deny with the system heap logged.
   into a record and adds the default stack (low memory 0x322) less 8 KB.
   `size_hook` replaces the `mr r3,r29` at its exit with a branch to a stub
   that raises the preferred size to 4 times what the file asks, capped at
-  `size_cap`: a quarter of the Process Manager zone's `zcbFree`, which
+  `size_cap`: a quarter of the Process Manager zone's `zcbFree` (an
+  eighth with virtual memory off, where the partition reserves RAM), which
   `size_follow` sets at task level (0 with protection off). The site is
   found by its instructions, in the system heap (virtual memory off) or in
   the file-mapped code around the switch hook's site (`pm_hook_mapped`,
@@ -812,7 +813,10 @@ Worst first. Keep in step with Limits in `README.md`.
 22. An application that tests for memory by asking for a huge block and
     expects it to fail can now get it, down to the 2 MB reserve.
 23. With virtual memory off, a partition raised at launch reserves RAM the
-    application may never touch (up to a quarter of what was free).
+    application may never touch (up to an eighth of what was free). With
+    Apple System Profiler, Sherlock 2, Scrapbook and Stickies running, the
+    nine heaps held 30 MB, 81% of it free, against 10.6 MB without launch
+    sizes.
 
 Compatibility review (2026-11-13) also noted: programs that write-protect
 their own pages lose those faults to the kernel and the hooks; the engine
@@ -976,7 +980,8 @@ the last block is a 12-byte nonrelocatable trailer.
 
 Built so far (2026-11-14, see "The engine" for how):
 - Launch sizes: an application gets up to 4 times its preferred size, no
-  more than a quarter of the free memory. This is design point 1 inside
+  more than a quarter of the free memory (an eighth with virtual memory
+  off). This is design point 1 inside
   what the Process Manager's heap can give: with virtual memory on the
   partition is sparse; with it off it reserves RAM. Scribble's 1,040 KB
   became 4,160 KB, VM off and on.
@@ -990,9 +995,29 @@ as one block of its heap, whose addresses are the logical memory (RAM, or
 the virtual memory size). A range beyond that needs the partition placed
 outside the Process Manager's heap, which means taking over launch.
 
-Still to build: reclaim (2), with `ReleaseMemoryData` under virtual
-memory; `GetProcessInformation` counting chunks (6); `MaxMem` and
-`FreeMem` (4); the stack guard page (5); a control panel setting.
+Also built: `GetProcessInformation` adds an application's chunks to its
+size and free memory (6; Scribble `O` checks it), and the control panel's
+"Give applications more memory than Get Info sets" turns launch sizes and
+overflow off (`State.want_mem`; off, Scribble `O` gets 3 of 32 blocks, as
+without Enforcer).
+
+Not built, and why:
+- Reclaim (2). With virtual memory off it frees nothing usable: there is
+  no pager to give a page to another address. With it on it would save
+  page-outs of free blocks, through `ReleaseMemoryData` if 9.2.2's VM has
+  it; not tried. It pays off with the kernel pager below.
+- `MaxMem` and `FreeMem` (4): they still count the partition only, which
+  errs on the safe side.
+- The stack guard page (5). The page above `ApplLimit` is legal stack,
+  and the one below is heap, so a guard needs `ApplLimit` lowered a page
+  at launch; a store into it would then be denied like one into another
+  application.
+- Growing a block past the partition (hole 20), and RAM reserved by a
+  larger partition with virtual memory off (hole 23). Both need the
+  partition's range to exceed what backs it: a zero-fill pager in the
+  kernel with a pool of pages, and the partition placed outside the
+  Process Manager's heap. That is the next large step if these limits
+  matter in use.
 
 ### Switch cost
 
