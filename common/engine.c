@@ -76,6 +76,7 @@ static UniversalProcPtr g_exit_rd, g_exit_old;
 
 static OSErr own_info(const ProcessSerialNumber *psn, ProcessInfoRec *info);
 static void stack_set(State *s, int d, unsigned long lo, unsigned long hi);
+static int chunk_is_sparse(const Chunk *c);
 
 static inline volatile void *lowmem(unsigned long addr)
 {
@@ -1838,6 +1839,20 @@ static unsigned long pool_shrink(State *s)
    pages the kernel has given since the last look come off it. A touch
    the engine promised nothing for also counts, so the debt can run low;
    the headroom covers that. */
+/* A promise ends when its pages are given, and also with time: a block
+   made from heap space that has its pages already takes none, so its
+   promise would stay for good, and a program that makes and frees large
+   blocks (a browser) would raise the debt, and with it the pool, until
+   the machine's free memory was all in the pool (About This Computer
+   shows it as Mac OS). The debt is in two parts: g_debt_new is what was
+   promised since g_debt_at, the rest is older. After kDebtTicks the
+   older part is dropped and the new part becomes the older one, so a
+   promise lasts between one and two times kDebtTicks. A program that is
+   still filling a block after that goes on at the pace the headroom
+   allows between two polls. */
+enum { kDebtTicks = 600 }; /* 10 seconds */
+static unsigned long g_debt_new, g_debt_at;
+
 static void sparse_settle(State *s)
 {
     long given = sparse_info(1);
@@ -1848,6 +1863,45 @@ static void sparse_settle(State *s)
     s->pool_debt = s->pool_debt > d ? s->pool_debt - d : 0;
     if (!s->sparse_used)
         s->pool_debt = 0;
+    unsigned long now = lowmem_long(0x16A); /* Ticks */
+    if (now - g_debt_at >= kDebtTicks) {
+        if (s->pool_debt > g_debt_new)
+            s->pool_debt = g_debt_new;
+        g_debt_new = 0;
+        g_debt_at = now;
+    }
+    if (g_debt_new > s->pool_debt) /* pages given come off the older part */
+        g_debt_new = s->pool_debt;
+}
+
+/* The pages of the sparse partitions and chunks that have no memory yet:
+   no more than these can be owed. From the counts sparse_backed keeps, so
+   up to a second old: a count that is low makes this high, which only
+   keeps more in the pool. */
+static unsigned long sparse_unbacked(State *s)
+{
+    unsigned long total = 0;
+    for (int i = 0; i < kMaxParts; i++) {
+        SparsePart *p = &s->parts[i];
+        if (!p->units)
+            continue;
+        unsigned long span = p->units * (kSparseUnit / kPage);
+        long n = sparse_backed(i, p->lo, p->lo + p->units * kSparseUnit);
+        if (n < 0)
+            return 0xFFFFFFFFUL;
+        total += span > (unsigned long)n ? span - (unsigned long)n : 0;
+    }
+    for (int i = 0; i < kMaxChunks; i++) {
+        Chunk *c = &s->chunks[i];
+        if (!c->live || !chunk_is_sparse(c))
+            continue;
+        unsigned long span = (c->hi - c->lo) / kPage;
+        long n = sparse_backed(kMaxParts + i, c->lo, c->hi);
+        if (n < 0)
+            return 0xFFFFFFFFUL;
+        total += span > (unsigned long)n ? span - (unsigned long)n : 0;
+    }
+    return total;
 }
 
 static int sparse_ensure(State *s, unsigned long pages, int promise)
@@ -1862,8 +1916,15 @@ static int sparse_ensure(State *s, unsigned long pages, int promise)
        the application is still on its way through the block (Scribble E:
        a preempted write loop, the poll in between, and a touch with the
        pool empty). Without, they are touched right away. */
-    if (promise)
+    if (promise) {
+        unsigned long most = sparse_unbacked(s);
         s->pool_debt += pages;
+        g_debt_new += pages;
+        if (s->pool_debt > most)
+            s->pool_debt = most;
+        if (g_debt_new > s->pool_debt)
+            g_debt_new = s->pool_debt;
+    }
     pages = promise ? s->pool_debt : s->pool_debt + pages;
     while ((unsigned long)level < kPoolHeadroom + pages) {
         unsigned long n = pool_grow(s);
@@ -2090,6 +2151,7 @@ static Chunk *sparse_chunk(State *s, int d, unsigned long size)
     sig[1] = (unsigned long)z;
 
     Chunk *c = &s->chunks[slot];
+    g_backed_at[kMaxParts + slot] = 0; /* not the last chunk's count */
     c->domain = d;
     c->block = lo;
     c->handle = (Handle)&c->block; /* chunk_is_sparse; the sweep's test
@@ -3944,6 +4006,7 @@ static long part_new(long size)
         *top = end;
     s->parts[slot].lo = lo;
     s->parts[slot].units = units;
+    g_backed_at[slot] = 0; /* not the last partition's count */
     s->part_made++;
     return (long)mp;
 }

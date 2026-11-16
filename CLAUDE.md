@@ -385,6 +385,7 @@ areas (a megabyte at a time, then a page at a time from 0x40000000 to
 | `T` | native code into the Finder's temporary memory | denied, Scribble stopped |
 | `P` | write and read back 600 MB of temporary memory | pages out other applications (VM on) |
 | `w` | write 64 KB and 4 MB from the heap to a file and read them back | PASS; in ScribbleBig it is disk I/O from and to sparse memory |
+| `c` | make, write and free a 1 MB handle 600 times | PASS: in ScribbleBig the pool grows by no more than the partition's pages without memory |
 | `Y` | an MP task into the Finder | dropped by the kernel, Scribble goes on |
 | `V` | a Time Manager task into a background-only application, 5 s later; make the Finder current | dropped by the kernel |
 | `D` | a deferred task into the Finder, Scribble current | skipped by the engine, Scribble goes on |
@@ -1343,9 +1344,23 @@ Left:
   `sparse_settle`). Before, the poll took pages back while a preempted
   write loop was still on its way through a grown block, and the next
   touch found the pool empty: the application went away without a
-  message. A block that is freed untouched keeps its promise until its
-  application quits, so the pool can hold more than is needed (34 MB
-  after two runs of `E`).
+  message.
+- A promise also ends with time, and the debt is never more than the
+  pages without memory in the sparse partitions and chunks
+  (`sparse_unbacked`, `kDebtTicks`: a promise lasts 10 to 20 seconds).
+  Before (to 0.2.0), a block made from heap space that had its pages
+  already left its promise in place for good. A program that makes and
+  frees large blocks raised the debt without end and the pool took the
+  machine's free memory: on a 512 MB machine About This Computer showed
+  Mac OS at 240 MB after a browser had loaded a few pages, and requests
+  for the pool were refused. Scribble `c` (in ScribbleBig) makes and
+  frees a 1 MB handle 600 times: the pool went from 1157 to 117381 pages
+  before, and stays under the partition's size now (2268 to 4060 pages
+  with VM on), back near the headroom 20 seconds later. To read the
+  engine's state from a guest that is busy in a sparse partition,
+  `xlog-read.py` can fail on pages that have no PTE ("never in the blue
+  task's address space"); with VM off, read those through physical
+  memory (`gva2gpa` gives the offset).
 - Freed heap pages do not go back until the partition does (reclaim).
 - About This Computer (built 2026-11-15). The Finder asks
   `GetProcessInformation` for each process. For a sparse partition or

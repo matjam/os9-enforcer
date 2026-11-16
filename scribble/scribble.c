@@ -617,7 +617,8 @@ int main(void)
                "in a native/68k callback, H 20 s in a 68k callback, G "
                "temporary memory in system mode, A draw a scroll bar, O 8 MB in this small partition, J sparse "
                "memory, I read into sparse memory, E grow a block to 20 "
-               "MB, w write and read a 4 MB file, a the kernel's areas, q "
+               "MB, w write and read a 4 MB file, c make and free 600 "
+               "blocks, a the kernel's areas, q "
                "quit; then Return\n");
         int ch = getchar();
         while (ch != '\n' && getchar() != '\n')
@@ -1053,6 +1054,40 @@ int main(void)
             if (sys)
                 DisposeHandle(sys);
             pool_report();
+            continue;
+        }
+        case 'c': {
+            /* Make, write and free a 1 MB handle 600 times, as a program
+               that reuses its heap does. In a sparse partition every
+               block after the first takes pages that have memory already,
+               so the pool must stay where it was: before the promises
+               ended with time, each block left 258 pages owed and the
+               pool took the machine's free memory (About This Computer
+               showed it as Mac OS). c again after 20 seconds shows the
+               pool back near its headroom. */
+            State *es = engine_state();
+            long before = es ? kcb_set(kKcbOpSparseInfo, 0) : -1;
+            unsigned long owed0 = es ? es->pool_debt : 0;
+            long free0 = TempFreeMem();
+            int made = 0;
+            for (int i = 0; i < 600; i++) {
+                Handle h = NewHandle(1 << 20);
+                if (!h)
+                    break;
+                for (unsigned long o = 0; o < 1 << 20; o += 4096)
+                    (*h)[o] = (char)i;
+                DisposeHandle(h);
+                made++;
+            }
+            long after = es ? kcb_set(kKcbOpSparseInfo, 0) : -1;
+            unsigned long owed = es ? es->pool_debt : 0;
+            printf("%d blocks; pool %ld -> %ld pages, owed %lu -> %lu "
+                   "pages, free temporary memory %ld -> %ld KB\n",
+                   made, before, after, owed0, owed, free0 >> 10,
+                   TempFreeMem() >> 10);
+            /* Owed: no more than the partition's pages without memory
+               (ScribbleBig's 32 MB: under 8192), against 154800. */
+            printf("%s\n", made == 600 && owed < 16384 ? "PASS" : "FAIL");
             continue;
         }
         case 'w': {
