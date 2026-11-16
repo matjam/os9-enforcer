@@ -386,6 +386,7 @@ areas (a megabyte at a time, then a page at a time from 0x40000000 to
 | `P` | write and read back 600 MB of temporary memory | pages out other applications (VM on) |
 | `w` | write 64 KB and 4 MB from the heap to a file and read them back | PASS; in ScribbleBig it is disk I/O from and to sparse memory |
 | `c` | make, write and free a 1 MB handle 600 times | PASS: in ScribbleBig the pool grows by no more than the partition's pages without memory |
+| `f` | 600 MB of temporary memory kept, eight 4 MB asynchronous writes queued, 4 MB handles made while they run | PASS with VM on: no stop in the kernel's debugger, handles made with the File Manager busy (run it twice; takes about 8 minutes) |
 | `Y` | an MP task into the Finder | dropped by the kernel, Scribble goes on |
 | `V` | a Time Manager task into a background-only application, 5 s later; make the Finder current | dropped by the kernel |
 | `D` | a deferred task into the Finder, Scribble current | skipped by the engine, Scribble goes on |
@@ -1361,6 +1362,30 @@ Left:
   `xlog-read.py` can fail on pages that have no PTE ("never in the blue
   task's address space"); with VM off, read those through physical
   memory (`gva2gpa` gives the offset).
+- With VM on, the engine makes no temporary memory while the File
+  Manager is busy (`paging_unsafe`: the word at 0x360, FSBusy, not 0):
+  `pool_grow` leaves the pages owed for the poll, and `new_chunk` fails
+  as a full heap would. A page fault then cannot be served (the Virtual
+  Memory Manager pages through the disk), and the new temporary memory
+  and the code that makes it may be out of physical memory. Before (to
+  0.2.0), Aura made a 4 MB handle inside a File Manager call, `pool_top`
+  grew the pool, and the Memory Manager's first touch of the new block's
+  space was refused: a 68k bus error, the Process Manager's handler
+  faulting the same way about 30 levels deep, the exception stack into
+  its guard page ("ISP_Guard_Page" at 0x3D516000), and the kernel's
+  "Blue task terminated" panic. Scribble `f` (in ScribbleBig) keeps
+  600 MB of temporary memory written so that physical memory is full,
+  queues eight 4 MB asynchronous writes and makes 4 MB handles until they
+  finish: the second run stopped in the kernel's debugger (a `kcThud`
+  call, the engine inside its own `TempNewHandle`); now both runs pass.
+- To read a guest stopped in the kernel's debugger (the CPU polls the
+  serial port at 0x00F26xxx with translation off; `info registers` shows
+  MSR 0x3000): save physical memory with `pmemsave`; the panic's caller
+  is the word at KDP + 0x904 (KDP 0x1F7FE000 on the 512 MB machine),
+  the saved registers start at KDP + 0x700 (DSISR + 0x798, DAR + 0x79C,
+  segment registers + 0x7C0), SDR1 is at KDP + 0x7B0 for walking the
+  HTAB, and the logical area's PLEs are at the physical address in its
+  Area's +0x40 (0x004C7000, one word a page).
 - Freed heap pages do not go back until the partition does (reclaim).
 - About This Computer (built 2026-11-15). The Finder asks
   `GetProcessInformation` for each process. For a sparse partition or

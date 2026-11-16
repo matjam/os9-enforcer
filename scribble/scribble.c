@@ -618,7 +618,8 @@ int main(void)
                "temporary memory in system mode, A draw a scroll bar, O 8 MB in this small partition, J sparse "
                "memory, I read into sparse memory, E grow a block to 20 "
                "MB, w write and read a 4 MB file, c make and free 600 "
-               "blocks, a the kernel's areas, q "
+               "blocks, f make blocks while the disk is busy, a the "
+               "kernel's areas, q "
                "quit; then Return\n");
         int ch = getchar();
         while (ch != '\n' && getchar() != '\n')
@@ -1088,6 +1089,91 @@ int main(void)
             /* Owed: no more than the partition's pages without memory
                (ScribbleBig's 32 MB: under 8192), against 154800. */
             printf("%s\n", made == 600 && owed < 16384 ? "PASS" : "FAIL");
+            continue;
+        }
+        case 'f': {
+            /* Blocks made while the File Manager is busy, with physical
+               memory full: up to 600 MB of temporary memory written and
+               kept, then eight 4 MB asynchronous writes, and 4 MB handles
+               made and written until they complete. In ScribbleBig each handle
+               makes the engine add pool blocks, whose new temporary
+               memory the Virtual Memory Manager cannot page in while the
+               disk is busy: Mac OS stopped in the kernel's debugger (seen
+               in Aura, 2026-11-15). */
+            enum { kFill = 75, kFillSize = 0x800000, kMost = 6,
+                   kSize = 0x400000 };
+            static const unsigned char fname[] = "\pScribble busy test";
+            static Handle fill[kFill];
+            Handle hs[kMost];
+            int nfill = 0, made = 0, busy = 0;
+            for (; nfill < kFill; nfill++) {
+                OSErr err = 0;
+                fill[nfill] = TempNewHandle(kFillSize, &err);
+                if (!fill[nfill])
+                    break;
+                HLock(fill[nfill]);
+                volatile char *p = *fill[nfill];
+                for (unsigned long o = 0; o < kFillSize; o += 4096)
+                    p[o] = (char)o;
+            }
+            printf("%d MB kept; ", nfill * (kFillSize >> 20));
+            State *es = engine_state();
+            long before = es ? kcb_set(kKcbOpSparseInfo, 0) : -1;
+            FSSpec spec;
+            short ref = 0;
+            FSMakeFSSpec(-1, 2, fname, &spec);
+            FSpDelete(&spec);
+            OSErr e1 = FSpCreate(&spec, 'ttxt', 'TEXT', smSystemScript);
+            OSErr e2 = e1 ? e1 : FSpOpenDF(&spec, fsRdWrPerm, &ref);
+            Ptr out = e2 ? 0 : NewPtr(kSize);
+            /* Eight writes queued, so that the File Manager stays busy
+               while several handles are made. */
+            static ParamBlockRec pbs[8];
+            ParamBlockRec *last = &pbs[7];
+            OSErr e3 = out ? 0 : memFullErr;
+            if (out) {
+                memset(out, 0x5C, kSize);
+                for (int k = 0; k < 8; k++) {
+                    ParamBlockRec *pb = &pbs[k];
+                    memset(pb, 0, sizeof *pb);
+                    pb->ioParam.ioRefNum = ref;
+                    pb->ioParam.ioBuffer = out;
+                    pb->ioParam.ioReqCount = kSize;
+                    pb->ioParam.ioPosMode = fsFromStart;
+                    pb->ioParam.ioPosOffset = k * kSize;
+                    PBWriteAsync(pb);
+                }
+                unsigned long fsq = 0x360; /* FSQHdr: FSBusy in its flags */
+                __asm__("" : "+r"(fsq));
+                while (last->ioParam.ioResult > 0 && made < kMost) {
+                    if (*(volatile unsigned short *)fsq & 0x0100)
+                        busy++;
+                    hs[made] = NewHandle(kSize);
+                    if (!hs[made])
+                        break;
+                    for (unsigned long o = 0; o < kSize; o += 4096)
+                        (*hs[made])[o] = (char)made;
+                    made++;
+                }
+                while (last->ioParam.ioResult > 0)
+                    ;
+                for (int k = 0; k < 8 && !e3; k++)
+                    e3 = pbs[k].ioParam.ioResult;
+            }
+            long after = es ? kcb_set(kKcbOpSparseInfo, 0) : -1;
+            printf("write %d %d %d; %d handles made while it ran, %d with "
+                   "the File Manager busy; pool %ld -> %ld pages\n",
+                   e1, e2, e3, made, busy, before, after);
+            for (int j = 0; j < made; j++)
+                DisposeHandle(hs[j]);
+            if (out)
+                DisposePtr(out);
+            if (!e2)
+                FSClose(ref);
+            FSpDelete(&spec);
+            for (int j = 0; j < nfill; j++)
+                DisposeHandle(fill[j]);
+            printf("%s\n", !e3 && made > 0 && busy > 0 ? "PASS" : "FAIL");
             continue;
         }
         case 'w': {

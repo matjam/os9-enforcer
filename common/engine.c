@@ -1711,6 +1711,20 @@ static OSErr own_info(const ProcessSerialNumber *psn, ProcessInfoRec *info)
     return err;
 }
 
+/* With virtual memory on, a page fault while the File Manager is busy
+   cannot be served: the Virtual Memory Manager pages through the disk.
+   New temporary memory, and the Memory Manager and Process Manager code
+   that makes it, may not be in physical memory, so the engine makes none
+   then: it can be called inside a File Manager call (an application's
+   NewHandle, the disk driver's _MemoryDispatch) or with an asynchronous
+   one queued. Aura (2026-11-15) and Scribble f stopped Mac OS in the
+   kernel's debugger that way. FSBusy (0x360) is the File Manager queue's
+   flags word. */
+static int paging_unsafe(const State *s)
+{
+    return s->vm && *(volatile unsigned short *)lowmem(0x360) != 0;
+}
+
 /* Temporary memory that outlives this program: made in system mode, the
    Process Manager keeps it on its system list. */
 static Handle sys_temp(State *s, unsigned long size)
@@ -1733,8 +1747,10 @@ static unsigned long pool_grow(State *s)
     for (int i = 0; i < kPoolBlocks && slot < 0; i++)
         if (!s->pool_blocks[i].h)
             slot = i;
-    /* Leave the Process Manager some temporary memory of its own. */
-    if (slot < 0 || (unsigned long)TempFreeMem() < kOverReserve + kPoolBlock)
+    /* Leave the Process Manager some temporary memory of its own. The
+       pages owed stay owed while paging is unsafe; the poll adds them. */
+    if (slot < 0 || paging_unsafe(s) ||
+        (unsigned long)TempFreeMem() < kOverReserve + kPoolBlock)
         return 0;
     /* With virtual memory on the block is locked, so that the Virtual
        Memory Manager leaves its page frames alone, and it is not one
@@ -1929,7 +1945,8 @@ static int sparse_ensure(State *s, unsigned long pages, int promise)
     while ((unsigned long)level < kPoolHeadroom + pages) {
         unsigned long n = pool_grow(s);
         if (!n) {
-            s->sparse_short++;
+            if (!paging_unsafe(s))
+                s->sparse_short++;
             return 0;
         }
         level += n;
@@ -2210,7 +2227,9 @@ static Chunk *new_chunk(State *s, int d, unsigned long size,
             kept = 1;
     }
     unsigned long csize = (size + kChunkSlack + kPage - 1) & kPageMask;
-    if (slot < 0 || csize < size || csize > 0x40000000UL)
+    /* While paging is unsafe the request fails, as in a full heap. */
+    if (slot < 0 || csize < size || csize > 0x40000000UL ||
+        paging_unsafe(s))
         return 0;
     if (csize < kChunkMin)
         csize = kChunkMin;
