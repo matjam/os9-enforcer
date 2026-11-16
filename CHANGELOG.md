@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/matjam/os9-enforcer/compare/v0.2.0...v0.2.1) (2026-11-16)
+
+
+### Bug Fixes
+
+* the page pool no longer grows without end under an application that reuses its heap ([b832e2a](https://github.com/matjam/os9-enforcer/commit/b832e2a5f087cae957a226ad8bec5a4cd513131e))
+
 ## [0.2.0](https://github.com/matjam/os9-enforcer/compare/v0.1.0...v0.2.0) (2026-11-15)
 
 
