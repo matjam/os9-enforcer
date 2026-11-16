@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.2](https://github.com/matjam/os9-enforcer/compare/v0.2.1...v0.2.2) (2026-11-16)
+
+
+### Bug Fixes
+
+* with virtual memory on, no pool growth while the File Manager is busy ([61cda2b](https://github.com/matjam/os9-enforcer/commit/61cda2bf1ab8a83a1669bcae3163aac2792423e0))
+
 ## [0.2.1](https://github.com/matjam/os9-enforcer/compare/v0.2.0...v0.2.1) (2026-11-16)
 
 
